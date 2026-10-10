@@ -67,9 +67,9 @@ def analyze_market(ticker, display_name):
         print(f"Erè lè w ap analize {display_name}: {e}")
 
 if __name__ == "__main__":
-    send_telegram_msg("🤖 Kenm bot OTC elaji a limen, l ap tcheke tout mache yo!")
+    send_telegram_msg("🤖 Kenm bot OTC elaji a limen, l ap tcheke tout gwo mache yo!")
     
-    # Lis tout gwo pè lajan ki koresponn ak mache OTC sou Pocket Option
+    # Tout gwo pè ki disponib nan lis ou a ki gen bon done
     assets = [
         ("EURUSD=X", "EUR/USD OTC"),
         ("GBPUSD=X", "GBP/USD OTC"),
@@ -81,8 +81,17 @@ if __name__ == "__main__":
         ("GBPJPY=X", "GBP/JPY OTC"),
         ("CADJPY=X", "CAD/JPY OTC"),
         ("AUDCAD=X", "AUD/CAD OTC"),
-        ("NZDUSD=X", "NZD/USD OTC"),
-        ("CHFJPY=X", "CHF/JPY OTC")
+        ("AUDCHF=X", "AUD/CHF OTC"),
+        ("AUDJPY=X", "AUD/JPY OTC"),
+        ("AUDNZD=X", "AUD/NZD OTC"),
+        ("CADCHF=X", "CAD/CHF OTC"),
+        ("CHFJPY=X", "CHF/JPY OTC"),
+        ("EURCHF=X", "EUR/CHF OTC"),
+        ("EURGBP=X", "EUR/GBP OTC"),
+        ("EURNZD=X", "EUR/NZD OTC"),
+        ("GBPAUD=X", "GBP/AUD OTC"),
+        ("NZDJPY=X", "NZD/JPY OTC"),
+        ("NZDUSD=X", "NZD/USD OTC")
     ]
     
     for ticker, display_name in assets:
