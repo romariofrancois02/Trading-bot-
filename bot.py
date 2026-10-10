@@ -25,16 +25,11 @@ def send_telegram_msg(message):
 def get_market_data(asset_tuple):
     ticker, display_name = asset_tuple
     try:
-        # Rapid: Telechaje sèlman 1d nan fòma 1m pou akselere tout bagay
-        df = yf.download(ticker, period="1d", interval="1m", progress=False)
-        if df.empty or len(df) < 50:
+        data = yf.Ticker(ticker)
+        df = data.history(period="1d", interval="1m")
+        if df.empty or len(df) < 30:
             return None
 
-        # Si yfinance retounen MultiIndex, nou plat li
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-
-        # --- ENDIKATÈ YO ---
         close_series = df['Close']
         high_series = df['High']
         low_series = df['Low']
@@ -43,51 +38,44 @@ def get_market_data(asset_tuple):
         df['EMA50'] = ta.trend.ema_indicator(close_series, window=50)
         df['RSI'] = ta.momentum.rsi(close_series, window=14)
 
-        df['Resistance'] = high_series.rolling(window=15).max()
-        df['Support'] = low_series.rolling(window=15).min()
+        df['Resistance'] = high_series.rolling(window=10).max()
+        df['Support'] = low_series.rolling(window=10).min()
 
         bb = ta.volatility.BollingerBands(close_series, window=20, window_dev=2)
         bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / close_series.iloc[-1]
 
-        prev1 = df.iloc[-2]  # Bouji retest / breakout
-        latest = df.iloc[-1] # Bouji konfimasyon
+        prev1 = df.iloc[-2]  
+        latest = df.iloc[-1] 
 
         call_score = 0
         put_score = 0
         matched_strategies = []
 
-        # Filtè: Pa antre si EMA20 ak EMA50 twò plat
-        ema_diff = abs(latest['EMA20'] - latest['EMA50']) / latest['Close']
-        if ema_diff < 0.0001:
-            return None
-
-        # 1. EMA 20/50 + Breakout + Retest
-        dist_ema20 = abs(latest['Close'] - latest['EMA20']) / latest['Close']
-        if dist_ema20 < 0.003: # Pri pa twò lwen EMA20
-            if latest['EMA20'] > latest['EMA50'] and prev1['High'] >= prev1['Resistance'] and latest['Low'] <= latest['EMA20'] and latest['Close'] > latest['Open']:
-                call_score += 35
-                matched_strategies.append("EMA Breakout/Retest")
-            elif latest['EMA20'] < latest['EMA50'] and prev1['Low'] <= prev1['Support'] and latest['High'] >= latest['EMA20'] and latest['Close'] < latest['Open']:
-                put_score += 35
-                matched_strategies.append("EMA Breakout/Retest")
+        # 1. EMA 20/50 + Trend & Retest
+        if latest['EMA20'] > latest['EMA50'] and latest['Close'] > latest['Open']:
+            call_score += 35
+            matched_strategies.append("EMA Breakout/Retest")
+        elif latest['EMA20'] < latest['EMA50'] and latest['Close'] < latest['Open']:
+            put_score += 35
+            matched_strategies.append("EMA Breakout/Retest")
 
         # 2. Support/Resistance Breakout Retest
-        if prev1['Close'] >= prev1['Resistance'] and latest['Low'] <= prev1['Resistance'] and latest['Close'] > latest['Open']:
-            call_score += 30
+        if prev1['Close'] >= prev1['Resistance'] and latest['Close'] > latest['Open']:
+            call_score += 35
             matched_strategies.append("S&R Retest")
-        elif prev1['Close'] <= prev1['Support'] and latest['High'] >= prev1['Support'] and latest['Close'] < latest['Open']:
-            put_score += 30
+        elif prev1['Close'] <= prev1['Support'] and latest['Close'] < latest['Open']:
+            put_score += 35
             matched_strategies.append("S&R Retest")
 
         # 3. EMA Pullback + Trend Continuation
         if latest['EMA20'] > latest['EMA50'] and latest['Low'] <= latest['EMA20'] and latest['Close'] > latest['Open']:
-            call_score += 25
+            call_score += 30
             matched_strategies.append("EMA Pullback")
         elif latest['EMA20'] < latest['EMA50'] and latest['High'] >= latest['EMA20'] and latest['Close'] < latest['Open']:
-            put_score += 25
+            put_score += 30
             matched_strategies.append("EMA Pullback")
 
-        # 4. RSI + Support/Resistance
+        # 4. RSI Filter
         if latest['RSI'] > 50 and latest['RSI'] < 70 and call_score > 0:
             call_score += 15
             matched_strategies.append("RSI Filter")
@@ -95,8 +83,14 @@ def get_market_data(asset_tuple):
             put_score += 15
             matched_strategies.append("RSI Filter")
 
-        if not matched_strategies or (call_score < 25 and put_score < 25):
-            return None
+        # Sekirite: Si pa gen okenn estrateji ki match, bay yon analiz de baz pou l pa janm ret vid
+        if not matched_strategies:
+            if latest['Close'] > latest['Open']:
+                call_score = 30
+                matched_strategies.append("Price Action Trend")
+            else:
+                put_score = 30
+                matched_strategies.append("Price Action Trend")
 
         # EKSPIRASYON EGZAK
         if bb_width > 0.0025:
@@ -138,13 +132,11 @@ if __name__ == "__main__":
         ("GBPAUD=X", "GBP/AUD OTC"), ("NZDJPY=X", "NZD/JPY OTC"), ("NZDUSD=X", "NZD/USD OTC")
     ]
 
-    # Melanje pè lajan yo pou gen rotasyon
     random.shuffle(assets)
 
     all_signals = []
     
-    # EKSEKUSYON AN PARALÈL: Tcheke tout pè lajan yo an menm tan pou akselerasyon
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [executor.submit(get_market_data, asset) for asset in assets]
         for future in as_completed(futures):
             res = future.result()
@@ -160,7 +152,7 @@ if __name__ == "__main__":
         emoji = "🚀 CALL (BUY)" if best_signal['type'] == "CALL" else "🔻 PUT (SELL)"
         msg = (
             f"👑 **ROMARIO TRADER - SIYAL RAPID** 👑\n"
-            f"⚡ *Siyal jènere an tan reyèl*\n\n"
+            f"⚡ *Siyal jènere an tan reyèl pa w*\n\n"
             f"🔥 SIYAL: {emoji}\n"
             f"📈 Asset: **{best_signal['display_name']}**\n"
             f"⏰ LÈ EGZAK POU ANTRE: `{entry_time}`\n"
