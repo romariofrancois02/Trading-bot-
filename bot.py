@@ -3,6 +3,7 @@ import requests
 import yfinance as yf
 import pandas as pd
 import ta
+from datetime import datetime, timedelta
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
@@ -19,80 +20,80 @@ def send_telegram_msg(message):
     except Exception as e:
         print("Erè nan voye mesaj:", e)
 
-def analyze_market(ticker, display_name):
+def get_market_data(ticker, display_name):
     try:
         data = yf.Ticker(ticker)
         df = data.history(period="5d", interval="1m")
         if df.empty or len(df) < 200:
-            print(f"[{display_name}] Pa gen ase done pou kalkile EMA 200.")
-            return
+            return None
 
         df['EMA200'] = ta.trend.ema_indicator(df['Close'], window=200)
-
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         df['bb_high'] = bb.bollinger_hband()
         df['bb_low'] = bb.bollinger_lband()
-
         df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
 
         latest = df.iloc[-1]
-        price = float(latest['Close'])
-        ema200 = float(latest['EMA200'])
-        rsi = float(latest['RSI'])
-        bb_low = float(latest['bb_low'])
-        bb_high = float(latest['bb_high'])
-
-        print(f"[{display_name}] Pri: {price:.5f} | EMA200: {ema200:.5f} | RSI: {rsi:.1f}")
-
-        # Kondisyon ki pi souplè pou voye siyal pi rapid
-        if rsi <= 45:
-            msg = (
-                f"🔥 SIYAL OTC RAPID: CALL 🚀\n"
-                f"Asset: {display_name}\n"
-                f"Pri: {price:.5f}\n"
-                f"RSI: {rsi:.1f} (Oversold)\n"
-                f"Expirations kòmande: 1M - 3M"
-            )
-            send_telegram_msg(msg)
-
-        elif rsi >= 55:
-            msg = (
-                f"🔥 SIYAL OTC RAPID: PUT 🔻\n"
-                f"Asset: {display_name}\n"
-                f"Pri: {price:.5f}\n"
-                f"RSI: {rsi:.1f} (Overbought)\n"
-                f"Expirations kòmande: 1M - 3M"
-            )
-            send_telegram_msg(msg)
+        return {
+            "display_name": display_name,
+            "price": float(latest['Close']),
+            "rsi": float(latest['RSI']),
+            "ema200": float(latest['EMA200']),
+            "bb_low": float(latest['bb_low']),
+            "bb_high": float(latest['bb_high'])
+        }
     except Exception as e:
-        print(f"Erè lè w ap analize {display_name}: {e}")
+        print(f"Erè sou {display_name}: {e}")
+        return None
 
 if __name__ == "__main__":
-    send_telegram_msg("🤖 Bot OTC ki bay siyal rapid la limen!")
-    
     assets = [
-        ("EURUSD=X", "EUR/USD OTC"),
-        ("GBPUSD=X", "GBP/USD OTC"),
-        ("USDJPY=X", "USD/JPY OTC"),
-        ("AUDUSD=X", "AUD/USD OTC"),
-        ("USDCAD=X", "USD/CAD OTC"),
-        ("USDCHF=X", "USD/CHF OTC"),
-        ("EURJPY=X", "EUR/JPY OTC"),
-        ("GBPJPY=X", "GBP/JPY OTC"),
-        ("CADJPY=X", "CAD/JPY OTC"),
-        ("AUDCAD=X", "AUD/CAD OTC"),
-        ("AUDCHF=X", "AUD/CHF OTC"),
-        ("AUDJPY=X", "AUD/JPY OTC"),
-        ("AUDNZD=X", "AUD/NZD OTC"),
-        ("CADCHF=X", "CAD/CHF OTC"),
-        ("CHFJPY=X", "CHF/JPY OTC"),
-        ("EURCHF=X", "EUR/CHF OTC"),
-        ("EURGBP=X", "EUR/GBP OTC"),
-        ("EURNZD=X", "EUR/NZD OTC"),
-        ("GBPAUD=X", "GBP/AUD OTC"),
-        ("NZDJPY=X", "NZD/JPY OTC"),
-        ("NZDUSD=X", "NZD/USD OTC")
+        ("EURUSD=X", "EUR/USD OTC"), ("GBPUSD=X", "GBP/USD OTC"), ("USDJPY=X", "USD/JPY OTC"),
+        ("AUDUSD=X", "AUD/USD OTC"), ("USDCAD=X", "USD/CAD OTC"), ("USDCHF=X", "USD/CHF OTC"),
+        ("EURJPY=X", "EUR/JPY OTC"), ("GBPJPY=X", "GBP/JPY OTC"), ("CADJPY=X", "CAD/JPY OTC"),
+        ("AUDCAD=X", "AUD/CAD OTC"), ("AUDCHF=X", "AUD/CHF OTC"), ("AUDJPY=X", "AUD/JPY OTC"),
+        ("AUDNZD=X", "AUD/NZD OTC"), ("CADCHF=X", "CAD/CHF OTC"), ("CHFJPY=X", "CHF/JPY OTC"),
+        ("EURCHF=X", "EUR/CHF OTC"), ("EURGBP=X", "EUR/GBP OTC"), ("EURNZD=X", "EUR/NZD OTC"),
+        ("GBPAUD=X", "GBP/AUD OTC"), ("NZDJPY=X", "NZD/JPY OTC"), ("NZDUSD=X", "NZD/USD OTC")
     ]
-    
+
+    call_candidates = []
+    put_candidates = []
+
     for ticker, display_name in assets:
-        analyze_market(ticker, display_name)
+        res = get_market_data(ticker, display_name)
+        if res:
+            # RSI 30 pou Call, 60 pou Put
+            if res['rsi'] <= 30:
+                call_candidates.append(res)
+            elif res['rsi'] >= 60:
+                put_candidates.append(res)
+
+    # Kalkile pwochen minit la pou antre nan trade la (egzanp: si kounye a se 10:21, l ap ba ou 10:22)
+    entry_time = (datetime.now() + timedelta(minutes=1)).strftime('%H:%M:00')
+
+    # Voye pi bon CALL la si genyen
+    if call_candidates:
+        best_call = min(call_candidates, key=lambda x: x['rsi'])
+        msg = (
+            f"🔥 PI BON SIYAL OTC: CALL 🚀\n"
+            f"Asset: {best_call['display_name']}\n"
+            f"⏰ LÈ POU RANTRE: {entry_time}\n"
+            f"Pri: {best_call['price']:.5f}\n"
+            f"RSI: {best_call['rsi']:.1f} (Oversold)\n"
+            f"Expirations: 1M"
+        )
+        send_telegram_msg(msg)
+
+    # Voye pi bon PUT la si genyen
+    if put_candidates:
+        best_put = max(put_candidates, key=lambda x: x['rsi'])
+        msg = (
+            f"🔥 PI BON SIYAL OTC: PUT 🔻\n"
+            f"Asset: {best_put['display_name']}\n"
+            f"⏰ LÈ POU RANTRE: {entry_time}\n"
+            f"Pri: {best_put['price']:.5f}\n"
+            f"RSI: {best_put['rsi']:.1f} (Overbought)\n"
+            f"Expirations: 1M"
+        )
+        send_telegram_msg(msg)
