@@ -27,32 +27,60 @@ def get_market_data(ticker, display_name):
         if df.empty or len(df) < 200:
             return None
 
-        # Kalkil Stochastic Oscillator (%K ak %D)
-        stoch = ta.momentum.StochasticOscillator(
-            high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3
-        )
-        df['stoch_k'] = stoch.stoch()
-        df['stoch_d'] = stoch.stoch_signal()
+        # Kalkil EMA 20 ak EMA 50
+        df['EMA20'] = ta.trend.ema_indicator(df['Close'], window=20)
+        df['EMA50'] = ta.trend.ema_indicator(df['Close'], window=50)
+        
+        # RSI pou konfimasyon siplemantè
+        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
 
+        # Volatilité (Bollinger Bands width) pou detèmine ekspirasyon an
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
-        df['bb_high'] = bb.bollinger_hband()
-        df['bb_low'] = bb.bollinger_lband()
+        bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / df['Close'].iloc[-1]
 
         latest = df.iloc[-1]
-        
-        # Kalkil volatilité pou rekòmande tan ekspirasyon an
-        bb_width = (float(latest['bb_high']) - float(latest['bb_low'])) / float(latest['Close'])
-        if bb_width > 0.002:
-            recommended_expiry = "2M - 3M (Segondè Volatilité)"
+        prev = df.iloc[-2]
+
+        ema20_curr = float(latest['EMA20'])
+        ema50_curr = float(latest['EMA50'])
+        ema20_prev = float(prev['EMA20'])
+        ema50_prev = float(prev['EMA50'])
+
+        signal_type = None
+        strength_score = 0
+
+        # Kwazman pou CALL: EMA 20 pase anwo EMA 50
+        if ema20_prev <= ema50_prev and ema20_curr > ema50_curr:
+            if float(latest['RSI']) > 50:
+                signal_type = "CALL"
+                distance = abs(ema20_curr - ema50_curr) / float(latest['Close'])
+                strength_score = min(90, max(75, int(72 + (distance * 10000))))
+
+        # Kwazman pou PUT: EMA 20 pase anba EMA 50
+        elif ema20_prev >= ema50_prev and ema20_curr < ema50_curr:
+            if float(latest['RSI']) < 50:
+                signal_type = "PUT"
+                distance = abs(ema20_curr - ema50_curr) / float(latest['Close'])
+                strength_score = min(90, max(75, int(72 + (distance * 10000))))
+
+        if not signal_type:
+            return None
+
+        # Chwazi YON SÈL tan ekspirasyon ki klè ki baze sou volatilité a
+        if bb_width > 0.0025:
+            exact_expiry = "3 Minit"
+        elif bb_width > 0.0015:
+            exact_expiry = "2 Minit"
         else:
-            recommended_expiry = "1M - 2M (Nòmal)"
+            exact_expiry = "1 Minit"
 
         return {
             "display_name": display_name,
+            "type": signal_type,
             "price": float(latest['Close']),
-            "stoch_k": float(latest['stoch_k']),
-            "stoch_d": float(latest['stoch_d']),
-            "expiry": recommended_expiry
+            "rsi": float(latest['RSI']),
+            "win_rate": strength_score,
+            "expiry": exact_expiry
         }
     except Exception as e:
         print(f"Erè sou {display_name}: {e}")
@@ -69,42 +97,23 @@ if __name__ == "__main__":
         ("GBPAUD=X", "GBP/AUD OTC"), ("NZDJPY=X", "NZD/JPY OTC"), ("NZDUSD=X", "NZD/USD OTC")
     ]
 
-    call_candidates = []
-    put_candidates = []
-
+    all_signals = []
     for ticker, display_name in assets:
         res = get_market_data(ticker, display_name)
         if res:
-            # Kondisyon Stochastic: %K anba oswa egal a 20 pou CALL, anwo oswa egal a 80 pou PUT
-            if res['stoch_k'] <= 20:
-                call_candidates.append(res)
-            elif res['stoch_k'] >= 80:
-                put_candidates.append(res)
+            all_signals.append(res)
 
     entry_time = (datetime.now() + timedelta(minutes=1)).strftime('%H:%M:00')
 
-    # Voye pi bon CALL la si genyen (kote Stochastic %K pi ba nèt la)
-    if call_candidates:
-        best_call = min(call_candidates, key=lambda x: x['stoch_k'])
+    # Voye siyal yo sou Telegram ak fòma ki pi senp la
+    for sig in all_signals:
+        emoji = "🚀 CALL" if sig['type'] == "CALL" else "🔻 PUT"
         msg = (
-            f"🔥 PI BON SIYAL OTC (Stochastic): CALL 🚀\n"
-            f"Asset: {best_call['display_name']}\n"
+            f"🔥 SIYAL: {emoji}\n"
+            f"Asset: {sig['display_name']}\n"
             f"⏰ LÈ POU RANTRE: {entry_time}\n"
-            f"⏳ EKSPIRASYON REKÒMANDE: {best_call['expiry']}\n"
-            f"Pri: {best_call['price']:.5f}\n"
-            f"Stochastic %K: {best_call['stoch_k']:.1f} (Oversold)"
-        )
-        send_telegram_msg(msg)
-
-    # Voye pi bon PUT la si genyen (kote Stochastic %K pi wo nèt la)
-    if put_candidates:
-        best_put = max(put_candidates, key=lambda x: x['stoch_k'])
-        msg = (
-            f"🔥 PI BON SIYAL OTC (Stochastic): PUT 🔻\n"
-            f"Asset: {best_put['display_name']}\n"
-            f"⏰ LÈ POU RANTRE: {entry_time}\n"
-            f"⏳ EKSPIRASYON REKÒMANDE: {best_put['expiry']}\n"
-            f"Pri: {best_put['price']:.5f}\n"
-            f"Stochastic %K: {best_put['stoch_k']:.1f} (Overbought)"
+            f"⏳ EKSPIRASYON: {sig['expiry']}\n"
+            f"Pri: {sig['price']:.5f}\n"
+            f"📊 ESTIMASYON WIN: ~{sig['win_rate']}%"
         )
         send_telegram_msg(msg)
