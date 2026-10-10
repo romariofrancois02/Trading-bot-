@@ -24,16 +24,12 @@ def get_market_data(ticker, display_name):
     try:
         data = yf.Ticker(ticker)
         df = data.history(period="5d", interval="1m")
-        if df.empty or len(df) < 200:
+        if df.empty or len(df) < 100:
             return None
 
-        # EMA 20 ak 50 pou direksyon jeneral
-        df['EMA20'] = ta.trend.ema_indicator(df['Close'], window=20)
-        df['EMA50'] = ta.trend.ema_indicator(df['Close'], window=50)
-
-        # Nivo Sipò ak Rezistans sou dènye 20 bouji yo
-        df['Resistance'] = df['High'].rolling(window=20).max()
-        df['Support'] = df['Low'].rolling(window=20).min()
+        # Nivo Sipò ak Rezistans sou dènye 10 bouji yo (pou siyal yo soti pi rapid)
+        df['Resistance'] = df['High'].rolling(window=10).max()
+        df['Support'] = df['Low'].rolling(window=10).min()
 
         # Volatilité pou ekspirasyon
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
@@ -49,11 +45,11 @@ def get_market_data(ticker, display_name):
         signal_type = None
 
         # KONFIMASYON CALL: Prev kase Rezistans + Latest se yon bouji vèt
-        if prev_candle['Close'] > prev_candle['Resistance'] and is_green_confirmation:
+        if prev_candle['Close'] >= prev_candle['Resistance'] and is_green_confirmation:
             signal_type = "CALL"
 
         # KONFIMASYON PUT: Prev kase Sipò + Latest se yon bouji wouj
-        elif prev_candle['Close'] < prev_candle['Support'] and is_red_confirmation:
+        elif prev_candle['Close'] <= prev_candle['Support'] and is_red_confirmation:
             signal_type = "PUT"
 
         if not signal_type:
