@@ -15,16 +15,16 @@ def send_telegram_msg(message):
     payload = {"chat_id": CHAT_ID, "text": message}
     try:
         res = requests.post(url, json=payload)
-        print("Mesaage voye bay Telegram:", res.status_code)
+        print("Mesaj voye bay Telegram:", res.status_code)
     except Exception as e:
         print("Erè nan voye mesaj:", e)
 
-def analyze_market(ticker="EURUSD=X"):
+def analyze_market(ticker, display_name):
     try:
         data = yf.Ticker(ticker)
         df = data.history(period="5d", interval="1m")
         if df.empty or len(df) < 200:
-            print(f"[{ticker}] Pa gen ase done pou kalkile EMA 200.")
+            print(f"[{display_name}] Pa gen ase done pou kalkile EMA 200.")
             return
 
         df['EMA200'] = ta.trend.ema_indicator(df['Close'], window=200)
@@ -42,12 +42,12 @@ def analyze_market(ticker="EURUSD=X"):
         bb_low = float(latest['bb_low'])
         bb_high = float(latest['bb_high'])
 
-        print(f"[{ticker}] Pri: {price:.5f} | EMA200: {ema200:.5f} | RSI: {rsi:.1f}")
+        print(f"[{display_name}] Pri: {price:.5f} | EMA200: {ema200:.5f} | RSI: {rsi:.1f}")
 
         if price > ema200 and price <= bb_low and rsi <= 35:
             msg = (
-                f"🔥 SIYAL ANRAJE: CALL 🚀\n"
-                f"Asset: {ticker}\n"
+                f"🔥 SIYAL OTC ANRAJE: CALL 🚀\n"
+                f"Asset: {display_name}\n"
                 f"Pri: {price:.5f}\n"
                 f"RSI: {rsi:.1f} (Oversold)\n"
                 f"Expirations kòmande: 1M - 3M"
@@ -56,20 +56,34 @@ def analyze_market(ticker="EURUSD=X"):
 
         elif price < ema200 and price >= bb_high and rsi >= 65:
             msg = (
-                f"🔥 SIYAL ANRAJE: PUT 🔻\n"
-                f"Asset: {ticker}\n"
+                f"🔥 SIYAL OTC ANRAJE: PUT 🔻\n"
+                f"Asset: {display_name}\n"
                 f"Pri: {price:.5f}\n"
                 f"RSI: {rsi:.1f} (Overbought)\n"
                 f"Expirations kòmande: 1M - 3M"
             )
             send_telegram_msg(msg)
     except Exception as e:
-        print(f"Erè lè w ap analize {ticker}: {e}")
+        print(f"Erè lè w ap analize {display_name}: {e}")
 
 if __name__ == "__main__":
-    # Tèst mesaj pou konfime bot la ap kominike ak Telegram
-    send_telegram_msg("🤖 Kenm bot limen epi l ap siveye mache a!")
+    send_telegram_msg("🤖 Kenm bot OTC elaji a limen, l ap tcheke tout mache yo!")
     
-    assets = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
-    for asset in assets:
-        analyze_market(asset)
+    # Lis tout gwo pè lajan ki koresponn ak mache OTC sou Pocket Option
+    assets = [
+        ("EURUSD=X", "EUR/USD OTC"),
+        ("GBPUSD=X", "GBP/USD OTC"),
+        ("USDJPY=X", "USD/JPY OTC"),
+        ("AUDUSD=X", "AUD/USD OTC"),
+        ("USDCAD=X", "USD/CAD OTC"),
+        ("USDCHF=X", "USD/CHF OTC"),
+        ("EURJPY=X", "EUR/JPY OTC"),
+        ("GBPJPY=X", "GBP/JPY OTC"),
+        ("CADJPY=X", "CAD/JPY OTC"),
+        ("AUDCAD=X", "AUD/CAD OTC"),
+        ("NZDUSD=X", "NZD/USD OTC"),
+        ("CHFJPY=X", "CHF/JPY OTC")
+    ]
+    
+    for ticker, display_name in assets:
+        analyze_market(ticker, display_name)
