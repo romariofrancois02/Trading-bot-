@@ -44,9 +44,10 @@ def analyze_market(ticker, display_name):
 
         print(f"[{display_name}] Pri: {price:.5f} | EMA200: {ema200:.5f} | RSI: {rsi:.1f}")
 
-        if price > ema200 and price <= bb_low and rsi <= 35:
+        # Kondisyon ki pi souplè pou voye siyal pi rapid
+        if rsi <= 45:
             msg = (
-                f"🔥 SIYAL OTC ANRAJE: CALL 🚀\n"
+                f"🔥 SIYAL OTC RAPID: CALL 🚀\n"
                 f"Asset: {display_name}\n"
                 f"Pri: {price:.5f}\n"
                 f"RSI: {rsi:.1f} (Oversold)\n"
@@ -54,9 +55,9 @@ def analyze_market(ticker, display_name):
             )
             send_telegram_msg(msg)
 
-        elif price < ema200 and price >= bb_high and rsi >= 65:
+        elif rsi >= 55:
             msg = (
-                f"🔥 SIYAL OTC ANRAJE: PUT 🔻\n"
+                f"🔥 SIYAL OTC RAPID: PUT 🔻\n"
                 f"Asset: {display_name}\n"
                 f"Pri: {price:.5f}\n"
                 f"RSI: {rsi:.1f} (Overbought)\n"
@@ -67,9 +68,8 @@ def analyze_market(ticker, display_name):
         print(f"Erè lè w ap analize {display_name}: {e}")
 
 if __name__ == "__main__":
-    send_telegram_msg("🤖 Kenm bot OTC elaji a limen, l ap tcheke tout gwo mache yo!")
+    send_telegram_msg("🤖 Bot OTC ki bay siyal rapid la limen!")
     
-    # Tout gwo pè ki disponib nan lis ou a ki gen bon done
     assets = [
         ("EURUSD=X", "EUR/USD OTC"),
         ("GBPUSD=X", "GBP/USD OTC"),
