@@ -67,6 +67,9 @@ def analyze_market(ticker="EURUSD=X"):
         print(f"Erè lè w ap analize {ticker}: {e}")
 
 if __name__ == "__main__":
+    # Tèst mesaj pou konfime bot la ap kominike ak Telegram
+    send_telegram_msg("🤖 Kenm bot limen epi l ap siveye mache a!")
+    
     assets = ["EURUSD=X", "GBPUSD=X", "USDJPY=X"]
     for asset in assets:
         analyze_market(asset)
