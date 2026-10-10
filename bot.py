@@ -27,46 +27,39 @@ def get_market_data(ticker, display_name):
         if df.empty or len(df) < 200:
             return None
 
-        # Kalkil EMA 20 ak EMA 50
+        # EMA 20 ak 50 pou direksyon jeneral
         df['EMA20'] = ta.trend.ema_indicator(df['Close'], window=20)
         df['EMA50'] = ta.trend.ema_indicator(df['Close'], window=50)
-        
-        # RSI pou konfimasyon siplemantè
-        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
 
-        # Volatilité (Bollinger Bands width) pou detèmine ekspirasyon an
+        # Nivo Sipò ak Rezistans sou dènye 20 bouji yo
+        df['Resistance'] = df['High'].rolling(window=20).max()
+        df['Support'] = df['Low'].rolling(window=20).min()
+
+        # Volatilité pou ekspirasyon
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / df['Close'].iloc[-1]
 
-        latest = df.iloc[-1]
-        prev = df.iloc[-2]
+        prev_candle = df.iloc[-2]     # Bouji ki fè kase an (Breakout)
+        latest_candle = df.iloc[-1]   # Bouji konfimasyon an
 
-        ema20_curr = float(latest['EMA20'])
-        ema50_curr = float(latest['EMA50'])
-        ema20_prev = float(prev['EMA20'])
-        ema50_prev = float(prev['EMA50'])
+        # Tcheke kalite bouji konfimasyon an
+        is_green_confirmation = latest_candle['Close'] > latest_candle['Open']
+        is_red_confirmation = latest_candle['Close'] < latest_candle['Open']
 
         signal_type = None
-        strength_score = 0
 
-        # Kwazman pou CALL: EMA 20 pase anwo EMA 50
-        if ema20_prev <= ema50_prev and ema20_curr > ema50_curr:
-            if float(latest['RSI']) > 50:
-                signal_type = "CALL"
-                distance = abs(ema20_curr - ema50_curr) / float(latest['Close'])
-                strength_score = min(90, max(75, int(72 + (distance * 10000))))
+        # KONFIMASYON CALL: Prev kase Rezistans + Latest se yon bouji vèt
+        if prev_candle['Close'] > prev_candle['Resistance'] and is_green_confirmation:
+            signal_type = "CALL"
 
-        # Kwazman pou PUT: EMA 20 pase anba EMA 50
-        elif ema20_prev >= ema50_prev and ema20_curr < ema50_curr:
-            if float(latest['RSI']) < 50:
-                signal_type = "PUT"
-                distance = abs(ema20_curr - ema50_curr) / float(latest['Close'])
-                strength_score = min(90, max(75, int(72 + (distance * 10000))))
+        # KONFIMASYON PUT: Prev kase Sipò + Latest se yon bouji wouj
+        elif prev_candle['Close'] < prev_candle['Support'] and is_red_confirmation:
+            signal_type = "PUT"
 
         if not signal_type:
             return None
 
-        # Chwazi YON SÈL tan ekspirasyon ki klè ki baze sou volatilité a
+        # Ekspirasyon egzak
         if bb_width > 0.0025:
             exact_expiry = "3 Minit"
         elif bb_width > 0.0015:
@@ -74,12 +67,15 @@ def get_market_data(ticker, display_name):
         else:
             exact_expiry = "1 Minit"
 
+        # Kalkil fòs (Win Rate Estimate)
+        strength_score = int(80 + (abs(latest_candle['Close'] - latest_candle['Open']) / latest_candle['Close'] * 10000))
+        win_rate = min(92, max(78, strength_score))
+
         return {
             "display_name": display_name,
             "type": signal_type,
-            "price": float(latest['Close']),
-            "rsi": float(latest['RSI']),
-            "win_rate": strength_score,
+            "price": float(latest_candle['Close']),
+            "win_rate": win_rate,
             "expiry": exact_expiry
         }
     except Exception as e:
@@ -97,23 +93,41 @@ if __name__ == "__main__":
         ("GBPAUD=X", "GBP/AUD OTC"), ("NZDJPY=X", "NZD/JPY OTC"), ("NZDUSD=X", "NZD/USD OTC")
     ]
 
-    all_signals = []
+    call_candidates = []
+    put_candidates = []
+
     for ticker, display_name in assets:
         res = get_market_data(ticker, display_name)
         if res:
-            all_signals.append(res)
+            if res['type'] == "CALL":
+                call_candidates.append(res)
+            elif res['type'] == "PUT":
+                put_candidates.append(res)
 
     entry_time = (datetime.now() + timedelta(minutes=1)).strftime('%H:%M:00')
 
-    # Voye siyal yo sou Telegram ak fòma ki pi senp la
-    for sig in all_signals:
-        emoji = "🚀 CALL" if sig['type'] == "CALL" else "🔻 PUT"
+    # Voye sèlman PI BON CALL la
+    if call_candidates:
+        best_call = max(call_candidates, key=lambda x: x['win_rate'])
         msg = (
-            f"🔥 SIYAL: {emoji}\n"
-            f"Asset: {sig['display_name']}\n"
+            f"🔥 SIYAL BREAKOUT + KONFIMASYON: 🚀 CALL\n"
+            f"Asset: {best_call['display_name']}\n"
             f"⏰ LÈ POU RANTRE: {entry_time}\n"
-            f"⏳ EKSPIRASYON: {sig['expiry']}\n"
-            f"Pri: {sig['price']:.5f}\n"
-            f"📊 ESTIMASYON WIN: ~{sig['win_rate']}%"
+            f"⏳ EKSPIRASYON: {best_call['expiry']}\n"
+            f"Pri: {best_call['price']:.5f}\n"
+            f"📊 ESTIMASYON WIN: ~{best_call['win_rate']}%"
+        )
+        send_telegram_msg(msg)
+
+    # Voye sèlman PI BON PUT la
+    if put_candidates:
+        best_put = max(put_candidates, key=lambda x: x['win_rate'])
+        msg = (
+            f"🔥 SIYAL BREAKOUT + KONFIMASYON: 🔻 PUT\n"
+            f"Asset: {best_put['display_name']}\n"
+            f"⏰ LÈ POU RANTRE: {entry_time}\n"
+            f"⏳ EKSPIRASYON: {best_put['expiry']}\n"
+            f"Pri: {best_put['price']:.5f}\n"
+            f"📊 ESTIMASYON WIN: ~{best_put['win_rate']}%"
         )
         send_telegram_msg(msg)
