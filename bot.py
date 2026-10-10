@@ -27,15 +27,20 @@ def get_market_data(ticker, display_name):
         if df.empty or len(df) < 200:
             return None
 
-        df['EMA200'] = ta.trend.ema_indicator(df['Close'], window=200)
+        # Kalkil Stochastic Oscillator (%K ak %D)
+        stoch = ta.momentum.StochasticOscillator(
+            high=df['High'], low=df['Low'], close=df['Close'], window=14, smooth_window=3
+        )
+        df['stoch_k'] = stoch.stoch()
+        df['stoch_d'] = stoch.stoch_signal()
+
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         df['bb_high'] = bb.bollinger_hband()
         df['bb_low'] = bb.bollinger_lband()
-        df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
 
         latest = df.iloc[-1]
         
-        # Kalkile volatilité pou deside sou tan ekspirasyon an (1M, 2M, oubyen 3M)
+        # Kalkil volatilité pou rekòmande tan ekspirasyon an
         bb_width = (float(latest['bb_high']) - float(latest['bb_low'])) / float(latest['Close'])
         if bb_width > 0.002:
             recommended_expiry = "2M - 3M (Segondè Volatilité)"
@@ -45,10 +50,8 @@ def get_market_data(ticker, display_name):
         return {
             "display_name": display_name,
             "price": float(latest['Close']),
-            "rsi": float(latest['RSI']),
-            "ema200": float(latest['EMA200']),
-            "bb_low": float(latest['bb_low']),
-            "bb_high": float(latest['bb_high']),
+            "stoch_k": float(latest['stoch_k']),
+            "stoch_d": float(latest['stoch_d']),
             "expiry": recommended_expiry
         }
     except Exception as e:
@@ -72,37 +75,36 @@ if __name__ == "__main__":
     for ticker, display_name in assets:
         res = get_market_data(ticker, display_name)
         if res:
-            # Règleman: RSI ≤ 30 AK Pri a anba oswa toupre Bollinger Band anba a pou CALL
-            if res['rsi'] <= 30 and res['price'] <= (res['bb_low'] * 1.001):
+            # Kondisyon Stochastic: %K anba oswa egal a 20 pou CALL, anwo oswa egal a 80 pou PUT
+            if res['stoch_k'] <= 20:
                 call_candidates.append(res)
-            # Règleman: RSI ≥ 60 AK Pri a anwo oswa toupre Bollinger Band anwo a pou PUT
-            elif res['rsi'] >= 60 and res['price'] >= (res['bb_high'] * 0.999):
+            elif res['stoch_k'] >= 80:
                 put_candidates.append(res)
 
     entry_time = (datetime.now() + timedelta(minutes=1)).strftime('%H:%M:00')
 
-    # Voye pi bon CALL la si genyen
+    # Voye pi bon CALL la si genyen (kote Stochastic %K pi ba nèt la)
     if call_candidates:
-        best_call = min(call_candidates, key=lambda x: x['rsi'])
+        best_call = min(call_candidates, key=lambda x: x['stoch_k'])
         msg = (
-            f"🔥 PI BON SIYAL OTC: CALL 🚀\n"
+            f"🔥 PI BON SIYAL OTC (Stochastic): CALL 🚀\n"
             f"Asset: {best_call['display_name']}\n"
             f"⏰ LÈ POU RANTRE: {entry_time}\n"
             f"⏳ EKSPIRASYON REKÒMANDE: {best_call['expiry']}\n"
             f"Pri: {best_call['price']:.5f}\n"
-            f"RSI: {best_call['rsi']:.1f} (Oversold)"
+            f"Stochastic %K: {best_call['stoch_k']:.1f} (Oversold)"
         )
         send_telegram_msg(msg)
 
-    # Voye pi bon PUT la si genyen
+    # Voye pi bon PUT la si genyen (kote Stochastic %K pi wo nèt la)
     if put_candidates:
-        best_put = max(put_candidates, key=lambda x: x['rsi'])
+        best_put = max(put_candidates, key=lambda x: x['stoch_k'])
         msg = (
-            f"🔥 PI BON SIYAL OTC: PUT 🔻\n"
+            f"🔥 PI BON SIYAL OTC (Stochastic): PUT 🔻\n"
             f"Asset: {best_put['display_name']}\n"
             f"⏰ LÈ POU RANTRE: {entry_time}\n"
             f"⏳ EKSPIRASYON REKÒMANDE: {best_put['expiry']}\n"
             f"Pri: {best_put['price']:.5f}\n"
-            f"RSI: {best_put['rsi']:.1f} (Overbought)"
+            f"Stochastic %K: {best_put['stoch_k']:.1f} (Overbought)"
         )
         send_telegram_msg(msg)
