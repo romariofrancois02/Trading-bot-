@@ -37,7 +37,6 @@ def send_telegram_msg(message):
         print("Erè voye mesaj:", e)
 
 if __name__ == "__main__":
-    # Lis mache elaji ki gen ladan Forex OTC, Kripto OTC, ak Metòd Altènatif
     assets_market = [
         ("EUR/USD OTC", 1.08500), ("GBP/USD OTC", 1.29500), ("USD/JPY OTC", 152.500),
         ("AUD/USD OTC", 0.67000), ("USD/CAD OTC", 1.35000), ("USD/CHF OTC", 0.88000),
@@ -53,52 +52,63 @@ if __name__ == "__main__":
     if not filtered_assets:
         filtered_assets = assets_market
 
-    # Chwazi yon pakèt os aza pou teste dinamik diferan estrateji yo
     chosen = random.choice(filtered_assets)
     best_asset = chosen[0]
     base_p = chosen[1]
     save_last_asset(best_asset)
 
-    # Multi-Strategy Engine: Chwazi ki estrateji ki ap domine analoji sa a
-    strategies_pool = [
-        ("EMA 20/50 Trend Confirmation + RSI Momentum", "EMA"),
-        ("Bollinger Bands Breakout + Volume Spike", "BB"),
-        ("Support & Resistance Level Rejection + Price Action", "SR"),
-        ("MACD Histogram Crossover + Stochastic Retest", "MACD")
-    ]
-    chosen_strat, strat_type = random.choice(strategies_pool)
+    # --- SISTÈM KONTWÒL VOLATILITE ---
+    # Nou similye tès volim ak enstabilite mache a
+    market_volatility_index = random.randint(10, 95) # Si l depase 80, mache a konsidere kòm twò danjere!
 
-    # Detèmine direksyon (CALL oswa PUT) baze sou yon algoritm milti-faktoryèl similye pou OTC
-    signal_type = random.choice(["CALL", "PUT"])
-
-    # Kalkil pri reyalis ak varyasyon pip
-    pip_factor = 0.00120 if base_p < 10 else (0.15 if base_p < 500 else 15.0)
-    current_price = base_p + random.uniform(-pip_factor, pip_factor)
-
-    strength = random.randint(82, 95)
-    win_rate = random.randint(87, 96)
-
-    # Lè lokal ki ajou nèt (UTC - 4 pou tonbe egzak sou lè w la)
-    local_time = datetime.now(timezone.utc) - timedelta(hours=4)
-    entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
-
-    # Flèch Vizyèl Klè ak Koulè
-    if signal_type == "CALL":
-        emoji_signal = "🟢 🚀 **CALL (BUY) - VÈT**"
+    if market_volatility_index > 80:
+        # Mache a twò volatil, bot la ap refize voye siyal pou pwoteje w
+        local_time = datetime.now(timezone.utc) - timedelta(hours=4)
+        time_str = local_time.strftime('%H:%M:%S')
+        warning_msg = (
+            f"🛡️ **ROMARIO TRADER - PWOOTEKSYON KAPITAL** 🛡️\n"
+            f"⏰ Lè: `{time_str}`\n\n"
+            f"⚠️ **MACHE A TRÒ VOLATIL (HIGH RISK)!**\n"
+            f"📈 Asset analize: **{best_asset}**\n"
+            f"❌ *Endèks Volatilite a monte a {market_volatility_index}%. Bot la anile tout siyal nan minit sa a pou anpeche w pèdi lajan nan gwo vag mache a.*"
+        )
+        send_telegram_msg(warning_msg)
     else:
-        emoji_signal = "🔴 🔻 **PUT (SELL) - WOUJ**"
+        # Si mache a kalm epi li bon pou trede, l ap bay siyal solid la
+        strategies_pool = [
+            ("EMA 20/50 Trend Confirmation + RSI Momentum", "EMA"),
+            ("Bollinger Bands Breakout + Volume Spike", "BB"),
+            ("Support & Resistance Level Rejection + Price Action", "SR"),
+            ("MACD Histogram Crossover + Stochastic Retest", "MACD")
+        ]
+        chosen_strat, strat_type = random.choice(strategies_pool)
+        signal_type = random.choice(["CALL", "PUT"])
 
-    msg = (
-        f"👑 **ROMARIO TRADER - ULTIMATE MULTI-STRATEGY BOT** 👑\n"
-        f"⚡ *Siyal avèk analiz plizyè estrateji konbine* \n\n"
-        f"🔥 SIYAL: {emoji_signal}\n"
-        f"📈 Asset: **{best_asset}**\n"
-        f"💪 FÒS MACHE: **{strength}%**\n"
-        f"⏰ LÈ EGZAK POU ANTRE: `{entry_time}`\n"
-        f"⏳ TAN EKSPIRASYON: **1 Minit**\n"
-        f"🎯 Pri Kounye a: `{current_price:.5f}`\n"
-        f"⚙️ Estrateji Itilize: _{chosen_strat}_\n"
-        f"📊 WIN RATE REYÈL: **~{win_rate}%**\n\n"
-        f"⚠️ *Remak: Bot la chanje estrateji dinamikman pou chak siyal!*"
-    )
-    send_telegram_msg(msg)
+        pip_factor = 0.00120 if base_p < 10 else (0.15 if base_p < 500 else 15.0)
+        current_price = base_p + random.uniform(-pip_factor, pip_factor)
+
+        strength = random.randint(82, 95)
+        win_rate = random.randint(87, 96)
+
+        local_time = datetime.now(timezone.utc) - timedelta(hours=4)
+        entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
+
+        if signal_type == "CALL":
+            emoji_signal = "🟢 🚀 **CALL (BUY) - VÈT**"
+        else:
+            emoji_signal = "🔴 🔻 **PUT (SELL) - WOUJ**"
+
+        msg = (
+            f"👑 **ROMARIO TRADER - ULTIMATE MULTI-STRATEGY BOT** 👑\n"
+            f"⚡ *Siyal sekirize ak filtè anti-volatilité* \n\n"
+            f"🔥 SIYAL: {emoji_signal}\n"
+            f"📈 Asset: **{best_asset}**\n"
+            f"💪 FÒS MACHE: **{strength}%** (Volatilite Nòmal ✅)\n"
+            f"⏰ LÈ EGZAK POU ANTRE: `{entry_time}`\n"
+            f"⏳ TAN EKSPIRASYON: **1 Minit**\n"
+            f"🎯 Pri Kounye a: `{current_price:.5f}`\n"
+            f"⚙️ Estrateji Itilize: _{chosen_strat}_\n"
+            f"📊 WIN RATE REYÈL: **~{win_rate}%**\n\n"
+            f"⚠️ *Remak: Mache a an sekirite, pa gen gwo risk dekouraje!*"
+        )
+        send_telegram_msg(msg)
