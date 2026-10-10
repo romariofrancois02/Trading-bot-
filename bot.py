@@ -24,7 +24,7 @@ def get_market_data(ticker, display_name):
     try:
         data = yf.Ticker(ticker)
         df = data.history(period="5d", interval="1m")
-        if df.empty or len(df) < 100:
+        if df.empty or len(df) < 50:
             return None
 
         # Endikatè de baz
@@ -36,23 +36,22 @@ def get_market_data(ticker, display_name):
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
         bb_width = (bb.bollinger_hband().iloc[-1] - bb.bollinger_lband().iloc[-1]) / df['Close'].iloc[-1]
 
-        prev2 = df.iloc[-3]
-        prev1 = df.iloc[-2]  # Bouji kase / Retest
-        latest = df.iloc[-1] # Bouji konfimasyon
+        prev1 = df.iloc[-2]  # Bouji anvan
+        latest = df.iloc[-1] # Dènye bouji
 
-        call_score = 0
-        put_score = 0
+        call_score = 10
+        put_score = 10
         matched_strategies = []
 
-        # 1. EMA 20/50 Retest Breakout
-        if prev1['EMA20'] > prev1['EMA50'] and latest['Close'] > latest['Open'] and latest['Close'] > prev1['EMA20']:
-            call_score += 35
+        # 1. EMA 20/50 Trend & Retest Breakout
+        if latest['EMA20'] > latest['EMA50'] and latest['Close'] > latest['Open']:
+            call_score += 30
             matched_strategies.append("EMA Breakout")
-        elif prev1['EMA20'] < prev1['EMA50'] and latest['Close'] < latest['Open'] and latest['Close'] < prev1['EMA20']:
-            put_score += 35
+        elif latest['EMA20'] < latest['EMA50'] and latest['Close'] < latest['Open']:
+            put_score += 30
             matched_strategies.append("EMA Breakout")
 
-        # 2. Support & Resistance Breakout + Konfimasyon
+        # 2. Support & Resistance Breakout
         if prev1['Close'] >= prev1['Resistance'] and latest['Close'] > latest['Open']:
             call_score += 35
             matched_strategies.append("S&R Breakout")
@@ -60,16 +59,19 @@ def get_market_data(ticker, display_name):
             put_score += 35
             matched_strategies.append("S&R Breakout")
 
-        # 3. Engulfing Candle (Bouji Anvlòp)
-        is_bullish_engulfing = (prev1['Close'] < prev1['Open']) and (latest['Close'] > latest['Open']) and (latest['Close'] >= prev1['Open']) and (latest['Open'] <= prev1['Close'])
-        is_bearish_engulfing = (prev1['Close'] > prev1['Open']) and (latest['Close'] < latest['Open']) and (latest['Close'] <= prev1['Open']) and (latest['Open'] >= prev1['Close'])
+        # 3. Engulfing Candle
+        is_bullish_engulfing = (prev1['Close'] < prev1['Open']) and (latest['Close'] > latest['Open']) and (latest['Close'] >= prev1['Open'])
+        is_bearish_engulfing = (prev1['Close'] > prev1['Open']) and (latest['Close'] < latest['Open']) and (latest['Close'] <= prev1['Open'])
 
         if is_bullish_engulfing:
-            call_score += 30
+            call_score += 25
             matched_strategies.append("Engulfing")
         elif is_bearish_engulfing:
-            put_score += 30
+            put_score += 25
             matched_strategies.append("Engulfing")
+
+        if not matched_strategies:
+            matched_strategies.append("Price Action Trend")
 
         # Tan ekspirasyon ki baze sou volatilité
         if bb_width > 0.0025:
@@ -79,24 +81,15 @@ def get_market_data(ticker, display_name):
         else:
             exact_expiry = "1 Minit"
 
-        signal_type = None
-        final_score = 0
-
-        if call_score >= 35 and call_score >= put_score:
-            signal_type = "CALL"
-            final_score = min(95, max(78, 60 + call_score))
-        elif put_score >= 35 and put_score > call_score:
-            signal_type = "PUT"
-            final_score = min(95, max(78, 60 + put_score))
-
-        if not signal_type:
-            return None
+        signal_type = "CALL" if call_score >= put_score else "PUT"
+        best_score = max(call_score, put_score)
+        win_rate = min(95, max(76, 55 + best_score))
 
         return {
             "display_name": display_name,
             "type": signal_type,
             "price": float(latest['Close']),
-            "win_rate": final_score,
+            "win_rate": win_rate,
             "expiry": exact_expiry,
             "strategy": " + ".join(matched_strategies)
         }
@@ -123,7 +116,7 @@ if __name__ == "__main__":
 
     entry_time = (datetime.now() + timedelta(minutes=1)).strftime('%H:%M:00')
 
-    # Voye pi bon siyal ki gen pi gwo win rate la anba non Romario Trader
+    # Voye pi bon siyal la sou Telegram
     if all_signals:
         best_signal = max(all_signals, key=lambda x: x['win_rate'])
         emoji = "🚀 CALL" if best_signal['type'] == "CALL" else "🔻 PUT"
