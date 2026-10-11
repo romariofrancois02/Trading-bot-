@@ -1,25 +1,47 @@
 
 import os
+import json
 import time
 import requests
-import yfinance as yf
 import pandas as pd
 from datetime import datetime, timezone
+from otcharts import Client
 
+# ROMARIO TRADER
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("OTCHARTS_API_KEY")
 
-ASSETS = {
-    "EUR/USD": "EURUSD=X",
-    "GBP/USD": "GBPUSD=X",
-    "USD/JPY": "JPY=X",
-    "AUD/USD": "AUDUSD=X",
-    "NZD/USD": "NZDUSD=X",
-}
+STATE_FILE = "last_signals.json"
+TIMEFRAME_SECONDS = 60
+CANDLE_LIMIT = 120
+RSI_BUY_MIN, RSI_BUY_MAX = 50, 68
+RSI_PUT_MIN, RSI_PUT_MAX = 32, 50
+
 
 def log(message):
-    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
-    print(f"[{now}] {message}", flush=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{stamp}] {message}", flush=True)
+
+
+def load_state():
+    try:
+        with open(STATE_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def field(obj, name, default=None):
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
 
 def send_telegram(message):
     if not TOKEN or not CHAT_ID:
@@ -29,64 +51,75 @@ def send_telegram(message):
     try:
         response = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": message},
-            timeout=10
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=15
         )
-        response.raise_for_status()
 
-        if not response.json().get("ok"):
-            log("Telegram pa konfime mesaj la.")
-            return False
+        data = response.json()
 
-        log("Telegram konfime mesaj la.")
-        return True
+        if response.ok and data.get("ok"):
+            log("Telegram konfime mesaj la.")
+            return True
 
-    except Exception as error:
-        log(f"ERÈ TELEGRAM: {error}")
+        log(f"Telegram erè: {data}")
         return False
 
-def get_candles(symbol):
-    log(f"Ap chèche bouji pou {symbol}...")
+    except Exception as error:
+        log(f"Telegram pa reponn: {error}")
+        return False
+
+
+def get_candles(client, venue, symbol):
+    log(f"Ap chèche {venue} / {symbol}")
 
     try:
-        df = yf.download(
-            tickers=symbol,
-            period="1d",
-            interval="1m",
-            progress=False,
-            auto_adjust=False,
-            threads=False,
-            timeout=12
+        bars = client.candles(
+            venue,
+            symbol,
+            tf=TIMEFRAME_SECONDS,
+            limit=CANDLE_LIMIT
         )
 
-        if df is None or df.empty:
-            log(f"PA GEN DONE: {symbol}")
+        rows = []
+
+        for bar in bars:
+            row = {
+                "time": field(bar, "time"),
+                "Open": field(bar, "open"),
+                "High": field(bar, "high"),
+                "Low": field(bar, "low"),
+                "Close": field(bar, "close")
+            }
+
+            if all(row[k] is not None for k in
+                   ["time", "Open", "High", "Low", "Close"]):
+                rows.append(row)
+
+        if len(rows) < 60:
+            log(f"Pa gen ase bouji: {venue}/{symbol}")
             return None
 
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        df = pd.DataFrame(rows)
 
-        needed = ["Open", "High", "Low", "Close"]
-        if not all(col in df.columns for col in needed):
-            log(f"Kolòn bouji yo manke: {symbol}")
-            return None
+        for col in ["Open", "High", "Low", "Close"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df = df[needed].dropna()
-
-        # Dènye bouji a ka poko fèmen.
-        if len(df) > 1:
-            df = df.iloc[:-1].copy()
+        df = df.dropna().reset_index(drop=True)
 
         if len(df) < 60:
-            log(f"Pa gen ase bouji pou {symbol}: {len(df)}")
+            log(f"Done yo pa ase oswa yo pa valab: {symbol}")
             return None
 
-        log(f"Done resevwa pou {symbol}: {len(df)} bouji")
+        log(f"Done resevwa: {symbol}, {len(df)} bouji")
         return df
 
     except Exception as error:
-        log(f"ERÈ DONE {symbol}: {error}")
+        log(f"ERÈ DONE {venue}/{symbol}: {error}")
         return None
+
 
 def analyze(df):
     df = df.copy()
@@ -104,26 +137,24 @@ def analyze(df):
     loss = -change.clip(upper=0)
 
     avg_gain = gain.ewm(
-        alpha=1/14, adjust=False, min_periods=14
+        alpha=1 / 14, adjust=False, min_periods=14
     ).mean()
 
     avg_loss = loss.ewm(
-        alpha=1/14, adjust=False, min_periods=14
+        alpha=1 / 14, adjust=False, min_periods=14
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["RSI"] = 100 - (100 / (1 + rs))
-    df = df.dropna()
+    df = df.dropna().reset_index(drop=True)
 
-    if len(df) < 30:
+    if len(df) < 55:
         return None
 
-    previous = df.iloc[-2]
-    candle = df.iloc[-1]
-    reference = df.iloc[-23:-3]
-
-    resistance = float(reference["High"].max())
-    support = float(reference["Low"].min())
+    # Dènye bouji a ka poko fini.
+    # Nou itilize dènye bouji anvan li kòm bouji konfime.
+    previous = df.iloc[-3]
+    candle = df.iloc[-2]
 
     close = float(candle["Close"])
     open_price = float(candle["Open"])
@@ -132,103 +163,162 @@ def analyze(df):
     ema20 = float(candle["EMA20"])
     ema50 = float(candle["EMA50"])
     rsi = float(candle["RSI"])
-    previous_close = float(previous["Close"])
 
-    tolerance = close * 0.0002
+    prev_close = float(previous["Close"])
+    prev_ema20 = float(previous["EMA20"])
 
-    # CALL: breakout anwo, retest, fèmti anlè zòn nan
-    if (
+    candle_range = high - low
+    if candle_range <= 0:
+        return None
+
+    body_ratio = abs(close - open_price) / candle_range
+
+    # Filtre ki pèmèt trend continuation san egzije
+    # breakout/retest pou chak siyal.
+    call_ok = (
         ema20 > ema50
         and close > ema20
-        and 52 <= rsi <= 68
-        and previous_close > resistance
-        and low <= resistance + tolerance
-        and close > resistance
+        and prev_close >= prev_ema20
+        and RSI_BUY_MIN <= rsi <= RSI_BUY_MAX
         and close > open_price
-    ):
-        return {
-            "side": "CALL",
-            "price": close,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "zone": resistance,
-            "time": str(df.index[-1])
-        }
+        and body_ratio >= 0.25
+    )
 
-    # PUT: breakout anba, retest, fèmti anba zòn nan
-    if (
+    put_ok = (
         ema20 < ema50
         and close < ema20
-        and 32 <= rsi <= 48
-        and previous_close < support
-        and high >= support - tolerance
-        and close < support
+        and prev_close <= prev_ema20
+        and RSI_PUT_MIN <= rsi <= RSI_PUT_MAX
         and close < open_price
-    ):
-        return {
-            "side": "PUT",
-            "price": close,
-            "ema20": ema20,
-            "ema50": ema50,
-            "rsi": rsi,
-            "zone": support,
-            "time": str(df.index[-1])
-        }
+        and body_ratio >= 0.25
+    )
 
-    return None
+    if call_ok:
+        side = "CALL 🟢"
+    elif put_ok:
+        side = "PUT 🔴"
+    else:
+        return None
+
+    return {
+        "side": side,
+        "price": close,
+        "ema20": ema20,
+        "ema50": ema50,
+        "rsi": rsi,
+        "time": str(candle["time"])
+    }
+
+
+def get_symbols(client, venue):
+    try:
+        items = client.symbols(venue)
+        symbols = []
+
+        for item in items:
+            symbol = field(item, "symbol")
+            name = field(item, "name", symbol)
+
+            if symbol:
+                symbols.append({
+                    "symbol": str(symbol),
+                    "name": str(name or symbol)
+                })
+
+        log(f"{venue}: {len(symbols)} enstriman disponib pou API key sa a.")
+        return symbols
+
+    except Exception as error:
+        log(f"ERÈ KATALÒG {venue}: {error}")
+        return []
+
 
 def main():
-    log("BOT STARTING")
-    log("GitHub Actions kòmanse travay la.")
+    log("ROMARIO TRADER AP DEMARE")
 
-    if not TOKEN or not CHAT_ID:
-        log("STOP: TELEGRAM_TOKEN oswa TELEGRAM_CHAT_ID manke.")
+    if not TOKEN or not CHAT_ID or not API_KEY:
+        log(
+            "STOP: Ajiste TELEGRAM_TOKEN, TELEGRAM_CHAT_ID "
+            "ak OTCHARTS_API_KEY nan GitHub Secrets."
+        )
         return
 
-    log("Telegram Secrets disponib.")
-    signals_found = 0
-    assets_checked = 0
+    # Client la itilize OTCHARTS_API_KEY nan anviwònman an.
+    client = Client()
+    state = load_state()
 
-    for asset, symbol in ASSETS.items():
-        log(f"Kòmanse analiz: {asset}")
+    venues = [
+        ("forex", "FOREX"),
+        ("otc", "POCKET OPTION OTC")
+    ]
 
-        df = get_candles(symbol)
-        if df is None:
-            continue
+    pending = []
+    updated_keys = {}
 
-        assets_checked += 1
-        signal = analyze(df)
+    for venue, label in venues:
+        log(f"Ap chaje lis pè pou {label}")
+        symbols = get_symbols(client, venue)
 
-        if signal is None:
-            log(f"{asset}: PA GEN SIYAL KI KONFIME.")
-            continue
+        for item in symbols:
+            symbol = item["symbol"]
+            name = item["name"]
+            key = f"{venue}:{symbol}"
 
-        message = (
-            "ROMARIO TRADER - SIYAL EKSPERIMANTAL\n\n"
-            f"Direksyon: {signal['side']}\n"
-            f"Pè: {asset}\n"
-            f"Pri nan done yo: {signal['price']:.5f}\n"
-            f"EMA20: {signal['ema20']:.5f}\n"
-            f"EMA50: {signal['ema50']:.5f}\n"
-            f"RSI: {signal['rsi']:.1f}\n"
-            f"Zòn retest: {signal['zone']:.5f}\n"
-            f"Bouji: {signal['time']}\n\n"
-            "Done sa yo soti nan Yahoo Finance, PA nan "
-            "Pocket Option OTC. Siyal la pa garanti pwofi. "
-            "Verifye pri ak lè bouji a anvan ou pran nenpòt desizyon."
-        )
+            df = get_candles(client, venue, symbol)
+            if df is None:
+                continue
 
+            signal = analyze(df)
+
+            if signal is None:
+                log(f"Pa gen siyal konfime: {label} / {name}")
+                continue
+
+            # Evite voye menm siyal la plizyè fwa
+            # pou menm bouji a.
+            candle_key = signal["time"] + "|" + signal["side"]
+
+            if state.get(key) == candle_key:
+                log(f"Siyal deja voye: {name} / {candle_key}")
+                continue
+
+            message = (
+                "👑 ROMARIO TRADER\n\n"
+                f"Mache: {label}\n"
+                f"Pè: {name}\n"
+                f"Siyal: {signal['side']}\n"
+                f"Pri bouji a: {signal['price']}\n"
+                f"EMA20: {signal['ema20']}\n"
+                f"EMA50: {signal['ema50']}\n"
+                f"RSI(14): {signal['rsi']:.1f}\n"
+                f"Bouji: {signal['time']}\n\n"
+                "Estrateji: EMA20/50 + RSI + bouji direksyon.\n"
+                "Siyal eksperimantal; pa gen garanti pwofi.\n"
+                "Verifye pri ak bouji sou platfòm ou anvan trade."
+            )
+
+            pending.append((key, candle_key, message))
+            log(f"SIYAL JWENN: {label} / {name} / {signal['side']}")
+
+            # Pa kite yon sèl egzekisyon depase twòp tan.
+            time.sleep(0.2)
+
+    if not pending:
+        log("ANALIZ FINI: pa gen nouvo siyal.")
+        return
+
+    # Voye siyal yo youn apre lòt pou evite mesaj twò long.
+    for key, candle_key, message in pending:
         if send_telegram(message):
-            signals_found += 1
+            state[key] = candle_key
+            updated_keys[key] = candle_key
 
-    log(f"ANALIZ FINI | Pè analize: {assets_checked}")
-    log(f"Siyal voye avèk siksè: {signals_found}")
-    log("BOT FINISHED")
+    if updated_keys:
+        save_state(state)
+        log(f"Nouvo siyal trete: {len(updated_keys)}")
+
+    log("ANALIZ FINI")
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as error:
-        log(f"ERÈ JENERAL: {error}")
-        raise
+    main()
