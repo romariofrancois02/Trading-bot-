@@ -1,31 +1,27 @@
 name: Run Trading Bot
 
 on:
-  workflow_dispatch: # Pèmèt ou kouri l manuèlman ak yon bouton
-  schedule:
-    - cron: '*/5 * * * *' # Kouri otomatikman chak 5 minit (ou ka chanje l si w vle)
+  workflow_dispatch: # Sa vle di sèlman lè ou menm ou klike sou "Run workflow" l ap kouri!
 
 jobs:
-  run-bot:
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install requests pandas numpy yfinance
+          python -m __import__('pip').install --upgrade pip
+          pip install requests
 
-      - name: Execute Bot Script
+      - name: Run Bot
+        run: python bot.py
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python bot.py
