@@ -4,113 +4,91 @@ import time
 import requests
 import yfinance as yf
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 
-# ==============================
-# ROMARIO TRADER - EMA 20/50
-# 1-minute breakout + retest
-# ==============================
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-CHECK_EVERY_SECONDS = 15
-
-# Forex nòmal, PA OTC Pocket Option
 ASSETS = {
     "EUR/USD": "EURUSD=X",
     "GBP/USD": "GBPUSD=X",
     "USD/JPY": "JPY=X",
     "AUD/USD": "AUDUSD=X",
-    "USD/CAD": "CAD=X",
     "NZD/USD": "NZDUSD=X",
-    "USD/CHF": "CHF=X",
-    "EUR/JPY": "EURJPY=X",
-    "GBP/JPY": "GBPJPY=X",
 }
 
-last_signals = {}
-
-
 def log(message):
-    now = datetime.now().astimezone().strftime("%H:%M:%S")
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
     print(f"[{now}] {message}", flush=True)
 
-
-def send_telegram_msg(message):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("ERÈ: Ajiste TELEGRAM_TOKEN ak TELEGRAM_CHAT_ID.")
+def send_telegram(message):
+    if not TOKEN or not CHAT_ID:
+        log("ERÈ: Telegram Secrets yo manke.")
         return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
-    )
 
     try:
         response = requests.post(
-            url,
+            f"https://api.telegram.org/bot{TOKEN}/sendMessage",
             json={"chat_id": CHAT_ID, "text": message},
             timeout=10
         )
+        response.raise_for_status()
 
-        data = response.json()
+        if not response.json().get("ok"):
+            log("Telegram pa konfime mesaj la.")
+            return False
 
-        if response.ok and data.get("ok"):
-            log("Mesaj Telegram voye.")
-            return True
+        log("Telegram konfime mesaj la.")
+        return True
 
-        log(f"Telegram refize mesaj la: {data}")
+    except Exception as error:
+        log(f"ERÈ TELEGRAM: {error}")
         return False
-
-    except Exception as e:
-        log(f"Erè Telegram: {e}")
-        return False
-
 
 def get_candles(symbol):
-    """Jwenn bouji 1-minit ki disponib sou Yahoo Finance."""
+    log(f"Ap chèche bouji pou {symbol}...")
+
     try:
         df = yf.download(
-            symbol,
+            tickers=symbol,
             period="1d",
             interval="1m",
             progress=False,
             auto_adjust=False,
-            threads=False
+            threads=False,
+            timeout=12
         )
 
         if df is None or df.empty:
-            log(f"{symbol}: pa gen done.")
+            log(f"PA GEN DONE: {symbol}")
             return None
 
-        # Sipò pou kolòn MultiIndex kèk vèsyon yfinance
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
 
-        required = ["Open", "High", "Low", "Close"]
-        if not all(col in df.columns for col in required):
-            log(f"{symbol}: kolòn bouji yo manke.")
+        needed = ["Open", "High", "Low", "Close"]
+        if not all(col in df.columns for col in needed):
+            log(f"Kolòn bouji yo manke: {symbol}")
             return None
 
-        df = df[required].dropna()
+        df = df[needed].dropna()
 
-        # Retire dènye bouji a, paske li ka poko fini
+        # Dènye bouji a ka poko fèmen.
         if len(df) > 1:
             df = df.iloc[:-1].copy()
 
         if len(df) < 60:
-            log(f"{symbol}: pa gen ase bouji pou analiz.")
+            log(f"Pa gen ase bouji pou {symbol}: {len(df)}")
             return None
 
+        log(f"Done resevwa pou {symbol}: {len(df)} bouji")
         return df
 
-    except Exception as e:
-        log(f"Erè done {symbol}: {e}")
+    except Exception as error:
+        log(f"ERÈ DONE {symbol}: {error}")
         return None
 
-
-def add_indicators(df):
+def analyze(df):
     df = df.copy()
 
     df["EMA20"] = df["Close"].ewm(
@@ -121,180 +99,136 @@ def add_indicators(df):
         span=50, adjust=False
     ).mean()
 
-    delta = df["Close"].diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
+    change = df["Close"].diff()
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
 
-    avg_gain = gains.ewm(
+    avg_gain = gain.ewm(
         alpha=1/14, adjust=False, min_periods=14
     ).mean()
 
-    avg_loss = losses.ewm(
+    avg_loss = loss.ewm(
         alpha=1/14, adjust=False, min_periods=14
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["RSI"] = 100 - (100 / (1 + rs))
+    df = df.dropna()
 
-    return df.dropna()
-
-
-def analyze(df):
-    """
-    Breakout sou bouji -2, retest/konfimasyon
-    sou dènye bouji fèmen -1.
-    """
-
-    df = add_indicators(df)
-
-    if len(df) < 60:
+    if len(df) < 30:
         return None
 
     previous = df.iloc[-2]
     candle = df.iloc[-1]
-
-    # Zòn rezistans/sipò ki soti nan bouji ki
-    # vini anvan bouji breakout ak retest yo.
     reference = df.iloc[-23:-3]
 
-    resistance = reference["High"].max()
-    support = reference["Low"].min()
+    resistance = float(reference["High"].max())
+    support = float(reference["Low"].min())
 
     close = float(candle["Close"])
     open_price = float(candle["Open"])
     high = float(candle["High"])
     low = float(candle["Low"])
-
     ema20 = float(candle["EMA20"])
     ema50 = float(candle["EMA50"])
     rsi = float(candle["RSI"])
+    previous_close = float(previous["Close"])
 
-    prev_close = float(previous["Close"])
+    tolerance = close * 0.0002
 
-    # Tolerans retest: 10% lajè zòn referans lan
-    zone_width = resistance - support
-    tolerance = max(zone_width * 0.10, close * 0.0001)
-
-    bullish = close > open_price
-    bearish = close < open_price
-
-    # CALL: tandans monte + breakout + retest
-    call_breakout = prev_close > resistance
-    call_retest = (
-        low <= resistance + tolerance
-        and close > resistance
-    )
-
+    # CALL: breakout anwo, retest, fèmti anlè zòn nan
     if (
         ema20 > ema50
         and close > ema20
         and 52 <= rsi <= 68
-        and bullish
-        and call_breakout
-        and call_retest
+        and previous_close > resistance
+        and low <= resistance + tolerance
+        and close > resistance
+        and close > open_price
     ):
         return {
-            "direction": "CALL 🟢",
+            "side": "CALL",
             "price": close,
-            "rsi": rsi,
             "ema20": ema20,
             "ema50": ema50,
-            "zone": resistance
+            "rsi": rsi,
+            "zone": resistance,
+            "time": str(df.index[-1])
         }
 
-    # PUT: tandans desann + kase sipò + retest
-    put_breakout = prev_close < support
-    put_retest = (
-        high >= support - tolerance
-        and close < support
-    )
-
+    # PUT: breakout anba, retest, fèmti anba zòn nan
     if (
         ema20 < ema50
         and close < ema20
         and 32 <= rsi <= 48
-        and bearish
-        and put_breakout
-        and put_retest
+        and previous_close < support
+        and high >= support - tolerance
+        and close < support
+        and close < open_price
     ):
         return {
-            "direction": "PUT 🔴",
+            "side": "PUT",
             "price": close,
-            "rsi": rsi,
             "ema20": ema20,
             "ema50": ema50,
-            "zone": support
+            "rsi": rsi,
+            "zone": support,
+            "time": str(df.index[-1])
         }
 
     return None
 
+def main():
+    log("BOT STARTING")
+    log("GitHub Actions kòmanse travay la.")
 
-def run_bot():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        log("Mete TELEGRAM_TOKEN ak TELEGRAM_CHAT_ID anvan.")
+    if not TOKEN or not CHAT_ID:
+        log("STOP: TELEGRAM_TOKEN oswa TELEGRAM_CHAT_ID manke.")
         return
 
-    log("ROMARIO TRADER DEMARE.")
-    log("Mòd: Forex nòmal; EMA20/50 + RSI + retest.")
-    log("Ap tann bouji ki konfime yon konfigirasyon...")
+    log("Telegram Secrets disponib.")
+    signals_found = 0
+    assets_checked = 0
 
-    while True:
-        try:
-            for asset, symbol in ASSETS.items():
-                log(f"Analiz {asset}...")
+    for asset, symbol in ASSETS.items():
+        log(f"Kòmanse analiz: {asset}")
 
-                candles = get_candles(symbol)
-                if candles is None:
-                    continue
+        df = get_candles(symbol)
+        if df is None:
+            continue
 
-                signal = analyze(candles)
+        assets_checked += 1
+        signal = analyze(df)
 
-                if signal is None:
-                    log(f"{asset}: pa gen siyal konfime.")
-                    continue
+        if signal is None:
+            log(f"{asset}: PA GEN SIYAL KI KONFIME.")
+            continue
 
-                # Anpeche menm siyal la repete
-                # sou menm bouji a.
-                candle_time = str(candles.index[-1])
-                signal_key = (asset, candle_time, signal["direction"])
+        message = (
+            "ROMARIO TRADER - SIYAL EKSPERIMANTAL\n\n"
+            f"Direksyon: {signal['side']}\n"
+            f"Pè: {asset}\n"
+            f"Pri nan done yo: {signal['price']:.5f}\n"
+            f"EMA20: {signal['ema20']:.5f}\n"
+            f"EMA50: {signal['ema50']:.5f}\n"
+            f"RSI: {signal['rsi']:.1f}\n"
+            f"Zòn retest: {signal['zone']:.5f}\n"
+            f"Bouji: {signal['time']}\n\n"
+            "Done sa yo soti nan Yahoo Finance, PA nan "
+            "Pocket Option OTC. Siyal la pa garanti pwofi. "
+            "Verifye pri ak lè bouji a anvan ou pran nenpòt desizyon."
+        )
 
-                if last_signals.get(asset) == signal_key:
-                    continue
+        if send_telegram(message):
+            signals_found += 1
 
-                price = signal["price"]
-                rsi = signal["rsi"]
-
-                message = (
-                    "👑 ROMARIO TRADER 👑\n\n"
-                    f"📈 Pè: {asset}\n"
-                    f"🔥 Siyal: {signal['direction']}\n"
-                    f"💰 Pri referans: {price:.5f}\n"
-                    f"📊 EMA20: {signal['ema20']:.5f}\n"
-                    f"📊 EMA50: {signal['ema50']:.5f}\n"
-                    f"📉 RSI(14): {rsi:.1f}\n"
-                    f"🎯 Zòn breakout/retest: "
-                    f"{signal['zone']:.5f}\n"
-                    f"🕒 Bouji fèmen: {candle_time}\n\n"
-                    "⚠️ Siyal eksperimantal, pa garanti pwofi.\n"
-                    "Done yo soti nan Yahoo Finance, pa nan "
-                    "Pocket Option OTC.\n"
-                    "Verifye pri aktyèl la anvan nenpòt desizyon."
-                )
-
-                if send_telegram_msg(message):
-                    last_signals[asset] = signal_key
-
-            log("Analiz fini; pwochen sik la ap kòmanse.")
-            time.sleep(CHECK_EVERY_SECONDS)
-
-        except KeyboardInterrupt:
-            log("Bot la kanpe.")
-            break
-
-        except Exception as e:
-            log(f"Erè jeneral: {e}")
-            time.sleep(10)
-
+    log(f"ANALIZ FINI | Pè analize: {assets_checked}")
+    log(f"Siyal voye avèk siksè: {signals_found}")
+    log("BOT FINISHED")
 
 if __name__ == "__main__":
-    run_bot()
+    try:
+        main()
+    except Exception as error:
+        log(f"ERÈ JENERAL: {error}")
+        raise
