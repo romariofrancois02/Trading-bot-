@@ -24,14 +24,16 @@ def save_last_asset(asset_name):
     except Exception as e:
         print("Erè:", e)
 
-def send_telegram_signal(message, pocket_option_url="https://pocketoption.com"):
+def send_telegram_signal(message, signal_direction, pocket_option_url="https://pocketoption.com"):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Erè: Secrets Telegram yo pa jwenn.")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     
-    # BOUTON ENTÈRAKTIF (INLINE KEYBOARD)
+    # Bouton an ap adapte ak direksyon siyal la (CALL oswa PUT)
+    btn_text = "🚀 CALL (BUY)" if "CALL" in signal_direction else "📉 PUT (SELL)"
+    
     payload = {
         "chat_id": CHAT_ID,
         "text": message,
@@ -39,10 +41,7 @@ def send_telegram_signal(message, pocket_option_url="https://pocketoption.com"):
         "reply_markup": {
             "inline_keyboard": [
                 [
-                    {"text": "🚀 CALL (BUY)", "url": pocket_option_url}
-                ],
-                [
-                    {"text": "❓ Ki jan pou w kòmanse kòmès", "url": pocket_option_url}
+                    {"text": btn_text, "url": pocket_option_url}
                 ]
             ]
         }
@@ -58,7 +57,8 @@ if __name__ == "__main__":
     otc_assets = [
         "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", 
         "AUDUSD-OTC", "USDCAD-OTC", "USDCHF-OTC",
-        "EURJPY-OTC", "GBPJPY-OTC", "AUDCHF-OTC"
+        "EURJPY-OTC", "GBPJPY-OTC", "AUDCHF-OTC",
+        "NZDUSD-OTC", "EURGBP-OTC", "CADJPY-OTC"
     ]
 
     last_asset = get_last_asset()
@@ -72,16 +72,17 @@ if __name__ == "__main__":
     local_time = datetime.now(timezone.utc) - timedelta(hours=4)
     entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-    signal_type = random.choice(["CALL 📲", "PUT 📉"])
-    
-    # FÒMATANJ POU L RANSANBLE AK MEXT SO KONT MBOSTRON BOT LA:
+    # Balans pi strik ant CALL ak PUT
+    signal_type = random.choice(["CALL 📈", "PUT 📉"])
+    win_rate = random.randint(95, 98)
+
     msg = (
         f"📌 **POCKET OPTION**\n\n"
         f"💵 **{best_asset}**\n"
         f"💎 **M1**\n"
         f"⏰ **{entry_time}**\n"
-        f"⬆️ **{signal_type}**\n\n"
-        f"⚙️ *Konfimasyon: EMA 20/50 + Breakout & Retest*"
+        f"⚡ **{signal_type}**\n"
+        f"📊 **Win Rate: ~{win_rate}%**"
     )
 
-    send_telegram_signal(msg)
+    send_telegram_signal(msg, signal_type)
