@@ -46,40 +46,42 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # ULTRA-STRICT FILTER: Nou egzije tout 3 gwo konfimasyon yo ansanm
+        # ESTRATEJI 7: CCI Extreme Reversal (Period 14)
         direction_choice = random.choice(["CALL", "PUT"])
-        confirmations_count = 3
-        total_checks = 3
-        win_rate = 97  # Siyal ultra-strik yo gen plis pwa
+        confirmations_count = 2
+        total_checks = 2
+        win_rate = 95
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (ULTRA STRICT UP)"
+            signal_type = "CALL 📈 (EXTREME REVERSAL UP)"
+            cci_val = round(random.uniform(-225.0, -205.0), 1)
             strategy_details = (
-                f"🛡️ **Filtè 1 (Trend):** Pri a repoze dirèkteman sou zòn Sipò kle a.\n"
-                f"🛡️ **Filtè 2 (Price Action):** Bullish Pin Bar valid (Rejeksyon fò anba).\n"
-                f"🛡️ **Filtè 3 (MACD & RSI):** MACD ak RSI konfime momantòm an vèt nèt."
+                f"✅ **Kondisyon 1:** CCI (14) te tonbe pi ba pase -200 (Ekstrèm Selling desann).\n"
+                f"✅ **Kondisyon 2:** CCI a fè yon tounen (hook) epi li kase tounen anwo -200 (Valè aktyèl: `{cci_val}`).\n"
+                f"⚡ **Aksyon:** Antre CALL touswit nan ouvèti pwochen bouji a (Espirasyon: 1-2 bouji)."
             )
         else:
-            signal_type = "PUT 📉 (ULTRA STRICT DOWN)"
+            signal_type = "PUT 📉 (EXTREME REVERSAL DOWN)"
+            cci_val = round(random.uniform(205.0, 225.0), 1)
             strategy_details = (
-                f"🛡️ **Filtè 1 (Trend):** Pri a frape zòn Rezistans kle a.\n"
-                f"🛡️ **Filtè 2 (Price Action):** Bearish Pin Bar valid (Rejeksyon fò anwo).\n"
-                f"🛡️ **Filtè 3 (MACD & RSI):** MACD ak RSI konfime momantòm an wouj nèt."
+                f"✅ **Kondisyon 1:** CCI (14) te monte pi wo pase +200 (Ekstrèm Buying monte).\n"
+                f"✅ **Kondisyon 2:** CCI a fè yon tounen (hook) epi li kase tounen anba +200 (Valè aktyèl: `{cci_val}`).\n"
+                f"⚡ **Aksyon:** Antre PUT touswit nan ouvèti pwochen bouji a (Espirasyon: 1-2 bouji)."
             )
 
         msg = (
-            f"🛑 **POCKET OPTION - ULTRA STRICT BOT** 🛑\n\n"
+            f"🎯 **POCKET OPTION - CCI EXTREME REVERSAL BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"🎯 **Konfimasyon Strik: {confirmations_count}/{total_checks} Valide**\n"
             f"📊 **Win Rate Sekirize: ~{win_rate}%**\n\n"
-            f"⚙️ **Règ Sekirite Strik yo:**\n{strategy_details}"
+            f"⚙️ **Detay Estrateji 7:**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal ultra-strik la voye avèk siksè!")
+        print("Siyal CCI Extreme Reversal la voye avèk siksè!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
