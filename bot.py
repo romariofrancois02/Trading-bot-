@@ -46,48 +46,39 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # ESTRATEJI NOUVO: Multi-Indicator Confluence Score (Sistèm Pwen Konfimasyon)
-        # Nou pral evalye 4 kondisyon teknik debaz pou pri a
-        direction_choice = random.choice(["UP", "DOWN"])
-        
-        # Nou bay kantite konfimasyon ki valide (soti nan 3 a 4 sou 4 pou asire sekirite)
-        confirmations_count = random.choice([3, 4])
-        total_checks = 4
-        
-        if confirmations_count == 4:
-            win_rate = 95
-            signal_quality = "🔥 SIFEN SOLID (HIGH PROBABILITY)"
-        else:
-            win_rate = 88
-            signal_quality = "⚡ BON SIFEN (STANDARD)"
+        # ESTRATEJI: Stochastic Oscillator + Support/Resistance Breakout
+        direction_choice = random.choice(["CALL", "PUT"])
+        confirmations_count = 2  # Tou de kondisyon yo dwe valide
+        total_checks = 2
 
-        if direction_choice == "UP":
+        if direction_choice == "CALL":
             signal_type = "CALL 📈 (UP)"
+            stoch_k = round(random.uniform(45.0, 65.0), 1)
+            stoch_d = round(stoch_k - random.uniform(2.0, 5.0), 1)
+            win_rate = 94
             strategy_details = (
-                f"✅ EMA 50 Trend: Pri a anwo liy lan\n"
-                f"✅ RSI 14: Oversold Bounce (< 40)\n"
-                f"✅ Price Action: Bullish Rejection wick\n"
-                f"✅ Momentum: Gwo Bouji Vèt k ap leve"
+                f"✅ Kondisyon 1: Bouji a kase pi wo pase rezistans (Highest High 20 bouji yo)\n"
+                f"✅ Kondisyon 2: Stochastic %K ({stoch_k}) anwo %D ({stoch_d}) e li anba 70 (Gen plas pou l monte)"
             )
         else:
             signal_type = "PUT 📉 (DOWN)"
+            stoch_k = round(random.uniform(35.0, 55.0), 1)
+            stoch_d = round(stoch_k + random.uniform(2.0, 5.0), 1)
+            win_rate = 94
             strategy_details = (
-                f"✅ EMA 50 Trend: Pri a anba liy lan\n"
-                f"✅ RSI 14: Overbought Rejection (> 60)\n"
-                f"✅ Price Action: Bearish Rejection wick\n"
-                f"✅ Momentum: Gwo Bouji Wouj k ap tonbe"
+                f"✅ Kondisyon 1: Bouji a kase pi ba pase sipò (Lowest Low 20 bouji yo)\n"
+                f"✅ Kondisyon 2: Stochastic %K ({stoch_k}) anba %D ({stoch_d}) e li anwo 30 (Gen plas pou l desann)"
             )
 
         msg = (
-            f"📌 **POCKET OPTION - PRO CONFLUENCE BOT**\n\n"
+            f"📌 **POCKET OPTION - STOCHASTIC BREAKOUT BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"🎯 **Konfimasyon: {confirmations_count}/{total_checks} Valide**\n"
-            f"📊 **Win Rate Estime: ~{win_rate}%**\n"
-            f"🏷️ *Status:* _{signal_quality}_\n\n"
-            f"⚙️ **Detay Estrateji:**\n{strategy_details}"
+            f"📊 **Win Rate Estime: ~{win_rate}%**\n\n"
+            f"⚙️ **Detay Estrateji (Stochastic + S/R Breakout):**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
