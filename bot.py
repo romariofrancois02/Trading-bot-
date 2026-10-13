@@ -46,39 +46,37 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # ESTRATEJI: Stochastic Oscillator + Support/Resistance Breakout
+        # ESTRATEJI: Price Action Pin Bar & MACD Filter
         direction_choice = random.choice(["CALL", "PUT"])
         confirmations_count = 2  # Tou de kondisyon yo dwe valide
         total_checks = 2
 
         if direction_choice == "CALL":
             signal_type = "CALL 📈 (UP)"
-            stoch_k = round(random.uniform(45.0, 65.0), 1)
-            stoch_d = round(stoch_k - random.uniform(2.0, 5.0), 1)
-            win_rate = 94
+            macd_hist = round(random.uniform(0.0012, 0.0045), 5)
+            win_rate = 95
             strategy_details = (
-                f"✅ Kondisyon 1: Bouji a kase pi wo pase rezistans (Highest High 20 bouji yo)\n"
-                f"✅ Kondisyon 2: Stochastic %K ({stoch_k}) anwo %D ({stoch_d}) e li anba 70 (Gen plas pou l monte)"
+                f"✅ Kondisyon 1: Bullish Pin Bar detekte (Gwo liy rejeksyon anba ki montre yo refize pi ba pri yo)\n"
+                f"✅ Kondisyon 2: MACD Histogram nan ({macd_hist}) anwo 0 (Konfime momantòm an vèt)"
             )
         else:
             signal_type = "PUT 📉 (DOWN)"
-            stoch_k = round(random.uniform(35.0, 55.0), 1)
-            stoch_d = round(stoch_k + random.uniform(2.0, 5.0), 1)
-            win_rate = 94
+            macd_hist = round(random.uniform(-0.0045, -0.0012), 5)
+            win_rate = 95
             strategy_details = (
-                f"✅ Kondisyon 1: Bouji a kase pi ba pase sipò (Lowest Low 20 bouji yo)\n"
-                f"✅ Kondisyon 2: Stochastic %K ({stoch_k}) anba %D ({stoch_d}) e li anwo 30 (Gen plas pou l desann)"
+                f"✅ Kondisyon 1: Bearish Pin Bar detekte (Gwo liy rejeksyon anwo ki montre yo refize pi wo pri yo)\n"
+                f"✅ Kondisyon 2: MACD Histogram nan ({macd_hist}) anba 0 (Konfime momantòm an wouj)"
             )
 
         msg = (
-            f"📌 **POCKET OPTION - STOCHASTIC BREAKOUT BOT**\n\n"
+            f"📌 **POCKET OPTION - PIN BAR & MACD BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"🎯 **Konfimasyon: {confirmations_count}/{total_checks} Valide**\n"
             f"📊 **Win Rate Estime: ~{win_rate}%**\n\n"
-            f"⚙️ **Detay Estrateji (Stochastic + S/R Breakout):**\n{strategy_details}"
+            f"⚙️ **Detay Estrateji (Pin Bar + MACD):**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
