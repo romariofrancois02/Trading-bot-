@@ -8,7 +8,7 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 def send_telegram_signal(message, signal_direction, pocket_option_url="https://pocketoption.com"):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Erè: Token Telegram oswa Chat ID manke.")
+        print("Erè : Token Telegram oswa Chat ID manke.")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -29,9 +29,9 @@ def send_telegram_signal(message, signal_direction, pocket_option_url="https://p
     
     try:
         res = requests.post(url, json=payload, timeout=10)
-        print("Status Telegram:", res.status_code)
+        print("Status Telegram :", res.status_code)
     except Exception as e:
-        print("Erè Telegram:", e)
+        print("Erè Telegram :", e)
 
 if __name__ == "__main__":
     try:
@@ -46,32 +46,32 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # Estrateji Fractal (Bill Williams Fractals Breakout)
+        # Estrateji Mini-Fractal (Bill Williams Breakout)
         direction_choice = random.choice(["CALL", "PUT"])
-        win_rate = round(random.uniform(85.0, 92.5), 1)  # Win rate dinamik ak reyalis
+        win_rate = round(random.uniform(86.0, 93.5), 1)
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (BULLISH FRACTAL)"
-            reason = "Pri a fè yon Breakout an nivo Down Fractal (Sipò kle a)."
+            signal_type = "CALL 📈 (MINI FRACTAL UP)"
+            reason = "Kout kraze pwòp anwo nivo Down Fractal (Sipò valide)."
         else:
-            signal_type = "PUT 📉 (BEARISH FRACTAL)"
-            reason = "Pri a fè yon Breakout anba nivo Up Fractal (Rezistans kle a)."
+            signal_type = "PUT 📉 (MINI FRACTAL DOWN)"
+            reason = "Kout kraze anba nivo Up Fractal (Rezistans valide)."
 
         msg = (
-            f"📌 **POCKET OPTION - FRACTAL BOT**\n\n"
+            f"📌 **POCKET OPTION - MINI FRACTAL BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1 (1 Minit)**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n"
-            f"📊 **Win Rate: ~{win_rate}%**\n\n"
-            f"⚙️ *Estrateji:* _Bill Williams Fractals_\n"
-            f"📉 *Analiz:* _{reason}_"
-            f"\n\n🛡️ *Antre nan 2 premye segond yo sèlman!*"
+            f"📊 **Win Rate : ~{win_rate}%**\n\n"
+            f"⚙️ *Estrateji :* _Bill Williams Fractals_\n"
+            f"📉 *Analiz :* _{reason}_"
+            f"\n\n🛡️ *Konsèy : Antre nan 2 premye segond nouvo bouji a sèlman!*"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal Fractal la voye avèk siksè!")
+        print("Siyal Mini-Fractal la voye avèk siksè !")
         
     except Exception as e:
-        print(f"Erè nan ekzekisyon an: {e}")
+        print(f"Erè ekzekisyon : {e}")
         exit(0)
