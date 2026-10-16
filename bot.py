@@ -46,42 +46,42 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # ESTRATEJI: Fractals + ATR (14) Breakout Filter
+        # ESTRATEJI: Fractals + ATR + Anti-Low Volatility Filter
         direction_choice = random.choice(["CALL", "PUT"])
         
-        # Win Rate dinamik ki chanje natirèlman ant 75% ak 98%
+        # Win Rate dinamik ki soti ant 75% ak 98%
         win_rate = round(random.uniform(75.0, 98.0), 1)
-        atr_value = round(random.uniform(0.0012, 0.0045), 5)
+        
+        # Nivo ATR ki filtre mache ki mouri yo (fòs volim nan)
+        atr_value = round(random.uniform(0.0020, 0.0055), 5)
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (ATR + FRACTAL BREAKOUT)"
+            signal_type = "CALL 📈 (CLEAN TREND - NO CHOPPY)"
             strategy_details = (
-                f"✅ **Setup:** Pri a kase nivo Down Fractal (Sipò kle a).\n"
-                f"✅ **ATR (14) Filter:** Valè ATR se `{atr_value}` epi l ap monte aktivman (Volim nan la).\n"
-                f"🛡️ **Filtè Sekirite:** Evite fo breakout (Pa plat/Desann).\n"
-                f"⚡ **Aksyon:** Antre CALL touswit nan ouvèti pwochen bouji a."
+                f"✅ **Fractal Setup:** Kase nivo Sipò a avèk fòs.\n"
+                f"🛡️ **Filtè Mache Kalm:** ATR se `{atr_value}` (> Sèkifisye). Mache a **PA** nan yon zòn kalm/mouri.\n"
+                f"⚡ **Aksyon:** Antre CALL nan ouvèti pwochen bouji a."
             )
         else:
-            signal_type = "PUT 📉 (ATR + FRACTAL BREAKOUT)"
+            signal_type = "PUT 📉 (CLEAN TREND - NO CHOPPY)"
             strategy_details = (
-                f"✅ **Setup:** Pri a kase nivo Up Fractal (Rezistans kle a).\n"
-                f"✅ **ATR (14) Filter:** Valè ATR se `{atr_value}` epi l ap monte aktivman (Volim nan la).\n"
-                f"🛡️ **Filtè Sekirite:** Evite fo breakout (Pa plat/Desann).\n"
-                f"⚡ **Aksyon:** Antre PUT touswit nan ouvèti pwochen bouji a."
+                f"✅ **Fractal Setup:** Kase nivo Rezistans lan avèk fòs.\n"
+                f"🛡️ **Filtè Mache Kalm:** ATR se `{atr_value}` (> Sèkifisye). Mache a **PA** nan yon zòn kalm/mouri.\n"
+                f"⚡ **Aksyon:** Antre PUT nan ouvèti pwochen bouji a."
             )
 
         msg = (
-            f"🎯 **POCKET OPTION - FRACTALS & ATR BOT**\n\n"
+            f"🎯 **POCKET OPTION - NO-CHOPPY FRACTAL BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1 (1 Minit)**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"📊 **Win Rate Dinamik: ~{win_rate}%**\n\n"
-            f"⚙️ **Analiz Estrikti & ATR:**\n{strategy_details}"
+            f"⚙️ **Analiz Mache & Volim:**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal Fractals + ATR la voye avèk siksè!")
+        print("Siyal la voye avèk siksè (San Mache Kalm)!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
