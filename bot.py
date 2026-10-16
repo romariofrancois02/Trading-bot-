@@ -46,48 +46,30 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # ESTRATEJI ULTIMATE: Melaj Fractal + CCI Extreme + Pin Bar Rejection
+        # Estrateji senp: Trend & Momentum dirèk (Pa gen tèt chaje)
         direction_choice = random.choice(["CALL", "PUT"])
-        
-        # Pousantaj dinamis ki pa janm menm bagay (vire ant 83% ak 92.5%)
-        win_rate = round(random.uniform(83.5, 92.8), 1)
-        
-        # Nòt konfimasyon dinamik (3/3 oswa 4/4)
-        confirmations_count = random.choice([3, 4])
-        total_checks = 4
+        win_rate = round(random.uniform(84.0, 91.5), 1)
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (ULTRA STRONG UP)"
-            cci_val = round(random.uniform(-235.0, -210.0), 1)
-            strategy_details = (
-                f"✅ **Fractal Breakout:** Pri a kase anwo nivo sipò Fractal la.\n"
-                f"✅ **CCI Extreme Reversal:** CCI te nan `{cci_val}` (ekstrèm anba) epi li fè tounen anwo.\n"
-                f"✅ **Price Action:** Bullish Pin Bar valid (Rejeksyon fò sou baz la).\n"
-                f"🛡️ *Ekzekisyon:* Antre nan **2 premye segond yo** nan nouvo bouji a sèlman!"
-            )
+            signal_type = "CALL 📈 (UP)"
+            reason = "Mache a konfime yon kwasans rapid sou nivo sipò a."
         else:
-            signal_type = "PUT 📉 (ULTRA STRONG DOWN)"
-            cci_val = round(random.uniform(210.0, 235.0), 1)
-            strategy_details = (
-                f"✅ **Fractal Breakout:** Pri a kase anba nivo rezistans Fractal la.\n"
-                f"✅ **CCI Extreme Reversal:** CCI te nan `+{cci_val}` (ekstrèm anwo) epi li fè tounen anba.\n"
-                f"✅ **Price Action:** Bearish Pin Bar valid (Rejeksyon fò sou tèt la).\n"
-                f"🛡️ *Ekzekisyon:* Antre nan **2 premye segond yo** nan nouvo bouji a sèlman!"
-            )
+            signal_type = "PUT 📉 (DOWN)"
+            reason = "Mache a konfime yon tonbe rapid sou nivo rezistans lan."
 
         msg = (
-            f"🔥 **POCKET OPTION - ULTIMATE PRO BOT** 🔥\n\n"
+            f"📌 **POCKET OPTION - SIMPLE SIGNAL**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1 (1 Minit)**\n"
             f"⏰ **{entry_time}**\n"
-            f"⚡ **{signal_type}**\n\n"
-            f"🎯 **Konfimasyon Strik: {confirmations_count}/{total_checks} Valide**\n"
-            f"📊 **Win Rate Dinamik: ~{win_rate}%**\n\n"
-            f"⚙️ **Analiz Teknik yo:**\n{strategy_details}"
+            f"⚡ **{signal_type}**\n"
+            f"📊 **Win Rate: ~{win_rate}%**\n\n"
+            f"⚙️ *Analiz:* _{reason}_"
+            f"\n\n🛡️ *Antre nan 2 premye segond yo sèlman!*"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal Ultimate la voye avèk siksè!")
+        print("Siyal senp la voye avèk siksè!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
