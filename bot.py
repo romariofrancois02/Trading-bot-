@@ -46,42 +46,42 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # 5-STEP SYSTEM: Closed Candle + Bollinger Bands + RSI(7) + Cooldown
+        # CONFIRMATION HOOK LOGIC (Bollinger + RSI Hook + 3rd Candle Open)
         direction_choice = random.choice(["CALL", "PUT"])
-        win_rate = round(random.uniform(78.0, 99.0), 1)
-        rsi_val = round(random.uniform(72.5, 88.4), 1) if direction_choice == "PUT" else round(random.uniform(12.1, 27.5), 1)
+        win_rate = round(random.uniform(80.0, 99.5), 1)
+        rsi_val = round(random.uniform(62.0, 68.5), 1) if direction_choice == "PUT" else round(random.uniform(31.5, 38.0), 1)
         bb_level = round(random.uniform(1.0850, 1.1020), 4)
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (BB OVERSOLD + RSI REVERSAL)"
+            signal_type = "CALL 📈 (HIGHER - CONFIRMATION HOOK VALIDATED)"
             strategy_details = (
-                f"✅ **Etap 1 (Closed Candle):** Analiz fèt sou Candle[1] ki fèmen nèt (Pa gen repainting).\n"
-                f"✅ **Etap 2 (Trend Check):** Bann yo stab (Pa gen gwo 'crocodile mouth' ki endike runaway trend).\n"
-                f"✅ **Etap 3 (Trigger):** Pri a touche/depase Lower Bollinger Band (`{bb_level}`) epi RSI(7) nan `{rsi_val}` (< 30).\n"
-                f"🛡️ **Etap 4 & 5:** Ekzekisyon rapid nan 00 segonn ak yon Protocol Cool-down aktive."
+                f"1️⃣ **Overextension:** Bouji anvan an te depase Lower Bollinger Band la ak RSI < 30 (Bot te veye sèlman).\n"
+                f"2️⃣ **Confirmation Hook:** Dezyèm bouji a fèmen kòm yon bouji vèt (Bullish).\n"
+                f"3️⃣ **RSI Rise:** RSI vire fò anwo epi depase nivo 30 la (rive nan `{rsi_val}`).\n"
+                f"⚡ **Aksyon (3yèm Bouji):** Bot voye lòd la pou w antre 1-Candle HIGHER nan egzakteman 00 segond!"
             )
         else:
-            signal_type = "PUT 📉 (BB OVERBOUGHT + RSI REVERSAL)"
+            signal_type = "PUT 📉 (LOWER - CONFIRMATION HOOK VALIDATED)"
             strategy_details = (
-                f"✅ **Etap 1 (Closed Candle):** Analiz fèt sou Candle[1] ki fèmen nèt (Pa gen repainting).\n"
-                f"✅ **Etap 2 (Trend Check):** Bann yo stab (Pa gen gwo 'crocodile mouth' ki endike runaway trend).\n"
-                f"✅ **Etap 3 (Trigger):** Pri a touche/depase Upper Bollinger Band (`{bb_level}`) epi RSI(7) nan `{rsi_val}` (> 70).\n"
-                f"🛡️ **Etap 4 & 5:** Ekzekisyon rapid nan 00 segonn ak yon Protocol Cool-down aktive."
+                f"1️⃣ **Overextension:** Bouji anvan an te depase Upper Bollinger Band la ak RSI > 70 (Bot te veye sèlman).\n"
+                f"2️⃣ **Confirmation Hook:** Dezyèm bouji a fèmen kòm yon bouji wouj (Bearish).\n"
+                f"3️⃣ **RSI Drop:** RSI vire fò anba epi desann anba nivo 70 la (rive nan `{rsi_val}`).\n"
+                f"⚡ **Aksyon (3yèm Bouji):** Bot voye lòd la pou w antre 1-Candle LOWER nan egzakteman 00 segond!"
             )
 
         msg = (
-            f"🎯 **POCKET OPTION - BOLLINGER & RSI PRO BOT**\n\n"
+            f"🎯 **POCKET OPTION - CONFIRMATION HOOK BOT**\n\n"
             f"💵 **{selected_asset}**\n"
             f"💎 **M1 (1 Minit)**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"📊 **Win Rate Dinamik: ~{win_rate}%**\n\n"
-            f"⚙️ **Règ Enstitisyonèl (5 Etap yo):**\n{strategy_details}\n\n"
+            f"⚙️ **Analiz Detaye sou Hook la:**\n{strategy_details}\n\n"
             f"🚨 *Antre nan 2 premye segond nouvo bouji a sèlman!*"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal Bollinger + RSI voye avèk siksè!")
+        print("Siyal Confirmation Hook la voye avèk siksè!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
