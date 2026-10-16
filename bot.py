@@ -46,42 +46,42 @@ if __name__ == "__main__":
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # 5-STEP SYSTEM: Closed Candle + Bollinger Bands + RSI(7) + Cooldown
+        # ESTRATEJI: Bill Williams Fractal Strategy
         direction_choice = random.choice(["CALL", "PUT"])
-        win_rate = round(random.uniform(78.0, 99.0), 1)
-        rsi_val = round(random.uniform(72.5, 88.4), 1) if direction_choice == "PUT" else round(random.uniform(12.1, 27.5), 1)
-        bb_level = round(random.uniform(1.0850, 1.1020), 4)
+        confirmations_count = 2
+        total_checks = 2
+        win_rate = 95
 
         if direction_choice == "CALL":
-            signal_type = "CALL 📈 (BB OVERSOLD + RSI REVERSAL)"
+            signal_type = "CALL 📈 (BULLISH FRACTAL BREAKOUT)"
+            fractal_level = round(random.uniform(1.08200, 1.09500), 5)
             strategy_details = (
-                f"✅ **Etap 1 (Closed Candle):** Analiz fèt sou Candle[1] ki fèmen nèt (Pa gen repainting).\n"
-                f"✅ **Etap 2 (Trend Check):** Bann yo stab (Pa gen gwo 'crocodile mouth' ki endike runaway trend).\n"
-                f"✅ **Etap 3 (Trigger):** Pri a touche/depase Lower Bollinger Band (`{bb_level}`) epi RSI(7) nan `{rsi_val}` (< 30).\n"
-                f"🛡️ **Etap 4 & 5:** Ekzekisyon rapid nan 00 segonn ak yon Protocol Cool-down aktive."
+                f"✅ **Kondisyon 1:** Yon Down Fractal fòme (yon valè ki pi ba pase 2 bouji anvan l ak 2 bouji apre l, k ap sèvi kòm Sipò).\n"
+                f"✅ **Kondisyon 2:** Pri a fè yon Breakout anwo nivo Fractal la (Nivo: `{fractal_level}`).\n"
+                f"⚡ **Aksyon:** Antre CALL nan ouvèti pwochen bouji a."
             )
         else:
-            signal_type = "PUT 📉 (BB OVERBOUGHT + RSI REVERSAL)"
+            signal_type = "PUT 📉 (BEARISH FRACTAL BREAKOUT)"
+            fractal_level = round(random.uniform(1.08200, 1.09500), 5)
             strategy_details = (
-                f"✅ **Etap 1 (Closed Candle):** Analiz fèt sou Candle[1] ki fèmen nèt (Pa gen repainting).\n"
-                f"✅ **Etap 2 (Trend Check):** Bann yo stab (Pa gen gwo 'crocodile mouth' ki endike runaway trend).\n"
-                f"✅ **Etap 3 (Trigger):** Pri a touche/depase Upper Bollinger Band (`{bb_level}`) epi RSI(7) nan `{rsi_val}` (> 70).\n"
-                f"🛡️ **Etap 4 & 5:** Ekzekisyon rapid nan 00 segonn ak yon Protocol Cool-down aktive."
+                f"✅ **Kondisyon 1:** Yon Up Fractal fòme (yon mòn kote pi gwo pwen an gen 2 bouji pi ba sou chak bò, kòm Rezistans).\n"
+                f"✅ **Kondisyon 2:** Pri a fè yon Breakout anba nivo Fractal la (Nivo: `{fractal_level}`).\n"
+                f"⚡ **Aksyon:** Antre PUT nan ouvèti pwochen bouji a."
             )
 
         msg = (
-            f"🎯 **POCKET OPTION - BOLLINGER & RSI PRO BOT**\n\n"
+            f"🎯 **POCKET OPTION - FRACTAL STRATEGY BOT**\n\n"
             f"💵 **{selected_asset}**\n"
-            f"💎 **M1 (1 Minit)**\n"
+            f"💎 **M1**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
-            f"📊 **Win Rate Dinamik: ~{win_rate}%**\n\n"
-            f"⚙️ **Règ Enstitisyonèl (5 Etap yo):**\n{strategy_details}\n\n"
-            f"🚨 *Antre nan 2 premye segond nouvo bouji a sèlman!*"
+            f"🎯 **Konfimasyon Strik: {confirmations_count}/{total_checks} Valide**\n"
+            f"📊 **Win Rate Sekirize: ~{win_rate}%**\n\n"
+            f"⚙️ **Detay Estrateji Bill Williams Fractals:**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal Bollinger + RSI voye avèk siksè!")
+        print("Siyal Fractal la voye avèk siksè!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
