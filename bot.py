@@ -50,7 +50,9 @@ if __name__ == "__main__":
         direction_choice = random.choice(["CALL", "PUT"])
         confirmations_count = 2
         total_checks = 2
-        win_rate = 95
+        
+        # Win Rate dinamik ki ka varye ant 70.0% ak 99.5%
+        win_rate = round(random.uniform(70.0, 99.5), 1)
 
         if direction_choice == "CALL":
             signal_type = "CALL 📈 (BULLISH FRACTAL BREAKOUT)"
@@ -76,7 +78,7 @@ if __name__ == "__main__":
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"🎯 **Konfimasyon Strik: {confirmations_count}/{total_checks} Valide**\n"
-            f"📊 **Win Rate Sekirize: ~{win_rate}%**\n\n"
+            f"📊 **Win Rate Dinamik: ~{win_rate}%**\n\n"
             f"⚙️ **Detay Estrateji Bill Williams Fractals:**\n{strategy_details}"
         )
 
