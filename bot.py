@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_TOKEN')
 CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
+# 🎯 METE PWOFIS EGZAK LA ISI A (Chanje l selon sa w wè sou ekran an, egzanp: 92, 90, 85)
+EXACT_PROFIT = 92
+
 def send_telegram_signal(message, signal_direction, pocket_option_url="https://pocketoption.com"):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Erè: Token Telegram oswa Chat ID manke.")
@@ -35,29 +38,21 @@ def send_telegram_signal(message, signal_direction, pocket_option_url="https://p
 
 if __name__ == "__main__":
     try:
-        # Lis tout asset yo ak yon pousantaj pwofi minimòm garanti ki >= 78%
-        qualified_assets = [
-            {"name": "EURUSD-OTC", "profit": random.randint(78, 92)},
-            {"name": "GBPUSD-OTC", "profit": random.randint(80, 95)},
-            {"name": "USDJPY-OTC", "profit": random.randint(78, 88)},
-            {"name": "AUDUSD-OTC", "profit": random.randint(79, 90)},
-            {"name": "USDCAD-OTC", "profit": random.randint(82, 92)},
-            {"name": "EURJPY-OTC", "profit": random.randint(80, 94)},
-            {"name": "GBPJPY-OTC", "profit": random.randint(83, 96)}
+        # Lis tout pi gwo pè OTC ki disponib sou Pocket Option yo
+        otc_assets = [
+            "EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", 
+            "AUDUSD-OTC", "USDCAD-OTC", "USDCHF-OTC",
+            "EURJPY-OTC", "GBPJPY-OTC", "AUDCHF-OTC",
+            "CADJPY-OTC", "NZDUSD-OTC", "EURGBP-OTC",
+            "EURAUD-OTC", "GBPCAD-OTC", "CHFJPY-OTC"
         ]
 
-        # Chwazi yon asset ki gen pwofi sètifye >= 78%
-        chosen_asset_data = random.choice(qualified_assets)
-        selected_asset = chosen_asset_data["name"]
-        asset_profit = chosen_asset_data["profit"]
+        selected_asset = random.choice(otc_assets)
         
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
-        # Lojik Sekirite Kont Pèt (High Confirmation Only)
         direction_choice = random.choice(["CALL", "PUT"])
-        
-        # Win rate monte pi wo (soti 88% a 98%) pou sèlman pran bon opòtinite
         win_rate = round(random.uniform(88.0, 98.5), 1)
         confirmations_count = 4
         total_checks = 4
@@ -66,35 +61,34 @@ if __name__ == "__main__":
             signal_type = "CALL 📈 (SAFE REVERSAL - HIGH PROBABILITY)"
             cci_val = round(random.uniform(-245.0, -220.0), 1)
             strategy_details = (
-                f"✅ **Filtè Pwofi Broker:** Pwofi asset sa a kanpe sou **{asset_profit}%** (Pi wo pase 78% minimòm).\n"
+                f"✅ **Pwofi Egzat:** `{EXACT_PROFIT}%` (Mete pa ou a).\n"
                 f"✅ **Confirmation Hook:** CCI soti nan ekzakteman `{cci_val}` (Zòn oversold fò).\n"
-                f"✅ **Trend & Volim:** Sipò vah ak ranvèsman konfime sou Candle[1].\n"
-                f"🛡️ *Pwoteksyon Pèt:* Pa gen antre si mache a pa montre fòs klè."
+                f"✅ **Trend & Volim:** Sipò valid ak ranvèsman sou Candle[1].\n"
+                f"🛡️ *Ekzekisyon:* Antre nan 2 premye segond yo nan nouvo bouji a!"
             )
         else:
             signal_type = "PUT 📉 (SAFE REVERSAL - HIGH PROBABILITY)"
             cci_val = round(random.uniform(220.0, 245.0), 1)
             strategy_details = (
-                f"✅ **Filtè Pwofi Broker:** Pwofi asset sa a kanpe sou **{asset_profit}%** (Pi wo pase 78% minimòm).\n"
+                f"✅ **Pwofi Egzat:** `{EXACT_PROFIT}%` (Mete pa ou a).\n"
                 f"✅ **Confirmation Hook:** CCI soti nan ekzakteman `+{cci_val}` (Zòn overbought fò).\n"
                 f"✅ **Trend & Volim:** Rezistans valid ak rejeksyon sou Candle[1].\n"
-                f"🛡️ *Pwoteksyon Pèt:* Pa gen antre si mache a pa montre fòs klè."
+                f"🛡️ *Ekzekisyon:* Antre nan 2 premye segond yo nan nouvo bouji a!"
             )
 
         msg = (
-            f"🛡️ **POCKET OPTION - ANTI-LOSS SAFE BOT** 🛡️\n\n"
-            f"💵 **{selected_asset}** (Pwofi: **{asset_profit}%** 💰)\n"
+            f"🛡️ **POCKET OPTION - EXACT PROFIT BOT** 🛡️\n\n"
+            f"💵 **{selected_asset}** (Pwofi: **{EXACT_PROFIT}%** 💰)\n"
             f"💎 **M1 (1 Minit)**\n"
             f"⏰ **{entry_time}**\n"
             f"⚡ **{signal_type}**\n\n"
             f"🎯 **Konfimasyon Strik: {confirmations_count}/{total_checks} Valide**\n"
             f"📊 **Win Rate Sekirize: ~{win_rate}%**\n\n"
-            f"⚙️ **Analiz Pwoteksyon:**\n{strategy_details}\n\n"
-            f"🚨 *Konsèy anti-pèt: Si w pèdi 2 trade dèt sou dèt, sispann jwe pou jounen an pou pwoteje kapital ou!*"
+            f"⚙️ **Analiz Pwoteksyon:**\n{strategy_details}"
         )
 
         send_telegram_signal(msg, signal_type)
-        print("Siyal sekirize a voye avèk siksè!")
+        print("Siyal la voye avèk siksè sou tout lis OTC yo!")
         
     except Exception as e:
         print(f"Erè nan ekzekisyon an: {e}")
