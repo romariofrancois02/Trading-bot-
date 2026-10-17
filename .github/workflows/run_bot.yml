@@ -1,16 +1,7 @@
 name: Run Trading Bot
 
 on:
-  workflow_dispatch:
-    inputs:
-      asset:
-        description: 'Asset sou ekran an (egz: EURUSD-OTC)'
-        required: true
-        default: 'EURUSD-OTC'
-      profit:
-        description: 'Pwofi sou ekran an (egz: 85)'
-        required: true
-        default: '85'
+  workflow_dispatch:  # Sèlman lè w klike sou Run workflow l ap kouri
 
 jobs:
   build:
@@ -34,7 +25,5 @@ jobs:
       env:
         TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        TARGET_ASSET: ${{ github.event.inputs.asset }}
-        TARGET_PROFIT: ${{ github.event.inputs.profit }}
       run: |
         python bot.py
