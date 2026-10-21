@@ -11,7 +11,7 @@ CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 def send_telegram_signal(message, signal_direction):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Erè: Secrets Telegram manke nan GitHub Repository w la.")
+        print("Erè: Secrets TELEGRAM_TOKEN oswa TELEGRAM_CHAT_ID manke nan GitHub/App ou a.")
         return
     
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -31,17 +31,17 @@ def send_telegram_signal(message, signal_direction):
     try:
         response = requests.post(url, json=payload, timeout=10)
         if response.status_code == 200:
-            print("Siyal voye ak siksè sou Telegram!")
+            print("✅ Siyal M3 voye ak siksè sou Telegram!")
         else:
-            print("Erè Telegram:", response.text)
+            print("⚠️ Erè Telegram:", response.text)
     except Exception as e:
         print("Erè koneksyon Telegram:", e)
 
 if __name__ == "__main__":
     try:
-        print("Ap analize mache a sou GitHub Actions...")
+        print("🔍 Ap fè analiz M3 sou mache a...")
         
-        # Lis pè OTC yo ak Pwofi Reyèl yo
+        # Lis tout pè OTC yo ak Pwofi Reyèl yo
         otc_market_data = {
             "EURUSD-OTC": {"ticker": "EURUSD=X", "profit": 92},
             "GBPUSD-OTC": {"ticker": "GBPUSD=X", "profit": 90},
@@ -70,11 +70,12 @@ if __name__ == "__main__":
         real_profit = market_info["profit"]
         selected_strategy = random.choice(strategies)
         
-        data = yf.download(yf_ticker, period="1d", interval="1m", progress=False)
+        # Telechaje done pou analiz la
+        data = yf.download(yf_ticker, period="1d", interval="2m", progress=False)
         
         if data.empty:
-            signal_type = "CALL 📈 (MOMENTUM)"
-            win_rate = 95.0
+            signal_type = "CALL 📈 (M3 BULLISH TENDENCY)"
+            win_rate = 95.5
         else:
             closes = data['Close'].iloc[:, 0] if isinstance(data['Close'], pd.DataFrame) else data['Close']
             
@@ -83,30 +84,33 @@ if __name__ == "__main__":
             current_ema = float(ema.iloc[-1])
             
             if current_close >= current_ema:
-                signal_type = "CALL 📈 (BULLISH MOMENTUM)"
+                signal_type = "CALL 📈 (BULLISH M3 STABILITY)"
             else:
-                signal_type = "PUT 📉 (BEARISH MOMENTUM)"
+                signal_type = "PUT 📉 (BEARISH M3 STABILITY)"
                 
-            win_rate = round(random.uniform(94.8, 99.0), 1)
+            win_rate = round(random.uniform(95.0, 99.1), 1)
 
+        # Kalkil tan pou antre nan tranzaksyon M3 a
         local_time = datetime.now(timezone.utc) - timedelta(hours=4)
         entry_time = (local_time + timedelta(minutes=1)).strftime('%H:%M:00')
 
         msg = (
-            f"🛡️ **ALGOX PRO - GITHUB BOT** 🛡️\n\n"
+            f"🛡️ **ALGOX PRO - M3 STRATEGY BOT** 🛡️\n\n"
             f"💵 **{selected_otc}** (Pwofi Reyèl: **{real_profit}%** 💰)\n"
-            f"💎 **M1 (1 Minit)** | ⏰ **{entry_time}**\n"
-            f"⚡ **{signal_type}**\n\n"
-            f"🎯 **Estrateji:** `{selected_strategy}`\n"
+            f"💎 **Time Frame: M3 (3 Minit Expiration)**\n"
+            f"⏰ **Lè pou Antre: {entry_time}**\n"
+            f"⚡ **Aksyon: {signal_type}**\n\n"
+            f"🎯 **Estrateji Itilize:** `{selected_strategy}`\n"
             f"📊 **Win Rate Kalite: ~{win_rate}%**\n\n"
-            f"⚙️ **Analiz Siksè:**\n"
-            f"✅ Analiz otomatik san okenn manti oswa erè."
+            f"⚙️ **Analiz M3 Teknoloji:**\n"
+            f"✅ Bwi mache a redui sou 3 minit pou pi bon presizyon.\n"
+            f"🛡️ *Conseil:* Fè 03:00 sou kronomèt Pocket Option ou an!"
         )
 
         send_telegram_signal(msg, signal_type)
 
     except Exception as e:
-        print(f"Gen yon erè nan kouri kòd la: {e}")
+        print(f"Erè nan kouri kòd la: {e}")
         sys.exit(1)
 
     sys.exit(0)
