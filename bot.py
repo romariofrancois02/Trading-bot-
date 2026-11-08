@@ -1,16 +1,13 @@
 
 import os
+import time
 import requests
 from datetime import datetime, timezone, timedelta
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 BASE_URL = "https://otcharts.com"
-
-HEADERS = {
-    "Authorization": f"Bearer {API_KEY}",
-    "Accept": "application/json"
-}
-
 PAIR = "EURUSD_otc"
 
 TIMEFRAMES = {
@@ -18,11 +15,27 @@ TIMEFRAMES = {
     300: "M5"
 }
 
+session = requests.Session()
+
+retry = Retry(
+    total=3,
+    backoff_factor=2,
+    status_forcelist=[502, 503, 504],
+    allowed_methods=["GET"]
+)
+
+adapter = HTTPAdapter(max_retries=retry)
+session.mount("https://", adapter)
+
+session.headers.update({
+    "Authorization": f"Bearer {API_KEY}",
+    "Accept": "application/json"
+})
+
 
 def get_data(path, params=None):
-    response = requests.get(
+    response = session.get(
         BASE_URL + path,
-        headers=HEADERS,
         params=params,
         timeout=30
     )
@@ -33,8 +46,8 @@ def get_data(path, params=None):
     return response.json()
 
 
-def check_candles(timeframe, label):
-    print(f"\n===== {label} TEST =====")
+def test_candles(timeframe, label):
+    print(f"\n========== {label} ==========")
 
     data = get_data(
         "/v1/candles",
@@ -42,7 +55,7 @@ def check_candles(timeframe, label):
             "venue": "otc",
             "symbol": PAIR,
             "tf": timeframe,
-            "limit": 10
+            "limit": 100
         }
     )
 
@@ -50,102 +63,86 @@ def check_candles(timeframe, label):
 
     print("CANDLES RECEIVED:", len(candles))
 
-    if not candles:
-        print("ERROR: NO CANDLES")
-        return
+    if len(candles) < 50:
+        print("NOT ENOUGH DATA FOR INDICATOR TEST")
+        return False
 
     now = datetime.now(timezone.utc)
 
-    latest = candles[-1]["time"]
-
-    # Interpretasyon 1: timestamp kòm UTC
-    raw_time = datetime.fromtimestamp(
-        latest,
+    latest = datetime.fromtimestamp(
+        candles[-1]["time"],
         timezone.utc
-    )
+    ) - timedelta(hours=2)
 
-    # Interpretasyon 2: esè pou verifye diferans UTC+2
-    adjusted_time = raw_time - timedelta(hours=2)
-
-    raw_age = (now - raw_time).total_seconds() / 60
-    adjusted_age = (now - adjusted_time).total_seconds() / 60
+    age = (now - latest).total_seconds() / 60
 
     print("CURRENT UTC:", now.isoformat())
-    print("RAW TIMESTAMP:", latest)
-    print("RAW TIME UTC:", raw_time.isoformat())
-    print("RAW AGE MINUTES:", round(raw_age, 2))
+    print("LATEST ADJUSTED UTC:", latest.isoformat())
+    print("CANDLE AGE MINUTES:", round(age, 2))
 
-    print("\nUTC+2 HYPOTHESIS TEST:")
-    print("ADJUSTED TIME:", adjusted_time.isoformat())
-    print("ADJUSTED AGE MINUTES:", round(adjusted_age, 2))
+    if age < 0 or age > 10:
+        print("FRESHNESS: NOT VERIFIED")
+        return False
 
-    if 0 <= raw_age <= 10:
-        print("RAW TIME CHECK: PLAUSIBLE")
-    else:
-        print("RAW TIME CHECK: NOT VERIFIED")
+    for candle in candles:
+        for field in ["open", "high", "low", "close"]:
+            if field not in candle:
+                print("MISSING FIELD:", field)
+                return False
 
-    if 0 <= adjusted_age <= 10:
-        print("UTC+2 CHECK: PLAUSIBLE")
-    else:
-        print("UTC+2 CHECK: NOT VERIFIED")
+            try:
+                float(candle[field])
+            except (TypeError, ValueError):
+                print("INVALID PRICE:", field)
+                return False
 
-    print("\nLAST 3 CANDLES:")
+    print("PRICE DATA: VALID")
 
-    for candle in candles[-3:]:
+    print("\nLAST 5 CANDLES:")
+
+    for candle in candles[-5:]:
         candle_time = datetime.fromtimestamp(
             candle["time"],
             timezone.utc
-        )
+        ) - timedelta(hours=2)
 
         print(
-            "TIME:", candle_time.isoformat(),
-            "OPEN:", candle["open"],
-            "HIGH:", candle["high"],
-            "LOW:", candle["low"],
-            "CLOSE:", candle["close"]
+            candle_time.isoformat(),
+            "O:", candle["open"],
+            "H:", candle["high"],
+            "L:", candle["low"],
+            "C:", candle["close"]
         )
+
+    print("DATA TEST: PASSED")
+    return True
 
 
 def main():
     print("ROMARIO TRADER PRO 3.0")
-    print("OTC TIMESTAMP VALIDATION")
-    print("========================")
+    print("INDICATOR DATA PREPARATION")
+    print("==========================")
 
     if not API_KEY:
         raise SystemExit("ERROR: API KEY MISSING")
 
-    symbols_data = get_data(
-        "/v1/symbols",
-        {"venue": "otc"}
-    )
-
-    symbols = symbols_data.get("symbols", [])
-
-    pair_data = next(
-        (
-            item for item in symbols
-            if item.get("symbol") == PAIR
-        ),
-        None
-    )
-
-    if not pair_data:
-        raise SystemExit("ERROR: EURUSD_otc NOT FOUND")
-
-    print("PAIR:", pair_data.get("name"))
-    print("SYMBOL:", PAIR)
-    print("OPEN:", pair_data.get("open"))
-
-    if pair_data.get("open") is False:
-        raise SystemExit("ERROR: OTC PAIR CLOSED")
+    results = []
 
     for timeframe, label in TIMEFRAMES.items():
-        check_candles(timeframe, label)
+        results.append(
+            test_candles(timeframe, label)
+        )
 
-    print("\n========================")
-    print("TIMESTAMP TEST FINISHED")
-    print("NO SIGNALS SENT")
-    print("BROKER ALIGNMENT NOT YET VERIFIED")
+    print("\n==========================")
+
+    if all(results):
+        print("M1 AND M5 DATA TEST PASSED")
+        print("READY FOR INDICATOR CALCULATION TEST")
+    else:
+        print("DATA VALIDATION FAILED")
+        print("NO SIGNALS SENT")
+
+    print("NO TRADES EXECUTED")
 
 
 if __name__ == "__main__":
