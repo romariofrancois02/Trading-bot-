@@ -2,325 +2,370 @@
 import os
 import requests
 import pandas as pd
-from datetime import datetime, timezone, timedelta
+import numpy as np
 
-API_KEY = os.getenv("OTCHARTS_API_KEY")
 BASE_URL = "https://otcharts.com"
-PAIR = "EURUSD_otc"
+API_KEY = os.getenv("OTCHARTS_API_KEY")
 
-TIMEFRAMES = {
-    60: "M1",
-    300: "M5"
+SYMBOL = "EURUSD_otc"
+VENUE = "otc"
+
+M1_LIMIT = 5000
+M5_LIMIT = 1000
+
+HEADERS = {
+    "Authorization": f"Bearer {API_KEY}",
+    "User-Agent": "ROMARIO-TRADER-PRO-3.0"
 }
 
-# Timestamp adjustment used in our previous tests.
-BROKER_OFFSET_HOURS = 2
 
+def get_candles(timeframe, limit):
+    url = f"{BASE_URL}/v1/candles"
 
-def get_candles(timeframe):
+    params = {
+        "venue": VENUE,
+        "symbol": SYMBOL,
+        "tf": timeframe,
+        "limit": limit
+    }
+
     response = requests.get(
-        BASE_URL + "/v1/candles",
-        headers={
-            "Authorization": f"Bearer {API_KEY}",
-            "Accept": "application/json"
-        },
-        params={
-            "venue": "otc",
-            "symbol": PAIR,
-            "tf": timeframe,
-            "limit": 100
-        },
+        url,
+        headers=HEADERS,
+        params=params,
         timeout=30
     )
 
-    print("HTTP STATUS:", response.status_code)
+    print(f"HTTP STATUS {timeframe}s:", response.status_code)
+
     response.raise_for_status()
+    data = response.json()
 
-    candles = response.json().get("candles", [])
+    candles = data.get("candles", [])
 
-    if len(candles) < 60:
-        raise ValueError("Not enough candles")
+    if not candles:
+        raise ValueError(f"Pa gen bouji pou timeframe {timeframe}")
 
     df = pd.DataFrame(candles)
 
-    required = ["time", "open", "high", "low", "close"]
+    required = ["open", "high", "low", "close", "time"]
 
-    for field in required:
-        if field not in df.columns:
-            raise ValueError(f"Missing field: {field}")
+    for column in required:
+        if column not in df.columns:
+            raise ValueError(f"Done manke kolòn: {column}")
 
-        df[field] = pd.to_numeric(
-            df[field],
-            errors="coerce"
-        )
+    df = df[required].copy()
 
-    df = df.dropna(subset=required)
+    for column in ["open", "high", "low", "close", "time"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    df = df.dropna()
     df = df.sort_values("time")
     df = df.drop_duplicates(subset=["time"])
     df = df.reset_index(drop=True)
 
-    # Convert broker timestamps to UTC using
-    # the offset assumption from our previous tests.
-    df["utc_time"] = pd.to_datetime(
-        df["time"],
-        unit="s",
-        utc=True
-    ) - pd.Timedelta(hours=BROKER_OFFSET_HOURS)
+    gaps = data.get("gaps", {})
+    missing = gaps.get("missingBars", 0)
 
-    now = datetime.now(timezone.utc)
+    print("CANDLES:", len(df))
+    print("MISSING BARS:", missing)
 
-    # Use completed candles only.
-    candle_end = (
-        df["utc_time"]
-        + pd.to_timedelta(timeframe, unit="s")
-    )
+    if missing:
+        raise ValueError(
+            f"Done gen {missing} bouji ki manke. "
+            "Nou pap fè backtest sou done sa yo."
+        )
 
-    df = df[candle_end <= pd.Timestamp(now)]
-
-    if len(df) < 50:
-        raise ValueError("Not enough completed candles")
-
-    latest_end = (
-        df.iloc[-1]["utc_time"]
-        + timedelta(seconds=timeframe)
-    )
-
-    age = (now - latest_end).total_seconds() / 60
-
-    print("COMPLETED CANDLES:", len(df))
-    print("LATEST CLOSED CANDLE:", df.iloc[-1]["utc_time"])
-    print("CANDLE AGE MINUTES:", round(age, 2))
-
-    if age < 0 or age > 10:
-        raise ValueError("Candle freshness not verified")
-
-    return df.reset_index(drop=True)
+    return df
 
 
 def calculate_indicators(df):
     df = df.copy()
 
     df["ema20"] = df["close"].ewm(
-        span=20,
-        adjust=False
+        span=20, adjust=False
     ).mean()
 
     df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
+        span=50, adjust=False
     ).mean()
 
     previous_close = df["close"].shift(1)
 
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs()
-        ],
-        axis=1
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - previous_close).abs()
+    tr3 = (df["low"] - previous_close).abs()
+
+    true_range = pd.concat(
+        [tr1, tr2, tr3], axis=1
     ).max(axis=1)
 
-    df["atr10"] = tr.ewm(
-        alpha=1 / 10,
-        adjust=False
-    ).mean()
+    df["atr10"] = true_range.rolling(10).mean()
+    df["atr14"] = true_range.rolling(14).mean()
 
-    df["atr14"] = tr.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
+    change = df["close"].diff()
 
-    df["kc_middle"] = df["ema20"]
-
-    df["kc_upper"] = (
-        df["ema20"] + 2 * df["atr10"]
-    )
-
-    df["kc_lower"] = (
-        df["ema20"] - 2 * df["atr10"]
-    )
-
-    delta = df["close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = change.clip(lower=0)
+    loss = -change.clip(upper=0)
 
     avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
+        alpha=1 / 14, adjust=False
     ).mean()
 
     avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
+        alpha=1 / 14, adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    df["rsi14"] = 100 - (100 / (1 + rs))
+    df["rsi"] = 100 - (100 / (1 + rs))
 
-    # RSI smoothing is a preliminary filter,
-    # not a complete QQE MOD implementation.
-    df["rsi_smooth"] = df["rsi14"].ewm(
-        span=5,
-        adjust=False
+    df["rsi_smooth"] = df["rsi"].ewm(
+        span=5, adjust=False
     ).mean()
+
+    df["kc_middle"] = df["ema20"]
+    df["kc_upper"] = df["ema20"] + (2 * df["atr10"])
+    df["kc_lower"] = df["ema20"] - (2 * df["atr10"])
 
     return df
 
 
-def trend(row):
-    if row["ema20"] > row["ema50"]:
-        return "BULLISH"
+def get_m5_confirmation(m5, signal_close_time):
+    completed = m5[
+        (m5["time"] + 300) <= signal_close_time
+    ]
 
-    if row["ema20"] < row["ema50"]:
-        return "BEARISH"
+    if completed.empty:
+        return None
 
-    return "NEUTRAL"
+    return completed.iloc[-1]
 
 
-def test_signal(m1, m5):
-    current = m1.iloc[-1]
-    previous = m1.iloc[-2]
-    trend5 = m5.iloc[-1]
+def run_backtest(m1, m5):
+    results = []
 
-    m1_trend = trend(current)
-    m5_trend = trend(trend5)
+    for i in range(50, len(m1) - 1):
+        previous = m1.iloc[i - 1]
+        current = m1.iloc[i]
+        next_candle = m1.iloc[i + 1]
 
-    print("\n========== SIGNAL ANALYSIS ==========")
+        signal_close_time = current["time"] + 60
 
-    print("M1 TREND:", m1_trend)
-    print("M5 TREND:", m5_trend)
+        m5_candle = get_m5_confirmation(
+            m5, signal_close_time
+        )
 
-    print("M1 CLOSE:", round(float(current["close"]), 6))
-    print("M5 CLOSE:", round(float(trend5["close"]), 6))
+        if m5_candle is None:
+            continue
 
-    print("M1 RSI:", round(float(current["rsi14"]), 2))
-    print(
-        "M1 RSI SMOOTH:",
-        round(float(current["rsi_smooth"]), 2)
-    )
+        values = [
+            current["ema20"],
+            current["ema50"],
+            current["atr10"],
+            current["atr14"],
+            current["rsi_smooth"],
+            previous["ema20"],
+            previous["atr10"],
+            m5_candle["ema20"],
+            m5_candle["ema50"]
+        ]
 
-    print("M1 ATR14:", round(float(current["atr14"]), 6))
+        if not all(np.isfinite(x) for x in values):
+            continue
 
-    # Previous candle must retest the EMA20 area.
-    zone = float(previous["atr10"]) * 0.25
+        atr = current["atr10"]
 
-    ema_zone_low = float(previous["ema20"]) - zone
-    ema_zone_high = float(previous["ema20"]) + zone
+        if atr <= 0 or current["atr14"] <= 0:
+            continue
 
-    retest = (
-        float(previous["low"]) <= ema_zone_high
-        and float(previous["high"]) >= ema_zone_low
-    )
+        # Retest EMA20 zone on previous candle
+        zone = previous["atr10"] * 0.25
 
-    bullish_confirmation = (
-        current["close"] > current["open"]
-        and current["close"] > previous["high"]
-    )
+        retest_call = (
+            previous["low"] <= previous["ema20"] + zone
+            and previous["high"] >= previous["ema20"] - zone
+        )
 
-    bearish_confirmation = (
-        current["close"] < current["open"]
-        and current["close"] < previous["low"]
-    )
+        retest_put = (
+            previous["high"] >= previous["ema20"] - zone
+            and previous["low"] <= previous["ema20"] + zone
+        )
 
-    rsi_rising = (
-        current["rsi_smooth"] > previous["rsi_smooth"]
-        and current["rsi_smooth"] > 50
-    )
+        bullish_confirmation = (
+            current["close"] > current["open"]
+            and current["close"] > previous["high"]
+        )
 
-    rsi_falling = (
-        current["rsi_smooth"] < previous["rsi_smooth"]
-        and current["rsi_smooth"] < 50
-    )
+        bearish_confirmation = (
+            current["close"] < current["open"]
+            and current["close"] < previous["low"]
+        )
 
-    m5_bullish = (
-        m5_trend == "BULLISH"
-        and trend5["close"] > trend5["ema20"]
-    )
+        m1_bullish = (
+            current["ema20"] > current["ema50"]
+            and current["close"] > current["ema20"]
+        )
 
-    m5_bearish = (
-        m5_trend == "BEARISH"
-        and trend5["close"] < trend5["ema20"]
-    )
+        m1_bearish = (
+            current["ema20"] < current["ema50"]
+            and current["close"] < current["ema20"]
+        )
 
-    atr_valid = (
-        pd.notna(current["atr14"])
-        and current["atr14"] > 0
-    )
+        m5_bullish = (
+            m5_candle["ema20"] > m5_candle["ema50"]
+            and m5_candle["close"] > m5_candle["ema20"]
+        )
 
-    print("\nCONDITIONS:")
-    print("M1 RETEST:", retest)
-    print("BULLISH CONFIRMATION:", bullish_confirmation)
-    print("BEARISH CONFIRMATION:", bearish_confirmation)
-    print("M5 BULLISH:", m5_bullish)
-    print("M5 BEARISH:", m5_bearish)
-    print("RSI RISING:", rsi_rising)
-    print("RSI FALLING:", rsi_falling)
-    print("ATR VALID:", atr_valid)
+        m5_bearish = (
+            m5_candle["ema20"] < m5_candle["ema50"]
+            and m5_candle["close"] < m5_candle["ema20"]
+        )
 
-    call = (
-        retest
-        and bullish_confirmation
-        and m1_trend == "BULLISH"
-        and m5_bullish
-        and rsi_rising
-        and atr_valid
-    )
+        rsi_rising = (
+            current["rsi_smooth"] > previous["rsi_smooth"]
+            and current["rsi_smooth"] > 50
+        )
 
-    put = (
-        retest
-        and bearish_confirmation
-        and m1_trend == "BEARISH"
-        and m5_bearish
-        and rsi_falling
-        and atr_valid
-    )
+        rsi_falling = (
+            current["rsi_smooth"] < previous["rsi_smooth"]
+            and current["rsi_smooth"] < 50
+        )
 
-    print("\n========== TEST RESULT ==========")
+        call_signal = (
+            retest_call
+            and bullish_confirmation
+            and m1_bullish
+            and m5_bullish
+            and rsi_rising
+        )
 
-    if call:
-        print("CALL CANDIDATE")
-        print("Direction: UP")
-        print("Pair:", PAIR)
+        put_signal = (
+            retest_put
+            and bearish_confirmation
+            and m1_bearish
+            and m5_bearish
+            and rsi_falling
+        )
 
-    elif put:
-        print("PUT CANDIDATE")
-        print("Direction: DOWN")
-        print("Pair:", PAIR)
+        if not call_signal and not put_signal:
+            continue
 
-    else:
-        print("WAIT")
-        print("No confirmed setup.")
+        # Approximation:
+        # Enter at next M1 candle open.
+        # Expire at that candle's close.
+        entry = next_candle["open"]
+        exit_price = next_candle["close"]
 
-    print("\nTEST MODE ONLY")
-    print("NO TELEGRAM ALERT SENT")
-    print("NO TRADE EXECUTED")
+        if call_signal:
+            direction = "CALL"
+            if exit_price > entry:
+                outcome = "WIN"
+            elif exit_price < entry:
+                outcome = "LOSS"
+            else:
+                outcome = "TIE"
+
+        else:
+            direction = "PUT"
+            if exit_price < entry:
+                outcome = "WIN"
+            elif exit_price > entry:
+                outcome = "LOSS"
+            else:
+                outcome = "TIE"
+
+        results.append({
+            "time": current["time"],
+            "direction": direction,
+            "entry": entry,
+            "exit": exit_price,
+            "result": outcome
+        })
+
+    return results
 
 
 def main():
     print("ROMARIO TRADER PRO 3.0")
-    print("CALL / PUT SIGNAL LOGIC TEST")
-    print("============================")
+    print("HISTORICAL BACKTEST")
+    print("==============================")
 
     if not API_KEY:
-        raise SystemExit("ERROR: API KEY MISSING")
-
-    try:
-        m1 = calculate_indicators(
-            get_candles(60)
+        raise ValueError(
+            "OTCHARTS_API_KEY pa jwenn nan GitHub Secrets."
         )
 
-        m5 = calculate_indicators(
-            get_candles(300)
+    m1 = get_candles(60, M1_LIMIT)
+    m5 = get_candles(300, M5_LIMIT)
+
+    m1 = calculate_indicators(m1)
+    m5 = calculate_indicators(m5)
+
+    print("\nSTARTING BACKTEST...")
+
+    results = run_backtest(m1, m5)
+
+    total = len(results)
+
+    wins = sum(
+        1 for item in results
+        if item["result"] == "WIN"
+    )
+
+    losses = sum(
+        1 for item in results
+        if item["result"] == "LOSS"
+    )
+
+    ties = sum(
+        1 for item in results
+        if item["result"] == "TIE"
+    )
+
+    calls = sum(
+        1 for item in results
+        if item["direction"] == "CALL"
+    )
+
+    puts = sum(
+        1 for item in results
+        if item["direction"] == "PUT"
+    )
+
+    decided = wins + losses
+
+    print("\n========== RESULTS ==========")
+    print("M1 CANDLES:", len(m1))
+    print("M5 CANDLES:", len(m5))
+    print("TOTAL SIGNALS:", total)
+    print("CALL SIGNALS:", calls)
+    print("PUT SIGNALS:", puts)
+    print("WINS:", wins)
+    print("LOSSES:", losses)
+    print("TIES:", ties)
+
+    if decided:
+        win_rate = (wins / decided) * 100
+        print(f"WIN RATE: {win_rate:.2f}%")
+    else:
+        print("WIN RATE: NOT AVAILABLE")
+
+    print("\nLAST 10 SIGNALS:")
+
+    for item in results[-10:]:
+        print(
+            item["direction"],
+            "|",
+            item["result"],
+            "| Entry:",
+            item["entry"],
+            "| Exit:",
+            item["exit"]
         )
 
-        test_signal(m1, m5)
-
-    except Exception as error:
-        print("\nTEST FAILED:", str(error))
-        raise
+    print("\nBACKTEST COMPLETE")
+    print("No real trades were placed.")
 
 
 if __name__ == "__main__":
