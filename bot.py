@@ -1,40 +1,42 @@
 
 import os
 import requests
+import json
 
-KEY = os.getenv("OTCHARTS_API_KEY")
-BASE = "https://otcharts.com"
+API_KEY = os.getenv("OTCHARTS_API_KEY")
+BASE_URL = "https://otcharts.com"
 
-if not KEY:
-    print("ERROR: OTCHARTS_API_KEY missing")
+if not API_KEY:
+    print("ERROR: OTCHARTS_API_KEY is missing")
     raise SystemExit(1)
 
-headers = {"Authorization": f"Bearer {KEY}"}
+headers = {
+    "Authorization": f"Bearer {API_KEY}",
+    "Accept": "application/json"
+}
 
-def test_endpoint(path, params=None):
+def test_api():
+    print("ROMARIO TRADER PRO 3.0")
+    print("Testing OTCharts connection...")
+
     response = requests.get(
-        BASE + path,
+        f"{BASE_URL}/v1/venues",
         headers=headers,
-        params=params,
-        timeout=20
+        timeout=30
     )
-    print(f"\n{path} — HTTP {response.status_code}")
+
+    print("HTTP STATUS:", response.status_code)
+
     try:
         data = response.json()
-        if path == "/v1/symbols" and "symbols" in data:
-            print("Nombre de pè:", data.get("count"))
-            for item in data["symbols"][:10]:
-                print(item)
-        else:
-            print(data)
+        print(json.dumps(data, indent=2)[:5000])
     except ValueError:
-        print(response.text[:500])
+        print(response.text[:1000])
 
-test_endpoint("/v1/venues")
-test_endpoint("/v1/symbols", {"venue": "otc"})
-test_endpoint("/v1/candles", {
-    "venue": "otc",
-    "symbol": "EURUSD_otc",
-    "tf": 60,
-    "limit": 5
-})
+    if response.status_code == 200:
+        print("API CONNECTION SUCCESS")
+    else:
+        print("API CONNECTION NEEDS CHECKING")
+
+if __name__ == "__main__":
+    test_api()
