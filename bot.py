@@ -1,7 +1,7 @@
 
 import os
 import requests
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 BASE_URL = "https://otcharts.com"
@@ -12,10 +12,12 @@ HEADERS = {
 }
 
 PAIR = "EURUSD_otc"
+
 TIMEFRAMES = {
     60: "M1",
     300: "M5"
 }
+
 
 def get_data(path, params=None):
     response = requests.get(
@@ -25,10 +27,11 @@ def get_data(path, params=None):
         timeout=30
     )
 
-    print(f"HTTP STATUS: {response.status_code}")
+    print("HTTP STATUS:", response.status_code)
     response.raise_for_status()
 
     return response.json()
+
 
 def check_candles(timeframe, label):
     print(f"\n===== {label} TEST =====")
@@ -53,44 +56,60 @@ def check_candles(timeframe, label):
 
     now = datetime.now(timezone.utc)
 
-    latest = datetime.fromtimestamp(
-        candles[-1]["time"],
+    latest = candles[-1]["time"]
+
+    # Interpretasyon 1: timestamp kòm UTC
+    raw_time = datetime.fromtimestamp(
+        latest,
         timezone.utc
     )
 
-    age = (now - latest).total_seconds() / 60
+    # Interpretasyon 2: esè pou verifye diferans UTC+2
+    adjusted_time = raw_time - timedelta(hours=2)
+
+    raw_age = (now - raw_time).total_seconds() / 60
+    adjusted_age = (now - adjusted_time).total_seconds() / 60
 
     print("CURRENT UTC:", now.isoformat())
-    print("LATEST CANDLE UTC:", latest.isoformat())
-    print("CANDLE AGE MINUTES:", round(age, 2))
+    print("RAW TIMESTAMP:", latest)
+    print("RAW TIME UTC:", raw_time.isoformat())
+    print("RAW AGE MINUTES:", round(raw_age, 2))
 
-    if age < 0:
-        print("WARNING: CANDLE TIMESTAMP IS IN THE FUTURE")
-    elif age > 10:
-        print("WARNING: CANDLE DATA MAY BE STALE")
+    print("\nUTC+2 HYPOTHESIS TEST:")
+    print("ADJUSTED TIME:", adjusted_time.isoformat())
+    print("ADJUSTED AGE MINUTES:", round(adjusted_age, 2))
+
+    if 0 <= raw_age <= 10:
+        print("RAW TIME CHECK: PLAUSIBLE")
     else:
-        print("CANDLE FRESHNESS CHECK: PASSED")
+        print("RAW TIME CHECK: NOT VERIFIED")
+
+    if 0 <= adjusted_age <= 10:
+        print("UTC+2 CHECK: PLAUSIBLE")
+    else:
+        print("UTC+2 CHECK: NOT VERIFIED")
 
     print("\nLAST 3 CANDLES:")
 
     for candle in candles[-3:]:
-        timestamp = datetime.fromtimestamp(
+        candle_time = datetime.fromtimestamp(
             candle["time"],
             timezone.utc
         )
 
         print(
-            timestamp.isoformat(),
+            "TIME:", candle_time.isoformat(),
             "OPEN:", candle["open"],
             "HIGH:", candle["high"],
             "LOW:", candle["low"],
             "CLOSE:", candle["close"]
         )
 
+
 def main():
     print("ROMARIO TRADER PRO 3.0")
-    print("OTC DATA VALIDATION")
-    print("====================")
+    print("OTC TIMESTAMP VALIDATION")
+    print("========================")
 
     if not API_KEY:
         raise SystemExit("ERROR: API KEY MISSING")
@@ -123,9 +142,11 @@ def main():
     for timeframe, label in TIMEFRAMES.items():
         check_candles(timeframe, label)
 
-    print("\n====================")
-    print("DATA VALIDATION FINISHED")
-    print("NO TRADING SIGNALS SENT")
+    print("\n========================")
+    print("TIMESTAMP TEST FINISHED")
+    print("NO SIGNALS SENT")
+    print("BROKER ALIGNMENT NOT YET VERIFIED")
+
 
 if __name__ == "__main__":
     main()
