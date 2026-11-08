@@ -6,29 +6,14 @@ import requests
 import pandas as pd
 import numpy as np
 
-from datetime import datetime, timezone
-from zoneinfo import ZoneInfo
-
-# ==========================================
-# ROMARIO TRADER PRO 4.4
-# POCKET OPTION OTC - MANUAL ALERTS ONLY
-# ==========================================
-
-VERSION = "ROMARIO TRADER PRO 4.4"
-
+VERSION = "ROMARIO TRADER PRO 4.5 DIAGNOSTIC"
 BASE_URL = "https://otcharts.com"
+
 MIN_PAYOUT = 79
-CANDLE_LIMIT = 100
 MIN_SCORE = 6
+CANDLE_LIMIT = 100
 
-TIMEFRAME_M1 = 60
-TIMEFRAME_M5 = 300
-EXPIRATION_SECONDS = 60
-
-# Signal notification is sent 30 seconds before entry.
-SIGNAL_LEAD_SECONDS = 30
-
-LOCAL_TZ = ZoneInfo("America/New_York")
+LOCAL_TZ = "America/New_York"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -38,42 +23,22 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/4.4"
+    "User-Agent": "ROMARIO-TRADER-PRO/4.5"
 })
 
-
-# ==========================================
-# GENERAL FUNCTIONS
-# ==========================================
 
 def log(message):
     print(message, flush=True)
 
 
-def now_utc():
-    return datetime.now(timezone.utc)
-
-
-def local_time(timestamp):
-    return datetime.fromtimestamp(
-        timestamp, timezone.utc
-    ).astimezone(LOCAL_TZ)
-
-
-def format_time(timestamp):
-    return local_time(timestamp).strftime("%I:%M:%S %p")
-
-
 def telegram_send(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("TELEGRAM ERROR: Missing Telegram secrets.")
+        log("Telegram secrets missing.")
         return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
     try:
         response = requests.post(
-            url,
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message
@@ -81,77 +46,65 @@ def telegram_send(message):
             timeout=20
         )
 
-        log(f"TELEGRAM HTTP STATUS: {response.status_code}")
+        log(f"TELEGRAM STATUS: {response.status_code}")
+        log(response.text[:500])
 
-        if response.status_code == 200:
-            log("TELEGRAM MESSAGE SENT")
-            return True
-
-        log(f"TELEGRAM ERROR: {response.text[:500]}")
-        return False
+        return response.status_code == 200
 
     except requests.RequestException as error:
-        log(f"TELEGRAM CONNECTION ERROR: {error}")
+        log(f"TELEGRAM ERROR: {error}")
         return False
 
 
 def api_get(endpoint, params=None):
-    url = BASE_URL + endpoint
-
     response = session.get(
-        url,
+        BASE_URL + endpoint,
         params=params,
         timeout=25
     )
 
-    log(f"API {endpoint} STATUS: {response.status_code}")
+    log(f"API {endpoint}: HTTP {response.status_code}")
     response.raise_for_status()
 
     return response.json()
 
 
-def extract_list(payload, possible_keys):
+def extract_list(payload, keys):
     if isinstance(payload, list):
         return payload
 
     if isinstance(payload, dict):
-        for key in possible_keys:
+        for key in keys:
             value = payload.get(key)
             if isinstance(value, list):
                 return value
 
         for value in payload.values():
-            if isinstance(value, dict):
-                result = extract_list(value, possible_keys)
+            if isinstance(value, (dict, list)):
+                result = extract_list(value, keys)
                 if result:
                     return result
 
     return []
 
 
-# ==========================================
-# SYMBOLS AND PAYOUT
-# ==========================================
-
-def get_otc_symbols():
+def get_symbols():
     payload = api_get(
         "/v1/symbols",
         {"venue": "otc"}
     )
 
-    symbols = extract_list(
+    items = extract_list(
         payload,
         ["data", "symbols", "instruments", "results"]
     )
 
-    if not symbols:
-        raise RuntimeError(
-            "Could not find symbols list in OTCharts response."
-        )
+    if not items:
+        raise RuntimeError("OTCharts returned no symbols list.")
 
-    forex_symbols = []
+    result = []
 
-    for item in symbols:
+    for item in items:
         if not isinstance(item, dict):
             continue
 
@@ -165,9 +118,7 @@ def get_otc_symbols():
         if not re.fullmatch(r"[A-Z]{6}_otc", symbol):
             continue
 
-        is_open = item.get("open", True)
-
-        if is_open is False:
+        if item.get("open", True) is False:
             continue
 
         try:
@@ -175,21 +126,15 @@ def get_otc_symbols():
         except (TypeError, ValueError):
             continue
 
-        if payout < MIN_PAYOUT:
-            continue
+        if payout >= MIN_PAYOUT:
+            result.append({
+                "symbol": symbol,
+                "name": symbol.replace("_otc", ""),
+                "payout": payout
+            })
 
-        forex_symbols.append({
-            "symbol": symbol,
-            "name": symbol.replace("_otc", ""),
-            "payout": payout
-        })
+    return result
 
-    return forex_symbols
-
-
-# ==========================================
-# CANDLE DATA
-# ==========================================
 
 def get_candles(symbol, timeframe):
     payload = api_get(
@@ -208,9 +153,7 @@ def get_candles(symbol, timeframe):
     )
 
     if not candles:
-        raise RuntimeError(
-            f"No candles returned for {symbol}, TF={timeframe}"
-        )
+        raise RuntimeError("No candle data.")
 
     df = pd.DataFrame(candles)
 
@@ -218,57 +161,50 @@ def get_candles(symbol, timeframe):
 
     if not all(column in df.columns for column in required):
         raise RuntimeError(
-            f"Missing candle fields for {symbol}: {list(df.columns)}"
+            f"Missing fields: {list(df.columns)}"
         )
 
-    for column in ["open", "high", "low", "close", "time"]:
+    for column in required:
         df[column] = pd.to_numeric(
             df[column], errors="coerce"
         )
 
-    df = df.dropna(
-        subset=["open", "high", "low", "close", "time"]
-    )
-
+    df = df.dropna(subset=required)
     df["time"] = df["time"].astype("int64")
 
-    df = df.sort_values("time")
-    df = df.drop_duplicates(subset=["time"])
-    df = df.reset_index(drop=True)
+    df = (
+        df.sort_values("time")
+        .drop_duplicates("time")
+        .reset_index(drop=True)
+    )
 
-    # A candle is closed only after its full duration has passed.
-    current_timestamp = int(time.time())
+    # Keep only candles whose full duration has passed.
+    now = int(time.time())
 
     df = df[
-        (df["time"] + timeframe) <= current_timestamp
-    ].copy()
-
-    df = df.reset_index(drop=True)
+        (df["time"] + timeframe) <= now
+    ].reset_index(drop=True)
 
     if len(df) < 55:
         raise RuntimeError(
-            f"Not enough CLOSED candles for {symbol}: {len(df)}"
+            f"Only {len(df)} closed candles available."
         )
 
     return df
 
 
-# ==========================================
-# INDICATORS
-# ==========================================
+def calculate_rsi(close, period=14):
+    delta = close.diff()
 
-def calculate_rsi(series, period=14):
-    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-
-    avg_gain = gains.ewm(
+    avg_gain = gain.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
 
-    avg_loss = losses.ewm(
+    avg_loss = loss.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
@@ -281,18 +217,16 @@ def calculate_rsi(series, period=14):
 def calculate_atr(df, period=14):
     previous_close = df["close"].shift(1)
 
-    ranges = pd.concat(
+    tr = pd.concat(
         [
             df["high"] - df["low"],
             (df["high"] - previous_close).abs(),
             (df["low"] - previous_close).abs()
         ],
         axis=1
-    )
+    ).max(axis=1)
 
-    true_range = ranges.max(axis=1)
-
-    return true_range.ewm(
+    return tr.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
@@ -306,7 +240,7 @@ def calculate_adx(df, period=14):
         np.where(
             (high_diff > low_diff) & (high_diff > 0),
             high_diff,
-            0.0
+            0
         ),
         index=df.index
     )
@@ -315,14 +249,14 @@ def calculate_adx(df, period=14):
         np.where(
             (low_diff > high_diff) & (low_diff > 0),
             low_diff,
-            0.0
+            0
         ),
         index=df.index
     )
 
     previous_close = df["close"].shift(1)
 
-    true_range = pd.concat(
+    tr = pd.concat(
         [
             df["high"] - df["low"],
             (df["high"] - previous_close).abs(),
@@ -331,7 +265,7 @@ def calculate_adx(df, period=14):
         axis=1
     ).max(axis=1)
 
-    atr = true_range.ewm(
+    atr = tr.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
@@ -356,7 +290,7 @@ def calculate_adx(df, period=14):
     ).mean()
 
 
-def prepare_indicators(df):
+def indicators(df):
     df = df.copy()
 
     df["ema9"] = df["close"].ewm(
@@ -378,364 +312,262 @@ def prepare_indicators(df):
     return df.dropna().reset_index(drop=True)
 
 
-# ==========================================
-# SIGNAL ANALYSIS
-# ==========================================
+def analyze(item):
+    symbol = item["symbol"]
 
-def analyze_pair(symbol_info):
-    symbol = symbol_info["symbol"]
+    m1_raw = get_candles(symbol, 60)
+    m5_raw = get_candles(symbol, 300)
 
-    m1_raw = get_candles(symbol, TIMEFRAME_M1)
-    m5_raw = get_candles(symbol, TIMEFRAME_M5)
-
-    m1 = prepare_indicators(m1_raw)
-    m5 = prepare_indicators(m5_raw)
-
-    if len(m1) < 10 or len(m5) < 10:
-        return None
+    m1 = indicators(m1_raw)
+    m5 = indicators(m5_raw)
 
     a = m1.iloc[-1]
     b = m5.iloc[-1]
 
+    close = float(a["close"])
     atr = float(a["atr"])
-    adx_m5 = float(b["adx"])
     rsi = float(a["rsi"])
+    adx = float(b["adx"])
 
-    if not np.isfinite(atr) or atr <= 0:
-        return None
+    candle_range = float(a["high"] - a["low"])
+    body = abs(float(a["close"] - a["open"]))
 
-    if not np.isfinite(adx_m5) or adx_m5 < 18:
-        return None
+    body_ratio = (
+        body / candle_range if candle_range > 0 else 0
+    )
 
-    body = abs(float(a["close"]) - float(a["open"]))
-    candle_range = float(a["high"]) - float(a["low"])
+    atr_percent = (
+        atr / close * 100 if close > 0 else 0
+    )
 
-    if candle_range <= 0:
-        return None
+    # Calculate directional scores even if a filter fails.
+    call = 0
+    put = 0
 
-    body_ratio = body / candle_range
-
-    if body_ratio < 0.35:
-        return None
-
-    if not 25 <= rsi <= 75:
-        return None
-
-    # ATR must be valid. It is a volatility check, not a win probability.
-    atr_percent = (atr / float(a["close"])) * 100
-
-    if not 0.001 <= atr_percent <= 1.0:
-        return None
-
-    call_score = 0
-    put_score = 0
-
-    # M1 trend
     if a["ema9"] > a["ema20"] > a["ema50"]:
-        call_score += 1
+        call += 1
 
     if a["ema9"] < a["ema20"] < a["ema50"]:
-        put_score += 1
+        put += 1
 
-    # M5 trend confirmation
     if b["ema20"] > b["ema50"]:
-        call_score += 1
+        call += 1
 
     if b["ema20"] < b["ema50"]:
-        put_score += 1
+        put += 1
 
-    # Last closed M1 candle
     if a["close"] > a["open"]:
-        call_score += 1
+        call += 1
 
     if a["close"] < a["open"]:
-        put_score += 1
+        put += 1
 
-    # Price position
     if a["close"] > a["ema9"]:
-        call_score += 1
+        call += 1
 
     if a["close"] < a["ema9"]:
-        put_score += 1
+        put += 1
 
-    # RSI direction
     if 50 <= rsi <= 70:
-        call_score += 1
+        call += 1
 
     if 30 <= rsi <= 50:
-        put_score += 1
+        put += 1
 
-    # ADX trend strength
-    if adx_m5 >= 20:
-        if call_score > put_score:
-            call_score += 1
-        elif put_score > call_score:
-            put_score += 1
+    if adx >= 20:
+        if call > put:
+            call += 1
+        elif put > call:
+            put += 1
 
-    # Candle body confirmation
     if body_ratio >= 0.50:
         if a["close"] > a["open"]:
-            call_score += 1
+            call += 1
         elif a["close"] < a["open"]:
-            put_score += 1
+            put += 1
 
-    if call_score >= MIN_SCORE and call_score > put_score:
+    score = max(call, put)
+
+    if call > put:
         direction = "CALL"
-        emoji = "🟢"
-        score = call_score
-
-    elif put_score >= MIN_SCORE and put_score > call_score:
+    elif put > call:
         direction = "PUT"
-        emoji = "🔴"
-        score = put_score
-
     else:
-        return None
+        direction = "TIE"
+
+    # Count every failed filter independently.
+    failures = []
+
+    if adx < 18:
+        failures.append("ADX")
+
+    if not 25 <= rsi <= 75:
+        failures.append("RSI")
+
+    if not 0.001 <= atr_percent <= 1.0:
+        failures.append("ATR")
+
+    if body_ratio < 0.35:
+        failures.append("BODY")
+
+    if score < MIN_SCORE:
+        failures.append("SCORE")
+
+    if direction == "TIE":
+        failures.append("DIRECTION")
 
     return {
         "symbol": symbol,
-        "name": symbol_info["name"],
+        "payout": item["payout"],
         "direction": direction,
-        "emoji": emoji,
         "score": score,
-        "payout": symbol_info["payout"],
-        "rsi": round(rsi, 2),
-        "adx_m5": round(adx_m5, 2),
-        "atr": round(atr, 5),
-        "atr_percent": round(atr_percent, 5),
-        "m1_timestamp": int(m1_raw.iloc[-1]["time"]),
-        "m5_timestamp": int(m5_raw.iloc[-1]["time"])
+        "call_score": call,
+        "put_score": put,
+        "rsi": rsi,
+        "adx": adx,
+        "atr_percent": atr_percent,
+        "body_ratio": body_ratio,
+        "failures": failures
     }
 
 
-# ==========================================
-# ENTRY TIME
-# ==========================================
-
-def calculate_entry_time():
-    now = time.time()
-
-    # Select a future minute boundary with enough time
-    # to send the alert exactly 30 seconds beforehand.
-    entry_timestamp = (
-        int((now + SIGNAL_LEAD_SECONDS + 1) // 60) + 1
-    ) * 60
-
-    signal_timestamp = entry_timestamp - SIGNAL_LEAD_SECONDS
-
-    if signal_timestamp <= now:
-        entry_timestamp += 60
-        signal_timestamp += 60
-
-    return int(signal_timestamp), int(entry_timestamp)
-
-
-def wait_until(timestamp):
-    while True:
-        remaining = timestamp - time.time()
-
-        if remaining <= 0:
-            return
-
-        time.sleep(min(remaining, 1))
-
-
-# ==========================================
-# FINAL VALIDATION AND TELEGRAM
-# ==========================================
-
-def final_validation(candidate):
-    symbol_info = {
-        "symbol": candidate["symbol"],
-        "name": candidate["name"],
-        "payout": candidate["payout"]
+def make_report(scanned, results, errors):
+    counts = {
+        "ADX": 0,
+        "RSI": 0,
+        "ATR": 0,
+        "BODY": 0,
+        "SCORE": 0,
+        "DIRECTION": 0
     }
 
-    fresh = analyze_pair(symbol_info)
+    valid = []
 
-    if not fresh:
-        return None
+    for result in results:
+        for reason in result["failures"]:
+            counts[reason] += 1
 
-    if fresh["direction"] != candidate["direction"]:
-        return None
+        if not result["failures"]:
+            valid.append(result)
 
-    if fresh["payout"] < MIN_PAYOUT:
-        return None
+    near_misses = sorted(
+        results,
+        key=lambda x: (
+            x["score"],
+            -len(x["failures"]),
+            x["adx"]
+        ),
+        reverse=True
+    )[:5]
 
-    return fresh
+    lines = [
+        f"🤖 {VERSION}",
+        "",
+        "⚪ DIAGNOSTIC REPORT",
+        "",
+        f"PAIRS SCANNED: {scanned}",
+        f"PAIRS ANALYZED: {len(results)}",
+        f"DATA ERRORS: {errors}",
+        f"MINIMUM PAYOUT: {MIN_PAYOUT}%",
+        "",
+        "========== FILTER RESULTS ==========",
+        f"ADX FAILED: {counts['ADX']}",
+        f"RSI FAILED: {counts['RSI']}",
+        f"ATR FAILED: {counts['ATR']}",
+        f"BODY FAILED: {counts['BODY']}",
+        f"SCORE FAILED: {counts['SCORE']}",
+        f"DIRECTION TIE: {counts['DIRECTION']}",
+        "",
+        f"VALID SETUPS: {len(valid)}",
+        "",
+        "========== TOP 5 NEAR MISSES =========="
+    ]
 
+    for item in near_misses:
+        lines.append(
+            f"{item['symbol']} | {item['direction']} "
+            f"| SCORE {item['score']}/7 "
+            f"| RSI {item['rsi']:.1f} "
+            f"| ADX {item['adx']:.1f}"
+        )
 
-def make_signal_message(candidate, entry_timestamp, signal_timestamp):
-    return f"""
-🤖 {VERSION}
+        lines.append(
+            f"FAILED: {', '.join(item['failures']) or 'NONE'}"
+        )
 
-{candidate['emoji']} {candidate['direction']}
+    if valid:
+        lines.extend([
+            "",
+            "VALID SETUPS FOUND.",
+            "This diagnostic does not send trade signals."
+        ])
+    else:
+        lines.extend([
+            "",
+            "NO VALID SETUP.",
+            "No trade recommended."
+        ])
 
-💱 PAIR: {candidate['name']} OTC
-📊 SYMBOL: {candidate['symbol']}
+    lines.extend([
+        "",
+        "WIN RATE: NOT ENOUGH DATA",
+        "DIAGNOSTIC ONLY - NO TRADE EXECUTED"
+    ])
 
-⏱ TIMEFRAME: M1
-⌛ EXPIRATION: 60 SECONDS
+    return "\n".join(lines)
 
-🕒 SIGNAL SENT: {format_time(signal_timestamp)}
-🎯 ENTRY TIME: {format_time(entry_timestamp)}
-
-💰 PAYOUT: {candidate['payout']:.0f}%
-📈 WIN RATE: NOT ENOUGH DATA
-
-📊 M1/M5 CONFIRMATION
-TREND: {candidate['direction']}
-RSI: {candidate['rsi']}
-M5 ADX: {candidate['adx_m5']}
-ATR: {candidate['atr']}
-
-⭐ TECHNICAL SCORE: {candidate['score']}/8
-
-⚠️ Manual entry only.
-⚠️ No guaranteed result.
-""".strip()
-
-
-def make_wait_message(reason, scanned):
-    return f"""
-🤖 {VERSION}
-
-⚪ WAIT
-
-No valid OTC signal.
-
-PAIRS SCANNED: {scanned}
-MINIMUM PAYOUT: {MIN_PAYOUT}%
-
-REASON: {reason}
-
-No trade recommended.
-""".strip()
-
-
-# ==========================================
-# MAIN
-# ==========================================
 
 def main():
     log("=" * 45)
     log(VERSION)
-    log("POCKET OPTION OTC SCANNER")
     log("=" * 45)
 
     if not API_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY is missing.")
+        raise RuntimeError("OTCHARTS_API_KEY missing.")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Telegram secrets are missing.")
+        raise RuntimeError("Telegram secrets missing.")
 
-    log(f"UTC NOW: {now_utc().isoformat()}")
-    log(f"FLORIDA NOW: {datetime.now(LOCAL_TZ).isoformat()}")
+    symbols = get_symbols()
 
-    symbols = get_otc_symbols()
+    log(f"ELIGIBLE SYMBOLS: {len(symbols)}")
 
-    log(f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: {len(symbols)}")
+    results = []
+    errors = 0
 
-    if not symbols:
-        telegram_send(
-            make_wait_message("No eligible OTC Forex pairs.", 0)
-        )
-        return
-
-    candidates = []
-    scanned = 0
-
-    for item in symbols:
-        scanned += 1
-
+    for index, item in enumerate(symbols, start=1):
         log(
-            f"Scanning {item['symbol']} "
-            f"| Payout: {item['payout']}%"
+            f"[{index}/{len(symbols)}] "
+            f"Analyzing {item['symbol']} "
+            f"| payout {item['payout']}%"
         )
 
         try:
-            result = analyze_pair(item)
+            result = analyze(item)
+            results.append(result)
 
-            if result:
-                candidates.append(result)
-
-                log(
-                    f"VALID: {result['direction']} "
-                    f"{result['symbol']} "
-                    f"SCORE {result['score']}"
-                )
-            else:
-                log(f"NO VALID SETUP: {item['symbol']}")
+            log(
+                f"RESULT {item['symbol']} "
+                f"| SCORE {result['score']}/7 "
+                f"| FAILED {result['failures']}"
+            )
 
         except Exception as error:
-            log(f"SKIPPED {item['symbol']}: {error}")
+            errors += 1
+            log(f"ERROR {item['symbol']}: {error}")
 
-    log(f"SCANNED: {scanned}")
-    log(f"VALID CANDIDATES: {len(candidates)}")
-
-    if not candidates:
-        telegram_send(
-            make_wait_message("No setup passed all filters.", scanned)
-        )
-        return
-
-    candidates.sort(
-        key=lambda x: (x["score"], x["payout"], x["adx_m5"]),
-        reverse=True
+    report = make_report(
+        len(symbols),
+        results,
+        errors
     )
 
-    best = candidates[0]
+    log("")
+    log(report)
 
-    log(f"BEST CANDIDATE: {best}")
+    telegram_send(report)
 
-    signal_timestamp, entry_timestamp = calculate_entry_time()
-
-    log(f"SIGNAL TIME: {format_time(signal_timestamp)}")
-    log(f"ENTRY TIME: {format_time(entry_timestamp)}")
-
-    log("WAITING FOR SIGNAL TIME...")
-    wait_until(signal_timestamp)
-
-    # Do not send a late signal.
-    if time.time() > signal_timestamp + 3:
-        log("MISSED SIGNAL TIME. NO SIGNAL SENT.")
-        telegram_send(
-            make_wait_message("Signal timing was missed.", scanned)
-        )
-        return
-
-    log("REFRESHING DATA BEFORE SIGNAL...")
-
-    try:
-        verified = final_validation(best)
-    except Exception as error:
-        log(f"FINAL VALIDATION ERROR: {error}")
-        verified = None
-
-    if not verified:
-        log("FINAL VALIDATION FAILED.")
-        telegram_send(
-            make_wait_message(
-                "Setup changed or failed final validation.",
-                scanned
-            )
-        )
-        return
-
-    # Make sure there is still enough time to enter.
-    if time.time() >= entry_timestamp:
-        log("ENTRY TIME PASSED. NO SIGNAL SENT.")
-        return
-
-    message = make_signal_message(
-        verified,
-        entry_timestamp,
-        signal_timestamp
-    )
-
-    telegram_send(message)
-
-    log("PROCESS COMPLETE.")
+    log("DIAGNOSTIC COMPLETE.")
 
 
 if __name__ == "__main__":
@@ -746,7 +578,7 @@ if __name__ == "__main__":
 
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
             telegram_send(
-                f"🤖 {VERSION}\n🔴 BOT ERROR\n{str(error)[:800]}"
+                f"🤖 {VERSION}\n🔴 BOT ERROR\n{str(error)[:700]}"
             )
 
         raise
