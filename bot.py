@@ -2,18 +2,36 @@
 import os
 import re
 import time
+import math
 import requests
 import pandas as pd
 import numpy as np
 
-VERSION = "ROMARIO TRADER PRO 4.5 DIAGNOSTIC"
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from zoneinfo import ZoneInfo
+
+# ==========================================
+# ROMARIO TRADER PRO 4.6
+# OTC SCANNER - MANUAL TELEGRAM SIGNALS
+# ==========================================
+
+VERSION = "ROMARIO TRADER PRO 4.6"
+
 BASE_URL = "https://otcharts.com"
 
 MIN_PAYOUT = 79
 MIN_SCORE = 6
 CANDLE_LIMIT = 100
 
-LOCAL_TZ = "America/New_York"
+M1 = 60
+M5 = 300
+EXPIRATION = 60
+
+SIGNAL_LEAD = 30
+VALIDATION_BEFORE_SIGNAL = 10
+
+LOCAL_TZ = ZoneInfo("America/New_York")
 
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -23,17 +41,35 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/4.5"
+    "User-Agent": "ROMARIO-TRADER-PRO/4.6"
 })
 
+
+# ==========================================
+# BASIC FUNCTIONS
+# ==========================================
 
 def log(message):
     print(message, flush=True)
 
 
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def florida_time(timestamp):
+    return datetime.fromtimestamp(
+        timestamp, timezone.utc
+    ).astimezone(LOCAL_TZ)
+
+
+def format_time(timestamp):
+    return florida_time(timestamp).strftime("%I:%M:%S %p")
+
+
 def telegram_send(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram secrets missing.")
+        log("TELEGRAM SECRETS MISSING")
         return False
 
     try:
@@ -47,26 +83,63 @@ def telegram_send(message):
         )
 
         log(f"TELEGRAM STATUS: {response.status_code}")
-        log(response.text[:500])
 
-        return response.status_code == 200
+        if response.status_code == 200:
+            log("TELEGRAM MESSAGE SENT")
+            return True
+
+        log(f"TELEGRAM ERROR: {response.text[:500]}")
+        return False
 
     except requests.RequestException as error:
-        log(f"TELEGRAM ERROR: {error}")
+        log(f"TELEGRAM CONNECTION ERROR: {error}")
         return False
 
 
-def api_get(endpoint, params=None):
-    response = session.get(
-        BASE_URL + endpoint,
-        params=params,
-        timeout=25
+# ==========================================
+# API REQUESTS WITH RETRIES
+# ==========================================
+
+def api_request(endpoint, params=None):
+    url = BASE_URL + endpoint
+
+    last_error = None
+
+    for attempt in range(1, 4):
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=30
+            )
+
+            log(
+                f"API {endpoint}: HTTP {response.status_code} "
+                f"(attempt {attempt}/3)"
+            )
+
+            if response.status_code in (429, 500, 502, 503, 504):
+                last_error = RuntimeError(
+                    f"HTTP {response.status_code}"
+                )
+
+                if attempt < 3:
+                    time.sleep(attempt * 2)
+                    continue
+
+            response.raise_for_status()
+
+            return response
+
+        except requests.RequestException as error:
+            last_error = error
+
+            if attempt < 3:
+                time.sleep(attempt * 2)
+
+    raise RuntimeError(
+        f"API request failed after 3 attempts: {last_error}"
     )
-
-    log(f"API {endpoint}: HTTP {response.status_code}")
-    response.raise_for_status()
-
-    return response.json()
 
 
 def extract_list(payload, keys):
@@ -76,23 +149,56 @@ def extract_list(payload, keys):
     if isinstance(payload, dict):
         for key in keys:
             value = payload.get(key)
+
             if isinstance(value, list):
                 return value
 
         for value in payload.values():
             if isinstance(value, (dict, list)):
                 result = extract_list(value, keys)
+
                 if result:
                     return result
 
     return []
 
 
-def get_symbols():
-    payload = api_get(
+def get_server_timestamp(response):
+    """
+    Use the HTTP Date header when available.
+    Fall back to the GitHub runner's UTC clock.
+    """
+
+    date_header = response.headers.get("Date")
+
+    if date_header:
+        try:
+            server_date = parsedate_to_datetime(date_header)
+
+            if server_date.tzinfo is None:
+                server_date = server_date.replace(
+                    tzinfo=timezone.utc
+                )
+
+            return server_date.timestamp()
+
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    return time.time()
+
+
+# ==========================================
+# SYMBOLS AND PAYOUT
+# ==========================================
+
+def get_otc_symbols():
+    response = api_request(
         "/v1/symbols",
         {"venue": "otc"}
     )
+
+    payload = response.json()
 
     items = extract_list(
         payload,
@@ -100,7 +206,9 @@ def get_symbols():
     )
 
     if not items:
-        raise RuntimeError("OTCharts returned no symbols list.")
+        raise RuntimeError(
+            "Could not find OTC symbols in API response."
+        )
 
     result = []
 
@@ -126,18 +234,24 @@ def get_symbols():
         except (TypeError, ValueError):
             continue
 
-        if payout >= MIN_PAYOUT:
-            result.append({
-                "symbol": symbol,
-                "name": symbol.replace("_otc", ""),
-                "payout": payout
-            })
+        if payout < MIN_PAYOUT:
+            continue
+
+        result.append({
+            "symbol": symbol,
+            "name": symbol.replace("_otc", ""),
+            "payout": payout
+        })
 
     return result
 
 
+# ==========================================
+# CANDLE TIMESTAMP CORRECTION
+# ==========================================
+
 def get_candles(symbol, timeframe):
-    payload = api_get(
+    response = api_request(
         "/v1/candles",
         {
             "venue": "otc",
@@ -147,43 +261,106 @@ def get_candles(symbol, timeframe):
         }
     )
 
+    server_now = get_server_timestamp(response)
+
+    payload = response.json()
+
     candles = extract_list(
         payload,
         ["data", "candles", "results", "bars"]
     )
 
     if not candles:
-        raise RuntimeError("No candle data.")
+        raise RuntimeError(
+            f"No candle data returned for {symbol}."
+        )
 
     df = pd.DataFrame(candles)
 
-    required = ["open", "high", "low", "close", "time"]
+    required = [
+        "open", "high", "low", "close", "time"
+    ]
 
     if not all(column in df.columns for column in required):
         raise RuntimeError(
-            f"Missing fields: {list(df.columns)}"
+            f"Missing candle fields: {list(df.columns)}"
         )
 
     for column in required:
         df[column] = pd.to_numeric(
-            df[column], errors="coerce"
+            df[column],
+            errors="coerce"
         )
 
-    df = df.dropna(subset=required)
+    df = df.dropna(subset=required).copy()
+
+    if df.empty:
+        raise RuntimeError("No valid numeric candles.")
+
+    # Convert milliseconds to seconds if necessary.
+    if df["time"].median() > 100000000000:
+        df["time"] = df["time"] / 1000
+
     df["time"] = df["time"].astype("int64")
 
     df = (
         df.sort_values("time")
-        .drop_duplicates("time")
+        .drop_duplicates(subset=["time"])
         .reset_index(drop=True)
     )
 
-    # Keep only candles whose full duration has passed.
-    now = int(time.time())
+    # Estimate provider timestamp offset from the API's
+    # HTTP Date header. Use 15-minute increments to support
+    # time zones with non-whole-hour offsets.
+    latest_raw_timestamp = int(df["time"].iloc[-1])
 
+    difference = latest_raw_timestamp - server_now
+
+    estimated_offset = round(
+        difference / 900
+    ) * 900
+
+    # Refuse unusual offsets instead of guessing.
+    if abs(estimated_offset) > 14 * 3600:
+        raise RuntimeError(
+            f"Unusual timestamp offset: {estimated_offset} seconds."
+        )
+
+    log(
+        f"{symbol} TF={timeframe} "
+        f"RAW TIME: {latest_raw_timestamp}"
+    )
+
+    log(
+        f"{symbol} ESTIMATED TIME OFFSET: "
+        f"{estimated_offset} seconds"
+    )
+
+    # Convert provider timestamps to UTC.
+    df["time"] = df["time"] - estimated_offset
+
+    latest_corrected = int(df["time"].iloc[-1])
+    latest_age = server_now - latest_corrected
+
+    log(
+        f"{symbol} CORRECTED TIME: {latest_corrected} "
+        f"| AGE: {latest_age:.1f}s"
+    )
+
+    # Reject data that is excessively old or in the future.
+    max_age = max(timeframe * 5, 900)
+
+    if latest_age < -10 or latest_age > max_age:
+        raise RuntimeError(
+            f"Stale or future candle data. Age={latest_age:.1f}s"
+        )
+
+    # Only use candles whose full timeframe has elapsed.
     df = df[
-        (df["time"] + timeframe) <= now
-    ].reset_index(drop=True)
+        (df["time"] + timeframe) <= server_now
+    ].copy()
+
+    df = df.reset_index(drop=True)
 
     if len(df) < 55:
         raise RuntimeError(
@@ -193,25 +370,41 @@ def get_candles(symbol, timeframe):
     return df
 
 
+# ==========================================
+# INDICATORS
+# ==========================================
+
 def calculate_rsi(close, period=14):
     delta = close.diff()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gains = delta.clip(lower=0)
+    losses = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(
+    avg_gain = gains.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
 
-    avg_loss = loss.ewm(
+    avg_loss = losses.ewm(
         alpha=1 / period,
         adjust=False
     ).mean()
 
     rs = avg_gain / avg_loss.replace(0, np.nan)
 
-    return 100 - (100 / (1 + rs))
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi = rsi.mask(
+        (avg_loss == 0) & (avg_gain > 0),
+        100
+    )
+
+    rsi = rsi.mask(
+        (avg_gain == 0) & (avg_loss > 0),
+        0
+    )
+
+    return rsi
 
 
 def calculate_atr(df, period=14):
@@ -240,7 +433,7 @@ def calculate_adx(df, period=14):
         np.where(
             (high_diff > low_diff) & (high_diff > 0),
             high_diff,
-            0
+            0.0
         ),
         index=df.index
     )
@@ -249,7 +442,7 @@ def calculate_adx(df, period=14):
         np.where(
             (low_diff > high_diff) & (low_diff > 0),
             low_diff,
-            0
+            0.0
         ),
         index=df.index
     )
@@ -280,9 +473,14 @@ def calculate_adx(df, period=14):
         / atr.replace(0, np.nan)
     )
 
-    denominator = (plus_di + minus_di).replace(0, np.nan)
+    denominator = (plus_di + minus_di).replace(
+        0, np.nan
+    )
 
-    dx = 100 * (plus_di - minus_di).abs() / denominator
+    dx = (
+        100 * (plus_di - minus_di).abs()
+        / denominator
+    )
 
     return dx.ewm(
         alpha=1 / period,
@@ -290,7 +488,7 @@ def calculate_adx(df, period=14):
     ).mean()
 
 
-def indicators(df):
+def prepare_indicators(df):
     df = df.copy()
 
     df["ema9"] = df["close"].ewm(
@@ -312,273 +510,417 @@ def indicators(df):
     return df.dropna().reset_index(drop=True)
 
 
-def analyze(item):
+# ==========================================
+# SIGNAL ANALYSIS
+# ==========================================
+
+def analyze_pair(item):
     symbol = item["symbol"]
 
-    m1_raw = get_candles(symbol, 60)
-    m5_raw = get_candles(symbol, 300)
+    m1_raw = get_candles(symbol, M1)
+    m5_raw = get_candles(symbol, M5)
 
-    m1 = indicators(m1_raw)
-    m5 = indicators(m5_raw)
+    m1 = prepare_indicators(m1_raw)
+    m5 = prepare_indicators(m5_raw)
+
+    if len(m1) < 10 or len(m5) < 10:
+        raise RuntimeError("Not enough indicator history.")
 
     a = m1.iloc[-1]
     b = m5.iloc[-1]
 
-    close = float(a["close"])
-    atr = float(a["atr"])
     rsi = float(a["rsi"])
+    atr = float(a["atr"])
     adx = float(b["adx"])
+    close = float(a["close"])
+
+    if not all(np.isfinite(x) for x in [rsi, atr, adx, close]):
+        return None
+
+    if atr <= 0 or close <= 0:
+        return None
 
     candle_range = float(a["high"] - a["low"])
     body = abs(float(a["close"] - a["open"]))
 
-    body_ratio = (
-        body / candle_range if candle_range > 0 else 0
-    )
+    if candle_range <= 0:
+        return None
 
-    atr_percent = (
-        atr / close * 100 if close > 0 else 0
-    )
+    body_ratio = body / candle_range
+    atr_percent = (atr / close) * 100
 
-    # Calculate directional scores even if a filter fails.
-    call = 0
-    put = 0
+    call_score = 0
+    put_score = 0
 
+    # M1 EMA trend
     if a["ema9"] > a["ema20"] > a["ema50"]:
-        call += 1
+        call_score += 1
 
     if a["ema9"] < a["ema20"] < a["ema50"]:
-        put += 1
+        put_score += 1
 
+    # M5 trend confirmation
     if b["ema20"] > b["ema50"]:
-        call += 1
+        call_score += 1
 
     if b["ema20"] < b["ema50"]:
-        put += 1
+        put_score += 1
 
+    # M1 candle direction
     if a["close"] > a["open"]:
-        call += 1
+        call_score += 1
 
     if a["close"] < a["open"]:
-        put += 1
+        put_score += 1
 
+    # Price relative to EMA9
     if a["close"] > a["ema9"]:
-        call += 1
+        call_score += 1
 
     if a["close"] < a["ema9"]:
-        put += 1
+        put_score += 1
 
+    # RSI direction
     if 50 <= rsi <= 70:
-        call += 1
+        call_score += 1
 
     if 30 <= rsi <= 50:
-        put += 1
+        put_score += 1
 
+    # Strong M5 trend bonus
     if adx >= 20:
-        if call > put:
-            call += 1
-        elif put > call:
-            put += 1
+        if call_score > put_score:
+            call_score += 1
+        elif put_score > call_score:
+            put_score += 1
 
+    # Strong candle body bonus
     if body_ratio >= 0.50:
         if a["close"] > a["open"]:
-            call += 1
+            call_score += 1
         elif a["close"] < a["open"]:
-            put += 1
+            put_score += 1
 
-    score = max(call, put)
-
-    if call > put:
-        direction = "CALL"
-    elif put > call:
-        direction = "PUT"
-    else:
-        direction = "TIE"
-
-    # Count every failed filter independently.
-    failures = []
-
+    # Hard filters
     if adx < 18:
-        failures.append("ADX")
+        return None
 
     if not 25 <= rsi <= 75:
-        failures.append("RSI")
+        return None
 
     if not 0.001 <= atr_percent <= 1.0:
-        failures.append("ATR")
+        return None
 
     if body_ratio < 0.35:
-        failures.append("BODY")
+        return None
 
-    if score < MIN_SCORE:
-        failures.append("SCORE")
+    if call_score >= MIN_SCORE and call_score > put_score:
+        direction = "CALL"
+        emoji = "🟢"
+        score = call_score
 
-    if direction == "TIE":
-        failures.append("DIRECTION")
+    elif put_score >= MIN_SCORE and put_score > call_score:
+        direction = "PUT"
+        emoji = "🔴"
+        score = put_score
+
+    else:
+        return None
 
     return {
         "symbol": symbol,
-        "payout": item["payout"],
+        "name": item["name"],
         "direction": direction,
+        "emoji": emoji,
         "score": score,
-        "call_score": call,
-        "put_score": put,
-        "rsi": rsi,
-        "adx": adx,
-        "atr_percent": atr_percent,
-        "body_ratio": body_ratio,
-        "failures": failures
+        "payout": item["payout"],
+        "rsi": round(rsi, 2),
+        "adx": round(adx, 2),
+        "atr": round(atr, 5),
+        "atr_percent": round(atr_percent, 5),
+        "body_ratio": round(body_ratio, 3)
     }
 
 
-def make_report(scanned, results, errors):
-    counts = {
-        "ADX": 0,
-        "RSI": 0,
-        "ATR": 0,
-        "BODY": 0,
-        "SCORE": 0,
-        "DIRECTION": 0
-    }
+# ==========================================
+# ENTRY TIME
+# ==========================================
 
-    valid = []
+def calculate_entry_time():
+    now = time.time()
 
-    for result in results:
-        for reason in result["failures"]:
-            counts[reason] += 1
+    # Ensure enough time for final validation before the alert.
+    entry_timestamp = math.ceil(
+        (now + 75) / 60
+    ) * 60
 
-        if not result["failures"]:
-            valid.append(result)
+    signal_timestamp = entry_timestamp - SIGNAL_LEAD
 
-    near_misses = sorted(
-        results,
-        key=lambda x: (
-            x["score"],
-            -len(x["failures"]),
-            x["adx"]
+    return int(signal_timestamp), int(entry_timestamp)
+
+
+def wait_until(timestamp):
+    while True:
+        remaining = timestamp - time.time()
+
+        if remaining <= 0:
+            return
+
+        time.sleep(min(remaining, 1))
+
+
+# ==========================================
+# TELEGRAM MESSAGES
+# ==========================================
+
+def make_wait_message(reason, scanned):
+    return f"""
+🤖 {VERSION}
+
+⚪ WAIT
+
+No valid OTC signal.
+
+PAIRS SCANNED: {scanned}
+MINIMUM PAYOUT: {MIN_PAYOUT}%
+
+REASON: {reason}
+
+No trade recommended.
+""".strip()
+
+
+def make_signal_message(candidate, entry_timestamp):
+    actual_signal_time = time.time()
+
+    return f"""
+🤖 {VERSION}
+
+{candidate['emoji']} {candidate['direction']}
+
+💱 PAIR: {candidate['name']} OTC
+📊 SYMBOL: {candidate['symbol']}
+
+⏱ TIMEFRAME: M1
+⌛ EXPIRATION: {EXPIRATION} SECONDS
+
+🕒 SIGNAL SENT: {format_time(actual_signal_time)}
+🎯 ENTRY TIME: {format_time(entry_timestamp)}
+
+💰 PAYOUT: {candidate['payout']:.0f}%
+📈 WIN RATE: NOT ENOUGH DATA
+
+📊 M1 / M5 CONFIRMATION
+RSI: {candidate['rsi']}
+M5 ADX: {candidate['adx']}
+ATR: {candidate['atr']}
+
+⭐ TECHNICAL SCORE: {candidate['score']}/7
+
+⚠️ MANUAL ENTRY ONLY
+⚠️ NO GUARANTEED RESULT
+""".strip()
+
+
+# ==========================================
+# FINAL VALIDATION
+# ==========================================
+
+def final_validation(candidate):
+    latest_symbols = get_otc_symbols()
+
+    latest_item = next(
+        (
+            item for item in latest_symbols
+            if item["symbol"] == candidate["symbol"]
         ),
-        reverse=True
-    )[:5]
+        None
+    )
 
-    lines = [
-        f"🤖 {VERSION}",
-        "",
-        "⚪ DIAGNOSTIC REPORT",
-        "",
-        f"PAIRS SCANNED: {scanned}",
-        f"PAIRS ANALYZED: {len(results)}",
-        f"DATA ERRORS: {errors}",
-        f"MINIMUM PAYOUT: {MIN_PAYOUT}%",
-        "",
-        "========== FILTER RESULTS ==========",
-        f"ADX FAILED: {counts['ADX']}",
-        f"RSI FAILED: {counts['RSI']}",
-        f"ATR FAILED: {counts['ATR']}",
-        f"BODY FAILED: {counts['BODY']}",
-        f"SCORE FAILED: {counts['SCORE']}",
-        f"DIRECTION TIE: {counts['DIRECTION']}",
-        "",
-        f"VALID SETUPS: {len(valid)}",
-        "",
-        "========== TOP 5 NEAR MISSES =========="
-    ]
+    if not latest_item:
+        log("PAIR NO LONGER MEETS PAYOUT REQUIREMENT.")
+        return None
 
-    for item in near_misses:
-        lines.append(
-            f"{item['symbol']} | {item['direction']} "
-            f"| SCORE {item['score']}/7 "
-            f"| RSI {item['rsi']:.1f} "
-            f"| ADX {item['adx']:.1f}"
-        )
+    fresh = analyze_pair(latest_item)
 
-        lines.append(
-            f"FAILED: {', '.join(item['failures']) or 'NONE'}"
-        )
+    if not fresh:
+        log("FINAL VALIDATION: NO VALID SETUP.")
+        return None
 
-    if valid:
-        lines.extend([
-            "",
-            "VALID SETUPS FOUND.",
-            "This diagnostic does not send trade signals."
-        ])
-    else:
-        lines.extend([
-            "",
-            "NO VALID SETUP.",
-            "No trade recommended."
-        ])
+    if fresh["direction"] != candidate["direction"]:
+        log("FINAL VALIDATION: DIRECTION CHANGED.")
+        return None
 
-    lines.extend([
-        "",
-        "WIN RATE: NOT ENOUGH DATA",
-        "DIAGNOSTIC ONLY - NO TRADE EXECUTED"
-    ])
+    if fresh["score"] < MIN_SCORE:
+        log("FINAL VALIDATION: SCORE TOO LOW.")
+        return None
 
-    return "\n".join(lines)
+    return fresh
 
+
+# ==========================================
+# MAIN
+# ==========================================
 
 def main():
     log("=" * 45)
     log(VERSION)
+    log("POCKET OPTION OTC SCANNER")
     log("=" * 45)
 
     if not API_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY missing.")
+        raise RuntimeError("OTCHARTS_API_KEY is missing.")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Telegram secrets missing.")
+        raise RuntimeError("Telegram secrets are missing.")
 
-    symbols = get_symbols()
+    log(f"UTC NOW: {utc_now().isoformat()}")
+    log(
+        "FLORIDA NOW: "
+        + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
+    )
 
-    log(f"ELIGIBLE SYMBOLS: {len(symbols)}")
+    symbols = get_otc_symbols()
 
-    results = []
+    log(f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: {len(symbols)}")
+
+    if not symbols:
+        telegram_send(
+            make_wait_message("No eligible OTC pairs found.", 0)
+        )
+        return
+
+    candidates = []
+    scanned = 0
     errors = 0
 
-    for index, item in enumerate(symbols, start=1):
+    for item in symbols:
+        scanned += 1
+
         log(
-            f"[{index}/{len(symbols)}] "
-            f"Analyzing {item['symbol']} "
-            f"| payout {item['payout']}%"
+            f"[{scanned}/{len(symbols)}] "
+            f"Scanning {item['symbol']} "
+            f"| PAYOUT {item['payout']}%"
         )
 
         try:
-            result = analyze(item)
-            results.append(result)
+            result = analyze_pair(item)
 
-            log(
-                f"RESULT {item['symbol']} "
-                f"| SCORE {result['score']}/7 "
-                f"| FAILED {result['failures']}"
-            )
+            if result:
+                candidates.append(result)
+
+                log(
+                    f"VALID: {result['direction']} "
+                    f"{result['symbol']} "
+                    f"SCORE {result['score']}/7"
+                )
+            else:
+                log(f"NO VALID SETUP: {item['symbol']}")
 
         except Exception as error:
             errors += 1
             log(f"ERROR {item['symbol']}: {error}")
 
-    report = make_report(
-        len(symbols),
-        results,
-        errors
+    log(f"PAIRS SCANNED: {scanned}")
+    log(f"VALID CANDIDATES: {len(candidates)}")
+    log(f"DATA ERRORS: {errors}")
+
+    if not candidates:
+        telegram_send(
+            make_wait_message(
+                f"No setup passed filters. Data errors: {errors}.",
+                scanned
+            )
+        )
+        return
+
+    candidates.sort(
+        key=lambda item: (
+            item["score"],
+            item["payout"],
+            item["adx"]
+        ),
+        reverse=True
     )
 
-    log("")
-    log(report)
+    best = candidates[0]
 
-    telegram_send(report)
+    log(f"BEST CANDIDATE: {best}")
 
-    log("DIAGNOSTIC COMPLETE.")
+    signal_timestamp, entry_timestamp = calculate_entry_time()
+
+    validation_timestamp = (
+        signal_timestamp - VALIDATION_BEFORE_SIGNAL
+    )
+
+    log(
+        f"VALIDATION TIME: {format_time(validation_timestamp)}"
+    )
+    log(f"SIGNAL TIME: {format_time(signal_timestamp)}")
+    log(f"ENTRY TIME: {format_time(entry_timestamp)}")
+
+    log("WAITING FOR FINAL VALIDATION...")
+    wait_until(validation_timestamp)
+
+    try:
+        verified = final_validation(best)
+
+    except Exception as error:
+        log(f"FINAL VALIDATION ERROR: {error}")
+        verified = None
+
+    if not verified:
+        telegram_send(
+            make_wait_message(
+                "Candidate failed final validation.",
+                scanned
+            )
+        )
+        return
+
+    log("FINAL VALIDATION PASSED.")
+    log("WAITING FOR SIGNAL TIME...")
+
+    wait_until(signal_timestamp)
+
+    # Do not send late alerts.
+    if time.time() > signal_timestamp + 3:
+        log("SIGNAL TIME MISSED. NO SIGNAL SENT.")
+        telegram_send(
+            make_wait_message(
+                "Signal timing was missed.",
+                scanned
+            )
+        )
+        return
+
+    # Confirm there is still enough time for manual entry.
+    if time.time() >= entry_timestamp:
+        log("ENTRY TIME PASSED. NO SIGNAL SENT.")
+        return
+
+    message = make_signal_message(
+        verified,
+        entry_timestamp
+    )
+
+    telegram_send(message)
+
+    log("PROCESS COMPLETE.")
 
 
 if __name__ == "__main__":
     try:
         main()
+
     except Exception as error:
         log(f"FATAL ERROR: {error}")
 
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
             telegram_send(
-                f"🤖 {VERSION}\n🔴 BOT ERROR\n{str(error)[:700]}"
+                f"🤖 {VERSION}\n"
+                f"🔴 BOT ERROR\n"
+                f"{str(error)[:700]}"
             )
 
         raise
