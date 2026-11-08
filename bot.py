@@ -12,15 +12,15 @@ from email.utils import parsedate_to_datetime
 from zoneinfo import ZoneInfo
 
 # ==========================================
-# ROMARIO TRADER PRO 4.6
-# OTC SCANNER - MANUAL TELEGRAM SIGNALS
+# ROMARIO TRADER PRO 4.7
+# POCKET OPTION OTC - MANUAL SIGNALS
 # ==========================================
 
-VERSION = "ROMARIO TRADER PRO 4.6"
+VERSION = "ROMARIO TRADER PRO 4.7"
 
 BASE_URL = "https://otcharts.com"
 
-MIN_PAYOUT = 79
+MIN_PAYOUT = 78
 MIN_SCORE = 6
 CANDLE_LIMIT = 100
 
@@ -29,7 +29,11 @@ M5 = 300
 EXPIRATION = 60
 
 SIGNAL_LEAD = 30
-VALIDATION_BEFORE_SIGNAL = 10
+MIN_ENTRY_DELAY = 30
+
+# Based on the timestamp pattern in the user's API logs.
+# If OTCharts changes timestamp format, this must be checked.
+CANDLE_TIME_OFFSET_SECONDS = 7200
 
 LOCAL_TZ = ZoneInfo("America/New_York")
 
@@ -41,7 +45,7 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/4.6"
+    "User-Agent": "ROMARIO-TRADER-PRO/4.7"
 })
 
 
@@ -97,12 +101,11 @@ def telegram_send(message):
 
 
 # ==========================================
-# API REQUESTS WITH RETRIES
+# API REQUESTS
 # ==========================================
 
 def api_request(endpoint, params=None):
     url = BASE_URL + endpoint
-
     last_error = None
 
     for attempt in range(1, 4):
@@ -128,7 +131,6 @@ def api_request(endpoint, params=None):
                     continue
 
             response.raise_for_status()
-
             return response
 
         except requests.RequestException as error:
@@ -164,11 +166,6 @@ def extract_list(payload, keys):
 
 
 def get_server_timestamp(response):
-    """
-    Use the HTTP Date header when available.
-    Fall back to the GitHub runner's UTC clock.
-    """
-
     date_header = response.headers.get("Date")
 
     if date_header:
@@ -189,7 +186,7 @@ def get_server_timestamp(response):
 
 
 # ==========================================
-# SYMBOLS AND PAYOUT
+# OTC SYMBOLS AND PAYOUT
 # ==========================================
 
 def get_otc_symbols():
@@ -247,7 +244,7 @@ def get_otc_symbols():
 
 
 # ==========================================
-# CANDLE TIMESTAMP CORRECTION
+# CANDLE DATA
 # ==========================================
 
 def get_candles(symbol, timeframe):
@@ -309,53 +306,41 @@ def get_candles(symbol, timeframe):
         .reset_index(drop=True)
     )
 
-    # Estimate provider timestamp offset from the API's
-    # HTTP Date header. Use 15-minute increments to support
-    # time zones with non-whole-hour offsets.
-    latest_raw_timestamp = int(df["time"].iloc[-1])
-
-    difference = latest_raw_timestamp - server_now
-
-    estimated_offset = round(
-        difference / 900
-    ) * 900
-
-    # Refuse unusual offsets instead of guessing.
-    if abs(estimated_offset) > 14 * 3600:
-        raise RuntimeError(
-            f"Unusual timestamp offset: {estimated_offset} seconds."
-        )
+    raw_time = int(df["time"].iloc[-1])
 
     log(
         f"{symbol} TF={timeframe} "
-        f"RAW TIME: {latest_raw_timestamp}"
+        f"RAW TIME: {raw_time}"
     )
 
-    log(
-        f"{symbol} ESTIMATED TIME OFFSET: "
-        f"{estimated_offset} seconds"
+    # Use the observed provider offset instead of estimating
+    # it from candle age. Estimating it from one candle can
+    # mistake stale data for a different timezone.
+    df["time"] = (
+        df["time"] - CANDLE_TIME_OFFSET_SECONDS
     )
-
-    # Convert provider timestamps to UTC.
-    df["time"] = df["time"] - estimated_offset
 
     latest_corrected = int(df["time"].iloc[-1])
     latest_age = server_now - latest_corrected
+
+    log(
+        f"{symbol} OFFSET: "
+        f"{CANDLE_TIME_OFFSET_SECONDS} seconds"
+    )
 
     log(
         f"{symbol} CORRECTED TIME: {latest_corrected} "
         f"| AGE: {latest_age:.1f}s"
     )
 
-    # Reject data that is excessively old or in the future.
     max_age = max(timeframe * 5, 900)
 
     if latest_age < -10 or latest_age > max_age:
         raise RuntimeError(
-            f"Stale or future candle data. Age={latest_age:.1f}s"
+            f"Stale/future candle data. AGE={latest_age:.1f}s"
         )
 
-    # Only use candles whose full timeframe has elapsed.
+    # Use only fully closed candles.
     df = df[
         (df["time"] + timeframe) <= server_now
     ].copy()
@@ -535,15 +520,18 @@ def analyze_pair(item):
     close = float(a["close"])
 
     if not all(np.isfinite(x) for x in [rsi, atr, adx, close]):
+        log(f"REJECT {symbol}: Invalid indicator values.")
         return None
 
     if atr <= 0 or close <= 0:
+        log(f"REJECT {symbol}: ATR or price invalid.")
         return None
 
     candle_range = float(a["high"] - a["low"])
     body = abs(float(a["close"] - a["open"]))
 
     if candle_range <= 0:
+        log(f"REJECT {symbol}: Candle range is zero.")
         return None
 
     body_ratio = body / candle_range
@@ -603,15 +591,19 @@ def analyze_pair(item):
 
     # Hard filters
     if adx < 18:
+        log(f"REJECT {symbol}: M5 ADX below 18 ({adx:.2f}).")
         return None
 
     if not 25 <= rsi <= 75:
+        log(f"REJECT {symbol}: RSI outside allowed range ({rsi:.2f}).")
         return None
 
     if not 0.001 <= atr_percent <= 1.0:
+        log(f"REJECT {symbol}: ATR% outside allowed range.")
         return None
 
     if body_ratio < 0.35:
+        log(f"REJECT {symbol}: Candle body too weak ({body_ratio:.2f}).")
         return None
 
     if call_score >= MIN_SCORE and call_score > put_score:
@@ -625,6 +617,10 @@ def analyze_pair(item):
         score = put_score
 
     else:
+        log(
+            f"REJECT {symbol}: Score insufficient "
+            f"(CALL {call_score}, PUT {put_score})."
+        )
         return None
 
     return {
@@ -643,18 +639,102 @@ def analyze_pair(item):
 
 
 # ==========================================
+# FINAL VALIDATION
+# ==========================================
+
+def final_validation(candidates):
+    log("=" * 40)
+    log("STARTING FINAL VALIDATION")
+    log("=" * 40)
+
+    latest_symbols = get_otc_symbols()
+
+    latest_map = {
+        item["symbol"]: item
+        for item in latest_symbols
+    }
+
+    for candidate in candidates:
+        symbol = candidate["symbol"]
+
+        log(f"FINAL CHECK: {symbol}")
+
+        latest_item = latest_map.get(symbol)
+
+        if not latest_item:
+            log(
+                f"REJECTED {symbol}: "
+                f"Pair unavailable or payout below {MIN_PAYOUT}%."
+            )
+            continue
+
+        try:
+            fresh = analyze_pair(latest_item)
+
+        except Exception as error:
+            log(f"FINAL DATA ERROR {symbol}: {error}")
+            continue
+
+        if not fresh:
+            log(
+                f"FINAL REJECTED {symbol}: "
+                "Current setup no longer qualifies."
+            )
+            continue
+
+        if fresh["direction"] != candidate["direction"]:
+            log(
+                f"FINAL REJECTED {symbol}: "
+                f"Direction changed from {candidate['direction']} "
+                f"to {fresh['direction']}."
+            )
+            continue
+
+        if fresh["score"] < MIN_SCORE:
+            log(
+                f"FINAL REJECTED {symbol}: "
+                f"Score too low ({fresh['score']})."
+            )
+            continue
+
+        if fresh["payout"] < MIN_PAYOUT:
+            log(
+                f"FINAL REJECTED {symbol}: "
+                "Payout below minimum."
+            )
+            continue
+
+        log(
+            f"FINAL VALIDATION PASSED: {symbol} "
+            f"{fresh['direction']} "
+            f"SCORE {fresh['score']}/7"
+        )
+
+        return fresh
+
+    log("FINAL VALIDATION: NO CANDIDATE PASSED.")
+    return None
+
+
+# ==========================================
 # ENTRY TIME
 # ==========================================
 
 def calculate_entry_time():
     now = time.time()
 
-    # Ensure enough time for final validation before the alert.
+    # Entry must be at least 30 seconds away.
     entry_timestamp = math.ceil(
-        (now + 75) / 60
+        (now + MIN_ENTRY_DELAY) / 60
     ) * 60
 
     signal_timestamp = entry_timestamp - SIGNAL_LEAD
+
+    # If signal time is already too close or passed,
+    # use the following minute.
+    if signal_timestamp <= now + 3:
+        entry_timestamp += 60
+        signal_timestamp += 60
 
     return int(signal_timestamp), int(entry_timestamp)
 
@@ -723,42 +803,6 @@ ATR: {candidate['atr']}
 
 
 # ==========================================
-# FINAL VALIDATION
-# ==========================================
-
-def final_validation(candidate):
-    latest_symbols = get_otc_symbols()
-
-    latest_item = next(
-        (
-            item for item in latest_symbols
-            if item["symbol"] == candidate["symbol"]
-        ),
-        None
-    )
-
-    if not latest_item:
-        log("PAIR NO LONGER MEETS PAYOUT REQUIREMENT.")
-        return None
-
-    fresh = analyze_pair(latest_item)
-
-    if not fresh:
-        log("FINAL VALIDATION: NO VALID SETUP.")
-        return None
-
-    if fresh["direction"] != candidate["direction"]:
-        log("FINAL VALIDATION: DIRECTION CHANGED.")
-        return None
-
-    if fresh["score"] < MIN_SCORE:
-        log("FINAL VALIDATION: SCORE TOO LOW.")
-        return None
-
-    return fresh
-
-
-# ==========================================
 # MAIN
 # ==========================================
 
@@ -775,18 +819,29 @@ def main():
         raise RuntimeError("Telegram secrets are missing.")
 
     log(f"UTC NOW: {utc_now().isoformat()}")
+
     log(
         "FLORIDA NOW: "
         + datetime.now(LOCAL_TZ).strftime("%Y-%m-%d %I:%M:%S %p")
     )
 
+    log(f"MINIMUM PAYOUT: {MIN_PAYOUT}%")
+    log(f"MINIMUM SCORE: {MIN_SCORE}/7")
+    log(f"CANDLE OFFSET: {CANDLE_TIME_OFFSET_SECONDS}s")
+
     symbols = get_otc_symbols()
 
-    log(f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: {len(symbols)}")
+    log(
+        f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: "
+        f"{len(symbols)}"
+    )
 
     if not symbols:
         telegram_send(
-            make_wait_message("No eligible OTC pairs found.", 0)
+            make_wait_message(
+                "No eligible OTC pairs found.",
+                0
+            )
         )
         return
 
@@ -821,6 +876,7 @@ def main():
             errors += 1
             log(f"ERROR {item['symbol']}: {error}")
 
+    log("=" * 45)
     log(f"PAIRS SCANNED: {scanned}")
     log(f"VALID CANDIDATES: {len(candidates)}")
     log(f"DATA ERRORS: {errors}")
@@ -843,49 +899,43 @@ def main():
         reverse=True
     )
 
-    best = candidates[0]
+    log("CANDIDATES RANKED:")
 
-    log(f"BEST CANDIDATE: {best}")
+    for candidate in candidates:
+        log(
+            f"{candidate['symbol']} "
+            f"{candidate['direction']} "
+            f"SCORE={candidate['score']} "
+            f"PAYOUT={candidate['payout']}"
+        )
 
-    signal_timestamp, entry_timestamp = calculate_entry_time()
-
-    validation_timestamp = (
-        signal_timestamp - VALIDATION_BEFORE_SIGNAL
-    )
-
-    log(
-        f"VALIDATION TIME: {format_time(validation_timestamp)}"
-    )
-    log(f"SIGNAL TIME: {format_time(signal_timestamp)}")
-    log(f"ENTRY TIME: {format_time(entry_timestamp)}")
-
-    log("WAITING FOR FINAL VALIDATION...")
-    wait_until(validation_timestamp)
-
-    try:
-        verified = final_validation(best)
-
-    except Exception as error:
-        log(f"FINAL VALIDATION ERROR: {error}")
-        verified = None
+    # Try the strongest candidate first.
+    # If it fails, test the next candidate.
+    verified = final_validation(candidates)
 
     if not verified:
         telegram_send(
             make_wait_message(
-                "Candidate failed final validation.",
+                "All candidates failed final validation.",
                 scanned
             )
         )
         return
 
-    log("FINAL VALIDATION PASSED.")
-    log("WAITING FOR SIGNAL TIME...")
+    # Calculate timing only after final validation.
+    signal_timestamp, entry_timestamp = calculate_entry_time()
 
+    log(f"VALIDATED PAIR: {verified['symbol']}")
+    log(f"SIGNAL TIME: {format_time(signal_timestamp)}")
+    log(f"ENTRY TIME: {format_time(entry_timestamp)}")
+
+    log("WAITING FOR SIGNAL TIME...")
     wait_until(signal_timestamp)
 
     # Do not send late alerts.
     if time.time() > signal_timestamp + 3:
         log("SIGNAL TIME MISSED. NO SIGNAL SENT.")
+
         telegram_send(
             make_wait_message(
                 "Signal timing was missed.",
@@ -894,7 +944,6 @@ def main():
         )
         return
 
-    # Confirm there is still enough time for manual entry.
     if time.time() >= entry_timestamp:
         log("ENTRY TIME PASSED. NO SIGNAL SENT.")
         return
