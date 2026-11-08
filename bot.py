@@ -3,234 +3,143 @@ import os
 import time
 import requests
 import pandas as pd
-import numpy as np
 from datetime import datetime, timezone, timedelta
 
 # ==========================================
-# ROMARIO TRADER PRO 3.3
-# ALL POCKET OPTION OTC SCANNER
-# MANUAL SCAN - TELEGRAM ALERTS ONLY
+# ROMARIO TRADER PRO 3.4
+# MORE SIGNALS - ALL OTC
+# MANUAL SCAN ONLY
 # ==========================================
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 BASE_URL = "https://otcharts.com"
-VENUE = "otc"
+OFFSET_HOURS = 2
 
 M1_TF = 60
 M5_TF = 300
+LIMIT = 100
 
-M1_LIMIT = 100
-M5_LIMIT = 100
-
-SWEEP_LOOKBACK = 10
-BROKER_OFFSET_HOURS = 2
-
-REQUEST_DELAY = 0.12
-MAX_MESSAGE_LENGTH = 3500
+DELAY = 0.12
+MAX_SYMBOLS = 150
 
 session = requests.Session()
-
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "ROMARIO-TRADER-PRO-3.3"
+    "User-Agent": "ROMARIO-TRADER-PRO-3.4"
 })
 
 
 # ==========================================
-# API REQUEST
+# API
 # ==========================================
 
-def api_get(endpoint, params=None):
-    url = BASE_URL + endpoint
-
-    response = session.get(
-        url,
+def api_get(path, params=None):
+    r = session.get(
+        BASE_URL + path,
         params=params,
         timeout=30
     )
+    r.raise_for_status()
+    return r.json()
 
-    response.raise_for_status()
-
-    return response.json()
-
-
-# ==========================================
-# TIME CONVERSION
-# ==========================================
 
 def convert_time(value):
     if isinstance(value, (int, float)):
         unit = "ms" if value > 100000000000 else "s"
+        dt = pd.to_datetime(value, unit=unit, utc=True)
+    else:
+        dt = pd.to_datetime(value, utc=True)
 
-        result = pd.to_datetime(
-            value,
-            unit=unit,
-            utc=True
-        )
-
-        return result - timedelta(
-            hours=BROKER_OFFSET_HOURS
-        )
-
-    result = pd.to_datetime(value, utc=True)
-
-    return result - timedelta(
-        hours=BROKER_OFFSET_HOURS
-    )
+    return dt - timedelta(hours=OFFSET_HOURS)
 
 
 # ==========================================
-# GET ALL OTC INSTRUMENTS
+# SYMBOL LIST
 # ==========================================
 
-def get_otc_symbols():
-    print("\nGETTING OTC SYMBOLS...")
-
-    data = api_get(
-        "/v1/symbols",
-        {"venue": VENUE}
-    )
+def get_symbols():
+    data = api_get("/v1/symbols", {"venue": "otc"})
 
     if isinstance(data, list):
-        instruments = data
-
+        items = data
     else:
-        instruments = (
+        items = (
             data.get("symbols")
             or data.get("instruments")
             or data.get("data")
             or []
         )
 
-    if isinstance(instruments, dict):
-        instruments = (
-            instruments.get("symbols")
-            or instruments.get("instruments")
-            or []
-        )
+    if isinstance(items, dict):
+        items = items.get("symbols", [])
 
-    if not isinstance(instruments, list):
-        raise ValueError(
-            "Unexpected symbols API response."
-        )
-
-    symbols = []
-
-    for item in instruments:
-
+    result = {}
+    for item in items:
         if not isinstance(item, dict):
             continue
 
         symbol = item.get("symbol")
-
         if not symbol:
             continue
 
-        name = (
-            item.get("name")
-            or item.get("displayName")
-            or symbol
-        )
-
-        is_open = item.get("open")
-
-        if is_open is False:
+        opened = item.get("open")
+        if opened is False:
+            continue
+        if isinstance(opened, str) and opened.lower() in (
+            "false", "closed", "0"
+        ):
             continue
 
-        if isinstance(is_open, str):
-            if is_open.lower() in (
-                "false", "closed", "0"
-            ):
-                continue
-
-        symbols.append({
+        name = item.get("name") or symbol
+        result[str(symbol)] = {
             "symbol": str(symbol),
             "name": str(name)
-        })
+        }
 
-    unique = {}
-
-    for item in symbols:
-        unique[item["symbol"]] = item
-
-    symbols = list(unique.values())
+    symbols = list(result.values())[:MAX_SYMBOLS]
 
     if not symbols:
-        raise ValueError(
-            "No open OTC instruments found."
-        )
-
-    print("OPEN OTC INSTRUMENTS:", len(symbols))
+        raise RuntimeError("No OTC symbols returned by API.")
 
     return symbols
 
 
 # ==========================================
-# GET CANDLES
+# CANDLES
 # ==========================================
 
-def fetch_candles(symbol, timeframe, limit):
-
+def get_candles(symbol, timeframe):
     data = api_get(
         "/v1/candles",
         {
-            "venue": VENUE,
+            "venue": "otc",
             "symbol": symbol,
             "tf": timeframe,
-            "limit": limit
+            "limit": LIMIT
         }
     )
 
     candles = data.get("candles", [])
-
     if not candles:
-        raise ValueError("No candles returned.")
-
-    missing = (
-        data.get("gaps", {}).get("missingBars", 0)
-    )
-
-    if missing:
-        raise ValueError(
-            f"Missing candles: {missing}"
-        )
+        raise RuntimeError("No candles")
 
     df = pd.DataFrame(candles)
 
-    required = [
-        "time",
-        "open",
-        "high",
-        "low",
-        "close"
-    ]
+    required = ["time", "open", "high", "low", "close"]
+    for col in required:
+        if col not in df.columns:
+            raise RuntimeError("Missing field: " + col)
 
-    for column in required:
-        if column not in df.columns:
-            raise ValueError(
-                f"Missing candle field: {column}"
-            )
-
-    for column in [
-        "open", "high", "low", "close"
-    ]:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
+    for col in ["open", "high", "low", "close"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["time"] = df["time"].apply(convert_time)
-
     df = df.dropna(subset=required)
-
     df = df.sort_values("time")
-
-    df = df.drop_duplicates(
-        subset=["time"]
-    )
+    df = df.drop_duplicates("time")
 
     return df.reset_index(drop=True)
 
@@ -239,206 +148,155 @@ def fetch_candles(symbol, timeframe, limit):
 # INDICATORS
 # ==========================================
 
-def add_indicators(df):
-
+def indicators(df):
     df = df.copy()
 
+    df["ema9"] = df["close"].ewm(
+        span=9, adjust=False
+    ).mean()
+
     df["ema20"] = df["close"].ewm(
-        span=20,
-        adjust=False
+        span=20, adjust=False
     ).mean()
 
     df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
+        span=50, adjust=False
     ).mean()
 
-    previous_close = df["close"].shift(1)
+    delta = df["close"].diff()
 
-    tr = pd.concat(
-        [
-            df["high"] - df["low"],
-            (df["high"] - previous_close).abs(),
-            (df["low"] - previous_close).abs()
-        ],
-        axis=1
-    ).max(axis=1)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    df["atr"] = tr.rolling(14).mean()
+    avg_gain = gain.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    avg_loss = loss.ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
+
+    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = df["rsi"].fillna(50)
 
     return df
 
 
-# ==========================================
-# COMPLETED CANDLES ONLY
-# ==========================================
-
-def get_completed(df, timeframe, now):
-
-    completed = df[
-        (
-            df["time"]
-            + timedelta(seconds=timeframe)
-        ) <= now
-    ].copy()
-
-    return completed.reset_index(drop=True)
+def completed(df, seconds, now):
+    return df[
+        df["time"] + timedelta(seconds=seconds) <= now
+    ].reset_index(drop=True)
 
 
 # ==========================================
-# M5 TREND
+# SIGNAL LOGIC
 # ==========================================
 
-def get_m5_trend(m5, signal_time):
+def analyze(m1, m5, now):
 
-    available = m5[
-        (
-            m5["time"]
-            + timedelta(seconds=M5_TF)
-        ) <= signal_time
-    ]
-
-    if available.empty:
+    if len(m1) < 30 or len(m5) < 25:
         return None
 
-    return available.iloc[-1]
+    a = m1.iloc[-1]
+    previous = m1.iloc[-2]
+    trend = m5.iloc[-1]
 
+    age1 = (
+        now - (a["time"] + timedelta(seconds=M1_TF))
+    ).total_seconds()
 
-# ==========================================
-# LIQUIDITY SWEEP + BOS + RETEST
-# ==========================================
+    age5 = (
+        now - (trend["time"] + timedelta(seconds=M5_TF))
+    ).total_seconds()
 
-def detect_signal(m1, m5):
-
-    if len(m1) < 40 or len(m5) < 30:
+    if age1 < 0 or age1 > 180:
         return None
 
-    i = len(m1) - 1
-
-    sweep = m1.iloc[i - 2]
-    bos = m1.iloc[i - 1]
-    retest = m1.iloc[i]
-
-    signal_time = (
-        retest["time"]
-        + timedelta(seconds=M1_TF)
-    )
-
-    trend = get_m5_trend(
-        m5,
-        signal_time
-    )
-
-    if trend is None:
+    if age5 < 0 or age5 > 600:
         return None
 
-    if not np.isfinite(sweep["atr"]):
+    # CALL CONDITIONS
+    call_score = 0
+
+    if a["ema9"] > a["ema20"]:
+        call_score += 1
+
+    if a["close"] > a["ema9"]:
+        call_score += 1
+
+    if 52 <= a["rsi"] <= 75:
+        call_score += 1
+
+    if a["close"] > a["open"] and a["close"] > previous["close"]:
+        call_score += 1
+
+    if trend["ema20"] > trend["ema50"]:
+        call_score += 1
+
+    # PUT CONDITIONS
+    put_score = 0
+
+    if a["ema9"] < a["ema20"]:
+        put_score += 1
+
+    if a["close"] < a["ema9"]:
+        put_score += 1
+
+    if 25 <= a["rsi"] <= 48:
+        put_score += 1
+
+    if a["close"] < a["open"] and a["close"] < previous["close"]:
+        put_score += 1
+
+    if trend["ema20"] < trend["ema50"]:
+        put_score += 1
+
+    if call_score >= 3 and call_score > put_score:
+        direction = "CALL"
+        score = call_score
+
+    elif put_score >= 3 and put_score > call_score:
+        direction = "PUT"
+        score = put_score
+
+    elif call_score >= 2 and call_score > put_score:
+        direction = "WEAK CALL"
+        score = call_score
+
+    elif put_score >= 2 and put_score > call_score:
+        direction = "WEAK PUT"
+        score = put_score
+
+    else:
         return None
 
-    if sweep["atr"] <= 0:
-        return None
+    if score >= 4:
+        strength = "STRONGER TECHNICAL SETUP"
+    elif score == 3:
+        strength = "MODERATE TECHNICAL SETUP"
+    else:
+        strength = "WEAK - EXTRA CAUTION"
 
-    history = m1.iloc[
-        i - 2 - SWEEP_LOOKBACK:i - 2
-    ]
-
-    if len(history) < SWEEP_LOOKBACK:
-        return None
-
-    old_low = history["low"].min()
-    old_high = history["high"].max()
-
-    # BULLISH LIQUIDITY SWEEP
-
-    bullish_sweep = (
-        sweep["low"] < old_low
-        and sweep["close"] > old_low
-    )
-
-    # BEARISH LIQUIDITY SWEEP
-
-    bearish_sweep = (
-        sweep["high"] > old_high
-        and sweep["close"] < old_high
-    )
-
-    # BREAK OF STRUCTURE
-
-    bullish_bos = (
-        bullish_sweep
-        and bos["close"] > sweep["high"]
-        and bos["close"] > bos["open"]
-    )
-
-    bearish_bos = (
-        bearish_sweep
-        and bos["close"] < sweep["low"]
-        and bos["close"] < bos["open"]
-    )
-
-    tolerance = sweep["atr"] * 0.15
-
-    # RETEST
-
-    bullish_retest = (
-        bullish_bos
-        and retest["low"]
-        <= sweep["high"] + tolerance
-        and retest["close"] > sweep["high"]
-        and retest["close"] > retest["open"]
-    )
-
-    bearish_retest = (
-        bearish_bos
-        and retest["high"]
-        >= sweep["low"] - tolerance
-        and retest["close"] < sweep["low"]
-        and retest["close"] < retest["open"]
-    )
-
-    # M5 CONFIRMATION
-
-    m5_bullish = (
-        trend["ema20"] > trend["ema50"]
-        and trend["close"] > trend["ema20"]
-    )
-
-    m5_bearish = (
-        trend["ema20"] < trend["ema50"]
-        and trend["close"] < trend["ema20"]
-    )
-
-    if bullish_retest and m5_bullish:
-
-        return {
-            "direction": "CALL",
-            "price": float(retest["close"]),
-            "time": signal_time
-        }
-
-    if bearish_retest and m5_bearish:
-
-        return {
-            "direction": "PUT",
-            "price": float(retest["close"]),
-            "time": signal_time
-        }
-
-    return None
+    return {
+        "direction": direction,
+        "score": score,
+        "strength": strength,
+        "price": float(a["close"]),
+        "rsi": round(float(a["rsi"]), 2),
+        "time": a["time"]
+    }
 
 
 # ==========================================
 # TELEGRAM
 # ==========================================
 
-def send_telegram(message):
+def telegram(message):
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    response = requests.post(
+    r = requests.post(
         url,
         json={
             "chat_id": CHAT_ID,
@@ -447,271 +305,163 @@ def send_telegram(message):
         timeout=20
     )
 
-    response.raise_for_status()
+    r.raise_for_status()
 
-    result = response.json()
-
-    if not result.get("ok"):
-        raise ValueError(
-            "Telegram message was rejected."
-        )
-
-    print("TELEGRAM MESSAGE SENT")
+    if not r.json().get("ok"):
+        raise RuntimeError("Telegram rejected message.")
 
 
-def send_long_message(message):
+# ==========================================
+# SCAN
+# ==========================================
 
-    lines = message.split("\n")
+def main():
 
+    print("ROMARIO TRADER PRO 3.4")
+    print("ALL OTC - MORE SIGNALS")
+    print("MANUAL SCAN")
+    print("==============================")
+
+    if not API_KEY or not TOKEN or not CHAT_ID:
+        raise RuntimeError("Missing GitHub Secrets.")
+
+    now = datetime.now(timezone.utc)
+
+    symbols = get_symbols()
+
+    print("OTC SYMBOLS:", len(symbols))
+
+    signals = []
+    scanned = 0
+    skipped = 0
+
+    for number, item in enumerate(symbols, 1):
+
+        symbol = item["symbol"]
+        name = item["name"]
+
+        print(f"\n{number}/{len(symbols)} SCANNING {name}")
+
+        try:
+            m1 = get_candles(symbol, M1_TF)
+            time.sleep(DELAY)
+
+            m5 = get_candles(symbol, M5_TF)
+            time.sleep(DELAY)
+
+            m1 = indicators(m1)
+            m5 = indicators(m5)
+
+            m1 = completed(m1, M1_TF, now)
+            m5 = completed(m5, M5_TF, now)
+
+            result = analyze(m1, m5, now)
+
+            scanned += 1
+
+            if result:
+                result["name"] = name
+                result["symbol"] = symbol
+                signals.append(result)
+
+                print(
+                    "SIGNAL:",
+                    result["direction"],
+                    "SCORE:",
+                    result["score"],
+                    "/5"
+                )
+            else:
+                print("WAIT")
+
+        except Exception as error:
+            skipped += 1
+            print("SKIPPED:", symbol, str(error))
+
+        time.sleep(DELAY)
+
+    # ======================================
+    # REPORT
+    # ======================================
+
+    calls = [
+        s for s in signals
+        if "CALL" in s["direction"]
+    ]
+
+    puts = [
+        s for s in signals
+        if "PUT" in s["direction"]
+    ]
+
+    lines = [
+        "ROMARIO TRADER PRO 3.4",
+        "ALL OTC SCANNER",
+        "-------------------------",
+        f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"OTC FOUND: {len(symbols)}",
+        f"SCANNED: {scanned}",
+        f"SKIPPED: {skipped}",
+        f"TOTAL SIGNALS: {len(signals)}",
+        f"CALL: {len(calls)}",
+        f"PUT: {len(puts)}",
+        "TIMEFRAME: M1",
+        "TREND: M5",
+        "EXPIRATION REFERENCE: 60 SECONDS",
+        "-------------------------"
+    ]
+
+    if not signals:
+        lines.extend([
+            "STATUS: WAIT",
+            "No setup met the signal threshold."
+        ])
+
+    for s in signals:
+        lines.extend([
+            "",
+            f"PAIR: {s['name']}",
+            f"SYMBOL: {s['symbol']}",
+            f"SIGNAL: {s['direction']}",
+            f"TECHNICAL SCORE: {s['score']}/5",
+            f"SETUP: {s['strength']}",
+            f"OTCHARTS CLOSE: {s['price']}",
+            f"RSI: {s['rsi']}",
+            f"CANDLE TIME: {s['time']}",
+            "-------------------------"
+        ])
+
+    lines.extend([
+        "",
+        "IMPORTANT:",
+        "Score is NOT a win probability.",
+        "Weak signals require extra caution.",
+        "OTCharts prices are not verified against",
+        "Pocket Option execution prices.",
+        "MANUAL ALERTS ONLY - NO AUTO TRADES."
+    ])
+
+    message = "\n".join(lines)
+
+    # Telegram messages must stay below limit.
     chunks = []
     current = ""
 
-    for line in lines:
-
-        if (
-            len(current) + len(line) + 1
-            > MAX_MESSAGE_LENGTH
-        ):
-
+    for line in message.split("\n"):
+        if len(current) + len(line) + 1 > 3500:
             chunks.append(current)
             current = ""
-
         current += line + "\n"
 
     if current:
         chunks.append(current)
 
     for chunk in chunks:
-        send_telegram(chunk)
-
-
-# ==========================================
-# SCAN ONE INSTRUMENT
-# ==========================================
-
-def scan_symbol(instrument, now):
-
-    symbol = instrument["symbol"]
-    name = instrument["name"]
-
-    try:
-
-        m1 = fetch_candles(
-            symbol,
-            M1_TF,
-            M1_LIMIT
-        )
-
-        time.sleep(REQUEST_DELAY)
-
-        m5 = fetch_candles(
-            symbol,
-            M5_TF,
-            M5_LIMIT
-        )
-
-        m1 = add_indicators(m1)
-        m5 = add_indicators(m5)
-
-        m1 = get_completed(
-            m1,
-            M1_TF,
-            now
-        )
-
-        m5 = get_completed(
-            m5,
-            M5_TF,
-            now
-        )
-
-        if len(m1) < 40 or len(m5) < 30:
-            raise ValueError(
-                "Not enough completed candles."
-            )
-
-        last_m1 = m1.iloc[-1]
-        last_m5 = m5.iloc[-1]
-
-        m1_age = (
-            now
-            - (
-                last_m1["time"]
-                + timedelta(seconds=M1_TF)
-            )
-        ).total_seconds()
-
-        m5_age = (
-            now
-            - (
-                last_m5["time"]
-                + timedelta(seconds=M5_TF)
-            )
-        ).total_seconds()
-
-        if m1_age < 0 or m1_age > 180:
-            raise ValueError("M1 data is stale.")
-
-        if m5_age < 0 or m5_age > 600:
-            raise ValueError("M5 data is stale.")
-
-        signal = detect_signal(m1, m5)
-
-        if signal:
-
-            signal["symbol"] = symbol
-            signal["name"] = name
-
-            print(
-                "CANDIDATE:",
-                name,
-                signal["direction"]
-            )
-
-            return signal
-
-        print("WAIT:", name)
-
-        return None
-
-    except Exception as error:
-
-        print(
-            "SKIPPED:",
-            symbol,
-            "|",
-            str(error)
-        )
-
-        return None
-
-
-# ==========================================
-# MAIN SCANNER
-# ==========================================
-
-def main():
-
-    print("\nROMARIO TRADER PRO 3.3")
-    print("ALL OTC SCANNER")
-    print("MANUAL DEMO MODE")
-    print("==============================")
-
-    if not API_KEY:
-        raise ValueError(
-            "OTCHARTS_API_KEY is missing."
-        )
-
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        raise ValueError(
-            "Telegram secrets are missing."
-        )
-
-    now = datetime.now(timezone.utc)
-
-    instruments = get_otc_symbols()
-
-    signals = []
-    errors = 0
-
-    total = len(instruments)
-
-    for index, instrument in enumerate(
-        instruments,
-        start=1
-    ):
-
-        print(
-            f"\nSCANNING {index}/{total}:",
-            instrument["name"]
-        )
-
-        signal = scan_symbol(
-            instrument,
-            now
-        )
-
-        if signal:
-            signals.append(signal)
-
-        time.sleep(REQUEST_DELAY)
-
-    # ======================================
-    # REPORT
-    # ======================================
-
-    print("\n========== SCAN RESULTS ==========")
-
-    print("INSTRUMENTS FOUND:", total)
-    print("SIGNALS FOUND:", len(signals))
-
-    calls = [
-        s for s in signals
-        if s["direction"] == "CALL"
-    ]
-
-    puts = [
-        s for s in signals
-        if s["direction"] == "PUT"
-    ]
-
-    print("CALL:", len(calls))
-    print("PUT:", len(puts))
-
-    report = [
-        "ROMARIO TRADER PRO 3.3",
-        "ALL OTC MARKET SCAN",
-        "--------------------------",
-        f"UTC: {now.strftime('%Y-%m-%d %H:%M:%S')}",
-        f"OTC INSTRUMENTS: {total}",
-        f"CALL CANDIDATES: {len(calls)}",
-        f"PUT CANDIDATES: {len(puts)}",
-        "TIMEFRAME: M1",
-        "M5 CONFIRMATION",
-        "EXPIRATION: 60 SECONDS",
-        "",
-        "DEMO CANDIDATES ONLY",
-        "--------------------------"
-    ]
-
-    if not signals:
-
-        report.extend([
-            "STATUS: WAIT",
-            "No valid setup found.",
-            "No trade recommended."
-        ])
-
-    else:
-
-        for signal in signals:
-
-            report.extend([
-                "",
-                f"PAIR: {signal['name']}",
-                f"SYMBOL: {signal['symbol']}",
-                f"DIRECTION: {signal['direction']}",
-                f"OTCHARTS CLOSE: {signal['price']}",
-                f"TIME UTC: {signal['time']}",
-                "EXPIRATION: 60 SECONDS",
-                "--------------------------"
-            ])
-
-    report.extend([
-        "",
-        "Strategy: Liquidity Sweep + BOS + Retest",
-        "M5 trend confirmation required.",
-        "OTCHARTS prices are not independently",
-        "verified against Pocket Option quotes.",
-        "DEMO ONLY - NO AUTOMATIC TRADES."
-    ])
-
-    send_long_message(
-        "\n".join(report)
-    )
+        telegram(chunk)
 
     print("\nSCAN COMPLETE")
-    print("NO REAL TRADES EXECUTED.")
+    print("SIGNALS:", len(signals))
+    print("SKIPPED:", skipped)
 
 
 if __name__ == "__main__":
