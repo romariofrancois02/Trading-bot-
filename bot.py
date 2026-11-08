@@ -15,7 +15,7 @@ API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-BASE_URL = "https://api.otcharts.com"
+BASE_URL = "https://otcharts.com"
 LOCAL_TZ = ZoneInfo("America/New_York")
 
 TIMEOUT = 20
