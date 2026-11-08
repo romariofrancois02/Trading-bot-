@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 4.0"
+VERSION = "ROMARIO TRADER PRO 4.1"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -21,6 +21,9 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 TIMEOUT = 20
 MAX_WORKERS = 8
+
+# Minimum preparation time before entry
+MIN_PREP_SECONDS = 30
 
 session = requests.Session()
 session.headers.update({
@@ -37,11 +40,23 @@ def utc_now():
     return datetime.now(timezone.utc)
 
 
-def next_minute(dt):
-    return (
-        dt.replace(second=0, microsecond=0)
+def next_entry_time(now):
+    """
+    Select the next full M1 minute.
+    If it is less than 30 seconds away,
+    skip to the following minute.
+    """
+    entry = (
+        now.replace(second=0, microsecond=0)
         + timedelta(minutes=1)
     )
+
+    seconds_left = (entry - now).total_seconds()
+
+    if seconds_left < MIN_PREP_SECONDS:
+        entry += timedelta(minutes=1)
+
+    return entry
 
 
 def send_telegram(message):
@@ -62,6 +77,13 @@ def send_telegram(message):
 
     log(f"TELEGRAM STATUS: {response.status_code}")
     response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram did not confirm message delivery")
+
+    return result
 
 
 def api_get(path, params=None):
@@ -92,7 +114,7 @@ def get_symbols():
     symbols = data.get("symbols", [])
 
     if not isinstance(symbols, list):
-        raise ValueError("Invalid symbols response")
+        raise ValueError("Invalid OTCharts symbols response")
 
     result = []
 
@@ -200,8 +222,7 @@ def analyze(item):
         if m1 is None or m5 is None:
             return None
 
-        # Keep completed candles only.
-        # This preserves the data handling used in PRO 3.9.
+        # Use completed candles only
         m1 = indicators(m1.iloc[:-1].copy())
         m5 = indicators(m5.iloc[:-1].copy())
 
@@ -254,13 +275,14 @@ def analyze(item):
         elif previous["close"] < previous["open"]:
             sell += 1
 
-        # RSI filter
+        # RSI
         if 50 <= rsi_value <= 68:
             buy += 1
 
         elif 32 <= rsi_value <= 50:
             sell += 1
 
+        # Avoid extreme RSI
         if rsi_value > 75 or rsi_value < 25:
             return None
 
@@ -289,12 +311,6 @@ def analyze(item):
         else:
             return None
 
-        # Record when this pair's analysis finished.
-        analyzed_at = utc_now()
-
-        # Entry is the next full minute after analysis.
-        entry_time = next_minute(analyzed_at)
-
         return {
             "symbol": symbol,
             "name": item["name"],
@@ -302,8 +318,7 @@ def analyze(item):
             "score": score,
             "rsi": rsi_value,
             "reference": float(last["close"]),
-            "analyzed_at": analyzed_at,
-            "entry_time": entry_time
+            "analyzed_at": utc_now()
         }
 
     except Exception as error:
@@ -315,14 +330,22 @@ def analyze(item):
         return None
 
 
-def signal_message(signal, total):
-    entry_utc = signal["entry_time"]
-    expiry_utc = entry_utc + timedelta(seconds=60)
+def signal_message(
+    signal,
+    total,
+    signal_time,
+    entry_time
+):
+    expiry_time = entry_time + timedelta(seconds=60)
 
-    entry_local = entry_utc.astimezone(LOCAL_TZ)
-    expiry_local = expiry_utc.astimezone(LOCAL_TZ)
+    signal_local = signal_time.astimezone(LOCAL_TZ)
+    entry_local = entry_time.astimezone(LOCAL_TZ)
+    expiry_local = expiry_time.astimezone(LOCAL_TZ)
 
-    signal_local = utc_now().astimezone(LOCAL_TZ)
+    preparation_seconds = max(
+        0,
+        int((entry_time - signal_time).total_seconds())
+    )
 
     if signal["direction"] == "BUY":
         title = "🟢 BUY / CALL"
@@ -341,13 +364,12 @@ def signal_message(signal, total):
         f"📈 TREND: {trend}\n"
         f"⏱ TIMEFRAME: M1\n"
         f"⌛ EXPIRATION: 60 SECONDS\n\n"
-        f"🕒 SIGNAL SENT: "
+        f"🕒 SIGNAL TIME: "
         f"{signal_local:%I:%M:%S %p}\n"
         f"🟢 <b>ENTRY TIME: "
         f"{entry_local:%I:%M:%S %p}</b>\n"
-        f"⏰ ENTRY WINDOW: "
-        f"{entry_local:%I:%M %p} - "
-        f"{expiry_local:%I:%M:%S %p}\n"
+        f"⏰ PREPARATION TIME: "
+        f"{preparation_seconds} SECONDS\n"
         f"🏁 EXPIRATION TIME: "
         f"{expiry_local:%I:%M:%S %p}\n\n"
         f"📍 LAST CLOSED PRICE REFERENCE: "
@@ -364,33 +386,12 @@ def signal_message(signal, total):
     )
 
 
-def wait_until_entry(entry_time):
-    log(
-        "WAITING FOR ENTRY: "
-        + entry_time.astimezone(LOCAL_TZ).strftime(
-            "%I:%M:%S %p"
-        )
-    )
-
-    while True:
-        remaining = (
-            entry_time - utc_now()
-        ).total_seconds()
-
-        if remaining <= 0:
-            break
-
-        time.sleep(min(0.2, remaining))
-
-    log("ENTRY TIME REACHED.")
-
-
 def main():
     start = time.time()
 
     log("=" * 45)
     log(VERSION)
-    log("NEXT M1 CANDLE ENTRY SCANNER")
+    log("IMMEDIATE TELEGRAM SIGNAL / NEXT M1 ENTRY")
     log("=" * 45)
 
     if not API_KEY:
@@ -431,7 +432,6 @@ def main():
             f"⚪ WAIT\n"
             f"No open Forex OTC pairs found."
         )
-
         return
 
     candidates = []
@@ -465,10 +465,9 @@ def main():
             f"💱 PAIRS SCANNED: {len(symbols)}\n"
             f"⏱ ANALYSIS: {elapsed:.1f}s"
         )
-
         return
 
-    # Highest score first, then newest analysis.
+    # Choose the strongest candidate.
     candidates.sort(
         key=lambda x: (
             x["score"],
@@ -477,59 +476,51 @@ def main():
         reverse=True
     )
 
-    # Never send a signal whose entry minute has passed.
-    now = utc_now()
+    best = candidates[0]
 
-    valid_candidates = [
-        item for item in candidates
-        if item["entry_time"] > now
-    ]
+    # Calculate entry after the entire scan is finished.
+    signal_time = utc_now()
+    entry_time = next_entry_time(signal_time)
 
-    if not valid_candidates:
-        log("ALL SIGNAL ENTRY WINDOWS EXPIRED.")
-
-        send_telegram(
-            f"🤖 <b>{VERSION}</b>\n\n"
-            f"⚪ <b>WAIT</b>\n"
-            f"Scan finished too late for the next "
-            f"M1 entry window.\n"
-            f"No expired signal will be sent.\n\n"
-            f"💱 PAIRS SCANNED: {len(symbols)}\n"
-            f"⏱ ANALYSIS: {elapsed:.1f}s"
-        )
-
-        return
-
-    best = valid_candidates[0]
+    preparation_seconds = (
+        entry_time - signal_time
+    ).total_seconds()
 
     log(
         f"SELECTED: {best['direction']} "
-        f"{best['symbol']} "
-        f"SCORE {best['score']}"
+        f"{best['symbol']} SCORE {best['score']}"
+    )
+
+    log(
+        "SIGNAL TIME: "
+        + signal_time.astimezone(LOCAL_TZ).strftime(
+            "%I:%M:%S %p"
+        )
     )
 
     log(
         "ENTRY TIME: "
-        + best["entry_time"].astimezone(
-            LOCAL_TZ
-        ).strftime("%I:%M:%S %p")
+        + entry_time.astimezone(LOCAL_TZ).strftime(
+            "%I:%M:%S %p"
+        )
     )
 
-    # Wait until the next full M1 minute.
-    wait_until_entry(best["entry_time"])
-
-    # Do not send if the target minute was missed.
-    if utc_now() >= (
-        best["entry_time"] + timedelta(seconds=60)
-    ):
-        log("ENTRY WINDOW EXPIRED. SIGNAL CANCELLED.")
-        return
-
-    send_telegram(
-        signal_message(best, len(symbols))
+    log(
+        f"PREPARATION TIME: "
+        f"{preparation_seconds:.1f} seconds"
     )
 
-    log("SIGNAL SENT SUCCESSFULLY.")
+    # Send immediately. Do NOT wait for entry time.
+    message = signal_message(
+        best,
+        len(symbols),
+        signal_time,
+        entry_time
+    )
+
+    send_telegram(message)
+
+    log("SIGNAL SENT. BOT FINISHED.")
 
 
 if __name__ == "__main__":
@@ -541,5 +532,4 @@ if __name__ == "__main__":
             f"FATAL ERROR: "
             f"{type(error).__name__}: {error}"
         )
-
         raise
