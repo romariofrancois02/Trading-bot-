@@ -7,9 +7,10 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 8.2
-# POCKET OPTION OTC | M1 | 60 SECONDS
+# ROMARIO TRADER PRO 8.3
+# OTC FOREX | M1 | 60 SECONDS
 # TELEGRAM ALERTS ONLY
+# 3 STRATEGIES | 2/3 CONFIRMATIONS
 # =====================================================
 
 BASE_URL = "https://otcharts.com"
@@ -20,8 +21,6 @@ OTC_OFFSET = 7200
 
 MIN_PAYOUT = 92.0
 MIN_VOTES = 2
-MIN_TEST_TRADES = 20       # Informational only; no longer blocks signals
-MIN_TEST_WINRATE = 53.0    # Informational only; no longer blocks signals
 MAX_PAIRS = 12
 
 FLORIDA = ZoneInfo("America/New_York")
@@ -47,7 +46,7 @@ logging.basicConfig(
 http = requests.Session()
 http.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTrader/8.2",
+    "User-Agent": "RomarioTrader/8.3",
     "Accept": "application/json"
 })
 
@@ -60,9 +59,9 @@ def florida_now():
 
 def entry_time():
     now = florida_now()
-    result = now.replace(second=0, microsecond=0)
-    result += timedelta(minutes=1)
-    return result.strftime("%I:%M:%S %p")
+    entry = now.replace(second=0, microsecond=0)
+    entry += timedelta(minutes=1)
+    return entry.strftime("%I:%M:%S %p")
 
 
 # ---------------- TELEGRAM ----------------
@@ -84,10 +83,7 @@ def telegram(message):
             timeout=20
         )
 
-        try:
-            data = response.json()
-        except ValueError:
-            data = {"description": response.text[:300]}
+        data = response.json()
 
         if response.ok and data.get("ok"):
             logging.info("Telegram message sent")
@@ -222,7 +218,6 @@ def get_pairs():
         reverse=True
     )
 
-    # Rotate scan order every five minutes.
     if pairs:
         offset = (int(time.time()) // 300) % len(pairs)
         pairs = pairs[offset:] + pairs[:offset]
@@ -302,19 +297,6 @@ def get_candles(symbol):
     return completed, gaps
 
 
-def has_missing_gaps(gaps):
-    if isinstance(gaps, dict):
-        try:
-            return int(gaps.get("missingBars", 0)) > 0
-        except (TypeError, ValueError):
-            return False
-
-    if isinstance(gaps, list):
-        return len(gaps) > 0
-
-    return False
-
-
 # ---------------- INDICATORS ----------------
 
 def ema(values, period):
@@ -337,9 +319,9 @@ def ema(values, period):
     return result
 
 
-def rsi(values, period=14):
+def rsi_series(values, period=14):
     if len(values) < period + 1:
-        return None
+        return []
 
     changes = [
         values[i] - values[i - 1]
@@ -349,17 +331,33 @@ def rsi(values, period=14):
     gains = [max(value, 0) for value in changes]
     losses = [max(-value, 0) for value in changes]
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    if avg_loss == 0:
-        return 100.0
+    result = []
 
-    if avg_gain == 0:
-        return 0.0
+    def calculate(gain, loss):
+        if loss == 0:
+            return 100.0
+        if gain == 0:
+            return 0.0
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    result.append(calculate(avg_gain, avg_loss))
+
+    for index in range(period, len(changes)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[index]
+        ) / period
+
+        avg_loss = (
+            avg_loss * (period - 1) + losses[index]
+        ) / period
+
+        result.append(calculate(avg_gain, avg_loss))
+
+    return result
 
 
 def bollinger(values, period=20):
@@ -396,122 +394,82 @@ def strategy_votes(candles):
     if len(candles) < 60:
         return result
 
-    closes = [candle["close"] for candle in candles]
-
-    previous = candles[-2]
+    closes = [c["close"] for c in candles]
     current = candles[-1]
+    previous = candles[-2]
 
     bullish = current["close"] > current["open"]
     bearish = current["close"] < current["open"]
 
+    # 1. EMA TREND
     e9 = ema(closes, 9)
     e21 = ema(closes, 21)
     e50 = ema(closes, 50)
 
-    current_rsi = rsi(closes)
-
-    # 1. EMA trend pullback
     if e9 and e21 and e50:
+
         if (
             e9[-1] > e21[-1] > e50[-1]
-            and previous["close"] <= e9[-2]
             and current["close"] > e9[-1]
+            and e9[-1] > e9[-2]
             and bullish
         ):
             result["CALL"] += 1
-            result["call_reasons"].append("EMA pullback")
+            result["call_reasons"].append("EMA bullish trend")
 
         elif (
             e9[-1] < e21[-1] < e50[-1]
-            and previous["close"] >= e9[-2]
             and current["close"] < e9[-1]
+            and e9[-1] < e9[-2]
             and bearish
         ):
             result["PUT"] += 1
-            result["put_reasons"].append("EMA pullback")
+            result["put_reasons"].append("EMA bearish trend")
 
-    # 2. Bollinger reversal + RSI
+    # 2. RSI MOMENTUM
+    rsi_values = rsi_series(closes)
+
+    if len(rsi_values) >= 2:
+        current_rsi = rsi_values[-1]
+        previous_rsi = rsi_values[-2]
+
+        if (
+            50 < current_rsi < 68
+            and current_rsi > previous_rsi
+            and bullish
+        ):
+            result["CALL"] += 1
+            result["call_reasons"].append("RSI bullish momentum")
+
+        elif (
+            32 < current_rsi < 50
+            and current_rsi < previous_rsi
+            and bearish
+        ):
+            result["PUT"] += 1
+            result["put_reasons"].append("RSI bearish momentum")
+
+    # 3. BOLLINGER REVERSAL
     old_bands = bollinger(closes[:-1])
     new_bands = bollinger(closes)
 
-    if old_bands and new_bands and current_rsi is not None:
+    if old_bands and new_bands:
+
         if (
-            previous["close"] <= old_bands[0]
+            previous["low"] <= old_bands[0]
             and current["close"] > new_bands[0]
-            and current_rsi < 50
             and bullish
         ):
             result["CALL"] += 1
-            result["call_reasons"].append(
-                "Bollinger reversal"
-            )
+            result["call_reasons"].append("Bollinger lower bounce")
 
         elif (
-            previous["close"] >= old_bands[2]
+            previous["high"] >= old_bands[2]
             and current["close"] < new_bands[2]
-            and current_rsi > 50
             and bearish
         ):
             result["PUT"] += 1
-            result["put_reasons"].append(
-                "Bollinger reversal"
-            )
-
-    # 3. Ten-candle breakout
-    if e21 and len(candles) >= 12:
-        previous_window = candles[-11:-1]
-
-        highest = max(
-            candle["high"] for candle in previous_window
-        )
-
-        lowest = min(
-            candle["low"] for candle in previous_window
-        )
-
-        if (
-            current["close"] > highest
-            and bullish
-            and e21[-1] > e21[-2]
-        ):
-            result["CALL"] += 1
-            result["call_reasons"].append("Breakout")
-
-        elif (
-            current["close"] < lowest
-            and bearish
-            and e21[-1] < e21[-2]
-        ):
-            result["PUT"] += 1
-            result["put_reasons"].append("Breakout")
-
-    # 4. Engulfing reversal + RSI
-    if current_rsi is not None:
-        bullish_engulfing = (
-            previous["close"] < previous["open"]
-            and bullish
-            and current["open"] <= previous["close"]
-            and current["close"] >= previous["open"]
-        )
-
-        bearish_engulfing = (
-            previous["close"] > previous["open"]
-            and bearish
-            and current["open"] >= previous["close"]
-            and current["close"] <= previous["open"]
-        )
-
-        if bullish_engulfing and current_rsi < 60:
-            result["CALL"] += 1
-            result["call_reasons"].append(
-                "Bullish engulfing"
-            )
-
-        elif bearish_engulfing and current_rsi > 40:
-            result["PUT"] += 1
-            result["put_reasons"].append(
-                "Bearish engulfing"
-            )
+            result["put_reasons"].append("Bollinger upper rejection")
 
     return result
 
@@ -529,59 +487,7 @@ def get_direction(votes):
     return None
 
 
-# ---------------- HISTORICAL TEST ----------------
-
-def backtest(candles):
-    wins = 0
-    losses = 0
-
-    for index in range(60, len(candles) - 1):
-
-        # Only test consecutive one-minute candles.
-        if (
-            candles[index + 1]["time"]
-            - candles[index]["time"]
-            != TIMEFRAME
-        ):
-            continue
-
-        history = candles[:index + 1]
-        votes = strategy_votes(history)
-        direction = get_direction(votes)
-
-        if not direction:
-            continue
-
-        next_candle = candles[index + 1]
-
-        if next_candle["close"] == next_candle["open"]:
-            continue
-
-        # Approximate historical candle-direction test.
-        if (
-            direction == "CALL"
-            and next_candle["close"] > next_candle["open"]
-        ):
-            wins += 1
-
-        elif (
-            direction == "PUT"
-            and next_candle["close"] < next_candle["open"]
-        ):
-            wins += 1
-
-        else:
-            losses += 1
-
-    total = wins + losses
-
-    if total == 0:
-        return 0, 0.0
-
-    return total, wins / total * 100
-
-
-# ---------------- NO SIGNAL REPORT ----------------
+# ---------------- REPORT ----------------
 
 def no_signal(pairs, reasons):
     now_text = florida_now().strftime(
@@ -594,13 +500,13 @@ def no_signal(pairs, reasons):
     )
 
     message = (
-        "🤖 ROMARIO TRADER PRO 8.2\n\n"
+        "🤖 ROMARIO TRADER PRO 8.3\n\n"
         "⚪ NO VALID SIGNAL\n"
-        "No current setup reached the confirmation rules.\n\n"
+        "No setup reached 2/3 confirmations.\n\n"
         f"Pairs scanned: {len(pairs)}\n"
         f"Minimum payout: {MIN_PAYOUT}%\n"
-        f"Minimum strategy votes: {MIN_VOTES}/4\n"
-        "Historical test: informational only\n\n"
+        "Strategies: EMA + RSI + Bollinger\n"
+        "Required confirmations: 2/3\n\n"
         "📋 SCAN REPORT:\n"
         f"{detail}\n\n"
         f"🕒 FLORIDA TIME: {now_text}"
@@ -614,8 +520,8 @@ def no_signal(pairs, reasons):
 
 def main():
     print("=" * 55)
-    print("ROMARIO TRADER PRO 8.2")
-    print("OTC FOREX SCANNER")
+    print("ROMARIO TRADER PRO 8.3")
+    print("3 STRATEGY CONFIRMATION SYSTEM")
     print("=" * 55)
 
     if not API_KEY:
@@ -628,24 +534,18 @@ def main():
 
     print("Pairs selected:", len(pairs))
 
+    reasons = {
+        "Insufficient candles": 0,
+        "Recent candle gaps": 0,
+        "No current setup": 0,
+        "API/data errors": 0
+    }
+
     if not pairs:
-        reasons = {
-            "No pairs with payout >= 92%": 1,
-            "Current setups": 0
-        }
         no_signal(pairs, reasons)
         return
 
     candidates = []
-
-    reasons = {
-        "Insufficient candles": 0,
-        "Candle gaps": 0,
-        "Insufficient historical signals": 0,
-        "Historical result below 53% (informational)": 0,
-        "No current setup": 0,
-        "API/data errors": 0
-    }
 
     for number, pair in enumerate(pairs, 1):
         symbol = pair["symbol"]
@@ -664,41 +564,29 @@ def main():
                 reasons["Insufficient candles"] += 1
                 continue
 
-            if has_missing_gaps(gaps):
-                print("Skipped: missing historical candles")
-                reasons["Candle gaps"] += 1
+            # Require the latest candles to be consecutive.
+            if (
+                candles[-1]["time"] - candles[-2]["time"]
+                != TIMEFRAME
+                or candles[-2]["time"] - candles[-3]["time"]
+                != TIMEFRAME
+            ):
+                reasons["Recent candle gaps"] += 1
                 continue
 
-            # Check the CURRENT setup first.
             votes = strategy_votes(candles)
             direction = get_direction(votes)
 
+            print(
+                f"CALL: {votes['CALL']}/3 | "
+                f"PUT: {votes['PUT']}/3"
+            )
+
             if not direction:
                 reasons["No current setup"] += 1
-                print(
-                    "No current setup | "
-                    f"CALL {votes['CALL']}/4 | "
-                    f"PUT {votes['PUT']}/4"
-                )
                 continue
 
-            score = votes[direction]
-
-            # Historical results are recorded but do not block
-            # a valid current setup.
-            total, winrate = backtest(candles)
-
-            if total < MIN_TEST_TRADES:
-                reasons[
-                    "Insufficient historical signals"
-                ] += 1
-
-            elif winrate < MIN_TEST_WINRATE:
-                reasons[
-                    "Historical result below 53% (informational)"
-                ] += 1
-
-            reasons_text = (
+            reasons_list = (
                 votes["call_reasons"]
                 if direction == "CALL"
                 else votes["put_reasons"]
@@ -708,17 +596,15 @@ def main():
                 "symbol": symbol,
                 "payout": pair["payout"],
                 "direction": direction,
-                "score": score,
-                "winrate": winrate,
-                "total": total,
-                "reasons": reasons_text
+                "score": votes[direction],
+                "reasons": reasons_list
             })
 
             print(
-                f"CURRENT SETUP: {direction} "
-                f"| Votes: {score}/4 "
-                f"| Historical signals: {total} "
-                f"| Historical rate: {winrate:.1f}%"
+                "VALID SETUP:",
+                direction,
+                votes[direction],
+                "/3"
             )
 
         except Exception:
@@ -729,13 +615,10 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    # Prefer more confirmations first.
-    # Historical figures are secondary, not guarantees.
+    # Best setup: highest confirmations, then payout.
     candidates.sort(
         key=lambda item: (
             item["score"],
-            item["total"] >= MIN_TEST_TRADES,
-            item["winrate"],
             item["payout"]
         ),
         reverse=True
@@ -743,8 +626,8 @@ def main():
 
     best = candidates[0]
 
-    # Re-fetch the selected pair before sending.
-    print("\nRechecking best pair:", best["symbol"])
+    # Final verification
+    print("\nFinal verification:", best["symbol"])
 
     fresh_candles, fresh_gaps = get_candles(best["symbol"])
 
@@ -753,8 +636,13 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    if has_missing_gaps(fresh_gaps):
-        reasons["Candle gaps"] += 1
+    if (
+        fresh_candles[-1]["time"] - fresh_candles[-2]["time"]
+        != TIMEFRAME
+        or fresh_candles[-2]["time"] - fresh_candles[-3]["time"]
+        != TIMEFRAME
+    ):
+        reasons["Recent candle gaps"] += 1
         no_signal(pairs, reasons)
         return
 
@@ -766,7 +654,6 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    # Check that the latest completed candle is recent.
     newest = fresh_candles[-1]["time"] - OTC_OFFSET
     age = time.time() - (newest + TIMEFRAME)
 
@@ -775,46 +662,37 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    # Calculate entry time after the final verification.
+    # Calculate entry after final verification.
     entry = entry_time()
-
     now_text = florida_now().strftime(
         "%Y-%m-%d %I:%M:%S %p"
     )
 
-    icon = (
-        "🟢" if fresh_direction == "CALL"
-        else "🔴"
-    )
-
-    confirmations_list = (
-        fresh_votes["call_reasons"]
-        if fresh_direction == "CALL"
-        else fresh_votes["put_reasons"]
-    )
+    icon = "🟢" if fresh_direction == "CALL" else "🔴"
 
     confirmations = "\n".join(
-        f"• {item}"
-        for item in confirmations_list
+        f"• {reason}"
+        for reason in (
+            fresh_votes["call_reasons"]
+            if fresh_direction == "CALL"
+            else fresh_votes["put_reasons"]
+        )
     )
 
     message = (
-        "🤖 ROMARIO TRADER PRO 8.2\n\n"
+        "🤖 ROMARIO TRADER PRO 8.3\n\n"
         f"{icon} {fresh_direction}\n\n"
         f"💱 PAIR: {best['symbol']}\n"
         f"💰 PAYOUT: {best['payout']:.1f}%\n"
-        f"📊 STRATEGY VOTES: "
-        f"{fresh_votes[fresh_direction]}/4\n"
-        f"📈 HISTORICAL WIN RATE: "
-        f"{best['winrate']:.1f}%\n"
-        f"🧪 HISTORICAL SIGNALS: {best['total']}\n"
+        f"📊 STRATEGY SCORE: "
+        f"{fresh_votes[fresh_direction]}/3\n"
         "⏱ TIMEFRAME: M1\n"
         "⌛ EXPIRATION: 60 SECONDS\n"
         f"🎯 ENTRY TIME: {entry} (Florida)\n\n"
         "📌 CONFIRMATIONS:\n"
         f"{confirmations}\n\n"
         f"🕒 FLORIDA TIME: {now_text}\n\n"
-        "⚠️ Historical results do not guarantee a win."
+        "⚠️ Signals are not guaranteed wins."
     )
 
     print(message)
@@ -831,7 +709,7 @@ if __name__ == "__main__":
         logging.exception("BOT FAILED")
 
         error_message = (
-            "🤖 ROMARIO TRADER PRO 8.2\n\n"
+            "🤖 ROMARIO TRADER PRO 8.3\n\n"
             "⚠️ BOT ERROR\n"
             f"{str(exc)[:400]}\n"
             "🕒 FLORIDA TIME: "
