@@ -4,16 +4,20 @@ import re
 import time
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ==========================================
-# ROMARIO TRADER PRO 5.0
-# THREE STRATEGIES - ALERT ONLY
+# ROMARIO TRADER PRO 5.1
+# THREE STRATEGIES - OTC ONLY
 # ==========================================
 
+VERSION = "ROMARIO TRADER PRO 5.1"
+
 BASE_URL = "https://otcharts.com"
+
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
@@ -21,6 +25,7 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 MIN_PAYOUT = 75
 EXPIRATION_SECONDS = 60
 MAX_WORKERS = 5
+
 FLORIDA = ZoneInfo("America/New_York")
 
 CURRENCIES = set("""
@@ -31,22 +36,35 @@ BDT VND UAH RON BGN ISK HRK RUB KES GHS MAD JOD LKR NPR
 """.split())
 
 session = requests.Session()
+
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json"
 })
 
 
+# ==========================================
+# TIME
+# ==========================================
+
 def florida_now():
+    from datetime import datetime
     return datetime.now(FLORIDA)
 
 
+# ==========================================
+# TELEGRAM
+# ==========================================
+
 def telegram(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram credentials missing.")
+        print("ERROR: Telegram credentials missing.")
         return False
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
 
     try:
         response = requests.post(
@@ -56,86 +74,165 @@ def telegram(message):
                 "text": message,
                 "parse_mode": "HTML"
             },
-            timeout=15
+            timeout=20
         )
+
         response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok"):
+            print("Telegram rejected message:", result)
+            return False
+
         return True
-    except requests.RequestException as exc:
+
+    except Exception as exc:
         print("Telegram error:", exc)
         return False
 
 
+# ==========================================
+# OTCHARTS API
+# ==========================================
+
 def api_get(path, params=None):
+
+    url = BASE_URL + path
+
     response = session.get(
-        BASE_URL + path,
+        url,
         params=params,
-        timeout=20
+        timeout=25
     )
+
+    if response.status_code != 200:
+        print("API ERROR:", response.status_code)
+        print("URL:", response.url)
+        print("BODY:", response.text[:500])
+
     response.raise_for_status()
-    data = response.json()
 
-    if isinstance(data, dict):
-        if data.get("success") is False:
-            raise RuntimeError(str(data))
-        return data.get("data", data.get("results", data))
+    result = response.json()
 
-    return data
+    if isinstance(result, dict):
 
+        if result.get("success") is False:
+            raise RuntimeError(str(result))
+
+        if "data" in result:
+            return result["data"]
+
+        if "results" in result:
+            return result["results"]
+
+    return result
+
+
+# ==========================================
+# PAYOUT
+# ==========================================
 
 def normalize_payout(value):
+
     try:
         value = float(value)
+
         if 0 < value <= 1:
             value *= 100
+
         if 0 < value <= 100:
             return value
+
     except (TypeError, ValueError):
         pass
+
     return None
 
 
+# ==========================================
+# GET OTC FOREX PAIRS
+# ==========================================
+
 def get_symbols():
-    data = api_get("/v1/symbols", {"venue": "otc"})
+
+    data = api_get(
+        "/v1/symbols",
+        {"venue": "otc"}
+    )
 
     if isinstance(data, dict):
-        data = data.get("symbols", data.get("items", []))
+        data = data.get(
+            "symbols",
+            data.get("items", [])
+        )
 
-    symbols = []
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "Unexpected symbols response format."
+        )
+
+    pairs = []
 
     for item in data:
+
         if not isinstance(item, dict):
             continue
 
-        symbol = str(
-            item.get("symbol", item.get("name", ""))
-        ).upper()
+        # IMPORTANT:
+        # Preserve original symbol case.
+        # Example: EURUSD_otc
 
-        if not re.fullmatch(r"[A-Z]{6}_OTC", symbol):
+        raw_symbol = str(
+            item.get(
+                "symbol",
+                item.get("name", "")
+            )
+        ).strip()
+
+        if not re.fullmatch(
+            r"[A-Z]{6}_otc",
+            raw_symbol,
+            re.IGNORECASE
+        ):
             continue
 
-        base, quote = symbol[:3], symbol[3:6]
+        base = raw_symbol[:3].upper()
+        quote = raw_symbol[3:6].upper()
 
-        if base not in CURRENCIES or quote not in CURRENCIES:
+        if base not in CURRENCIES:
+            continue
+
+        if quote not in CURRENCIES:
             continue
 
         if item.get("open") is False:
             continue
 
-        # Payout must be supplied by the API.
-        payout = normalize_payout(item.get("payout"))
+        payout = normalize_payout(
+            item.get("payout")
+        )
 
-        if payout is None or payout < MIN_PAYOUT:
+        if payout is None:
             continue
 
-        symbols.append({
-            "symbol": symbol,
+        if payout < MIN_PAYOUT:
+            continue
+
+        pairs.append({
+            "symbol": raw_symbol,
             "payout": payout
         })
 
-    return symbols
+    return pairs
 
+
+# ==========================================
+# GET CANDLES
+# ==========================================
 
 def get_candles(symbol, timeframe):
+
     data = api_get(
         "/v1/candles",
         {
@@ -147,7 +244,13 @@ def get_candles(symbol, timeframe):
     )
 
     if isinstance(data, dict):
-        data = data.get("candles", data.get("items", []))
+        data = data.get(
+            "candles",
+            data.get("items", [])
+        )
+
+    if not isinstance(data, list):
+        return None
 
     df = pd.DataFrame(data)
 
@@ -164,22 +267,42 @@ def get_candles(symbol, timeframe):
     rename = {}
 
     for standard, choices in aliases.items():
+
         for choice in choices:
+
             if choice in df.columns:
                 rename[choice] = standard
                 break
 
     df = df.rename(columns=rename)
 
-    required = ["open", "high", "low", "close"]
+    required = [
+        "open",
+        "high",
+        "low",
+        "close"
+    ]
 
-    if not all(column in df.columns for column in required):
+    if not all(
+        column in df.columns
+        for column in required
+    ):
+        print(
+            symbol,
+            "Missing OHLC columns:",
+            list(df.columns)
+        )
         return None
 
     for column in required:
-        df[column] = pd.to_numeric(df[column], errors="coerce")
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce"
+        )
 
-    df = df.dropna(subset=required).reset_index(drop=True)
+    df = df.dropna(
+        subset=required
+    ).reset_index(drop=True)
 
     if len(df) < 55:
         return None
@@ -187,76 +310,130 @@ def get_candles(symbol, timeframe):
     return df
 
 
+# ==========================================
+# INDICATORS
+# ==========================================
+
 def indicators(df):
+
     df = df.copy()
-    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
-    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+
+    df["ema20"] = (
+        df["close"].ewm(
+            span=20,
+            adjust=False
+        ).mean()
+    )
+
+    df["ema50"] = (
+        df["close"].ewm(
+            span=50,
+            adjust=False
+        ).mean()
+    )
 
     delta = df["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
 
-    rs = gain / loss.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
+    gain = delta.clip(
+        lower=0
+    ).rolling(14).mean()
 
-    df["range"] = df["high"] - df["low"]
-    df["body"] = (df["close"] - df["open"]).abs()
+    loss = (
+        -delta.clip(upper=0)
+    ).rolling(14).mean()
+
+    rs = gain / loss.replace(
+        0,
+        float("nan")
+    )
+
+    df["rsi"] = 100 - (
+        100 / (1 + rs)
+    )
+
+    df["range"] = (
+        df["high"] - df["low"]
+    )
+
+    df["body"] = (
+        df["close"] - df["open"]
+    ).abs()
 
     return df.dropna().reset_index(drop=True)
 
 
 def candle_direction(row):
+
     if row["close"] > row["open"]:
         return "CALL"
+
     if row["close"] < row["open"]:
         return "PUT"
+
     return None
 
 
+# ==========================================
+# STRATEGY 1: TREND PULLBACK
+# ==========================================
+
 def strategy_trend_pullback(m1, m5):
-    a = m1.iloc[-1]
-    b = m1.iloc[-2]
+
+    current = m1.iloc[-1]
+    previous = m1.iloc[-2]
     trend = m5.iloc[-1]
 
-    distance = abs(a["close"] - a["ema20"]) / a["close"]
+    distance = (
+        abs(current["close"] - current["ema20"])
+        / current["close"]
+    )
 
     if distance > 0.0015:
         return None
 
-    direction = None
-
     if trend["close"] > trend["ema50"]:
-        if (
-            candle_direction(a) == "CALL"
-            and b["low"] <= b["ema20"] * 1.001
-            and a["close"] > a["ema20"]
-        ):
-            direction = "CALL"
 
-    elif trend["close"] < trend["ema50"]:
         if (
-            candle_direction(a) == "PUT"
-            and b["high"] >= b["ema20"] * 0.999
-            and a["close"] < a["ema20"]
+            candle_direction(current) == "CALL"
+            and previous["low"] <= previous["ema20"] * 1.001
+            and current["close"] > current["ema20"]
         ):
-            direction = "PUT"
 
-    if direction:
-        return {
-            "strategy": "TREND PULLBACK",
-            "direction": direction,
-            "score": 3
-        }
+            return {
+                "strategy": "TREND PULLBACK",
+                "direction": "CALL",
+                "score": 3
+            }
+
+    if trend["close"] < trend["ema50"]:
+
+        if (
+            candle_direction(current) == "PUT"
+            and previous["high"] >= previous["ema20"] * 0.999
+            and current["close"] < current["ema20"]
+        ):
+
+            return {
+                "strategy": "TREND PULLBACK",
+                "direction": "PUT",
+                "score": 3
+            }
 
     return None
 
 
+# ==========================================
+# STRATEGY 2: BREAKOUT + RETEST
+# ==========================================
+
 def strategy_breakout_retest(m1, m5):
+
     if len(m1) < 25:
         return None
 
     previous = m1.iloc[-2]
     current = m1.iloc[-1]
+
     history = m1.iloc[-22:-2]
 
     resistance = history["high"].max()
@@ -268,6 +445,7 @@ def strategy_breakout_retest(m1, m5):
         and current["close"] > resistance
         and candle_direction(current) == "CALL"
     ):
+
         return {
             "strategy": "BREAKOUT + RETEST",
             "direction": "CALL",
@@ -280,6 +458,7 @@ def strategy_breakout_retest(m1, m5):
         and current["close"] < support
         and candle_direction(current) == "PUT"
     ):
+
         return {
             "strategy": "BREAKOUT + RETEST",
             "direction": "PUT",
@@ -289,9 +468,14 @@ def strategy_breakout_retest(m1, m5):
     return None
 
 
+# ==========================================
+# STRATEGY 3: SUPPORT / RESISTANCE
+# ==========================================
+
 def strategy_reversal(m1, m5):
+
     current = m1.iloc[-1]
-    previous = m1.iloc[-2]
+
     history = m1.iloc[-22:-2]
 
     support = history["low"].min()
@@ -300,8 +484,19 @@ def strategy_reversal(m1, m5):
     if current["range"] <= 0:
         return None
 
-    lower_wick = min(current["open"], current["close"]) - current["low"]
-    upper_wick = current["high"] - max(current["open"], current["close"])
+    lower_wick = (
+        min(
+            current["open"],
+            current["close"]
+        ) - current["low"]
+    )
+
+    upper_wick = (
+        current["high"] - max(
+            current["open"],
+            current["close"]
+        )
+    )
 
     if (
         current["low"] <= support * 1.001
@@ -309,6 +504,7 @@ def strategy_reversal(m1, m5):
         and lower_wick / current["range"] >= 0.40
         and current["rsi"] < 40
     ):
+
         return {
             "strategy": "SUPPORT REVERSAL",
             "direction": "CALL",
@@ -321,6 +517,7 @@ def strategy_reversal(m1, m5):
         and upper_wick / current["range"] >= 0.40
         and current["rsi"] > 60
     ):
+
         return {
             "strategy": "RESISTANCE REVERSAL",
             "direction": "PUT",
@@ -330,51 +527,76 @@ def strategy_reversal(m1, m5):
     return None
 
 
+# ==========================================
+# ANALYZE ONE PAIR
+# ==========================================
+
 def analyze(pair):
+
     symbol = pair["symbol"]
 
     try:
+
         m1 = get_candles(symbol, 60)
         m5 = get_candles(symbol, 300)
 
         if m1 is None or m5 is None:
             return []
 
-        # Exclude the most recent candle, assumed incomplete.
-        m1 = indicators(m1.iloc[:-1].reset_index(drop=True))
-        m5 = indicators(m5.iloc[:-1].reset_index(drop=True))
+        # Assumes final returned candle is incomplete.
+        # Verify this assumption against API timestamps.
+
+        m1 = indicators(
+            m1.iloc[:-1].reset_index(drop=True)
+        )
+
+        m5 = indicators(
+            m5.iloc[:-1].reset_index(drop=True)
+        )
 
         if len(m1) < 25 or len(m5) < 25:
             return []
 
-        last = m1.iloc[-1]
+        current = m1.iloc[-1]
 
-        if last["range"] <= 0:
+        if current["range"] <= 0:
             return []
 
-        if last["range"] / last["close"] > 0.002:
+        if (
+            current["range"] / current["close"]
+            > 0.002
+        ):
             return []
 
-        body_ratio = last["body"] / last["range"]
+        body_ratio = (
+            current["body"] / current["range"]
+        )
 
         if body_ratio < 0.30:
             return []
 
-        strategies = [
+        results = [
             strategy_trend_pullback(m1, m5),
             strategy_breakout_retest(m1, m5),
             strategy_reversal(m1, m5)
         ]
 
-        valid = [s for s in strategies if s]
+        valid = [
+            result
+            for result in results
+            if result is not None
+        ]
 
         if not valid:
             return []
 
-        # Require agreement when more than one strategy triggers.
-        directions = {s["direction"] for s in valid}
+        directions = {
+            result["direction"]
+            for result in valid
+        }
 
-        if len(directions) > 1:
+        # Reject conflicting directions.
+        if len(directions) != 1:
             return []
 
         direction = valid[0]["direction"]
@@ -382,27 +604,47 @@ def analyze(pair):
         # M5 trend confirmation.
         trend = m5.iloc[-1]
 
-        if direction == "CALL" and trend["close"] <= trend["ema50"]:
+        if (
+            direction == "CALL"
+            and trend["close"] <= trend["ema50"]
+        ):
             return []
 
-        if direction == "PUT" and trend["close"] >= trend["ema50"]:
+        if (
+            direction == "PUT"
+            and trend["close"] >= trend["ema50"]
+        ):
             return []
 
         return [{
             "symbol": symbol,
             "payout": pair["payout"],
             "direction": direction,
-            "strategies": [s["strategy"] for s in valid],
-            "score": sum(s["score"] for s in valid),
-            "analysis_time": florida_now()
+            "strategies": [
+                result["strategy"]
+                for result in valid
+            ],
+            "score": sum(
+                result["score"]
+                for result in valid
+            )
         }]
 
     except Exception as exc:
-        print(f"{symbol} analysis error: {exc}")
+
+        print(
+            f"{symbol} analysis error: {exc}"
+        )
+
         return []
 
 
-def build_message(signal):
+# ==========================================
+# SIGNAL MESSAGE
+# ==========================================
+
+def build_message(signal, entry):
+
     direction = signal["direction"]
 
     if direction == "CALL":
@@ -412,100 +654,199 @@ def build_message(signal):
         emoji = "🔴"
         label = "SELL / PUT"
 
-    now = florida_now()
-    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    signal_time = entry - timedelta(seconds=30)
-    expiry = entry + timedelta(seconds=EXPIRATION_SECONDS)
+    signal_time = (
+        entry - timedelta(seconds=30)
+    )
 
-    strategy_text = " + ".join(signal["strategies"])
+    expiry = (
+        entry + timedelta(
+            seconds=EXPIRATION_SECONDS
+        )
+    )
+
+    strategies = " + ".join(
+        signal["strategies"]
+    )
 
     return (
-        "🤖 <b>ROMARIO TRADER PRO 5.0</b>\n\n"
-        f"{emoji} <b>{label}</b>\n"
+        f"🤖 <b>{VERSION}</b>\n\n"
+        f"{emoji} <b>{label}</b>\n\n"
         f"💱 PAIR: {signal['symbol']}\n"
         f"💰 PAYOUT: {signal['payout']:.1f}%\n"
-        "⏱ TIMEFRAME: M1\n"
-        "⌛ EXPIRATION: 60 SECONDS\n\n"
-        f"🧠 STRATEGY: {strategy_text}\n"
-        f"📊 SETUP SCORE: {signal['score']}/9\n"
-        f"🕒 SIGNAL TIME: {signal_time.strftime('%I:%M:%S %p')}\n"
-        f"🎯 ENTRY TIME: {entry.strftime('%I:%M:%S %p')}\n"
-        f"🏁 EXPIRY: {expiry.strftime('%I:%M:%S %p')}\n"
-        "📍 TIMEZONE: Florida\n\n"
-        "⚠️ Technical signal only. No guaranteed win rate.\n"
-        "🧪 TEST ON DEMO FIRST."
+        f"⏱ TIMEFRAME: M1\n"
+        f"⌛ EXPIRATION: 60 SECONDS\n\n"
+        f"🧠 STRATEGY: {strategies}\n"
+        f"📊 SETUP SCORE: {signal['score']}/9\n\n"
+        f"🕒 SIGNAL TIME: "
+        f"{signal_time.strftime('%I:%M:%S %p')}\n"
+        f"🎯 ENTRY TIME: "
+        f"{entry.strftime('%I:%M:%S %p')}\n"
+        f"🏁 EXPIRY: "
+        f"{expiry.strftime('%I:%M:%S %p')}\n"
+        f"📍 TIMEZONE: Florida\n\n"
+        f"⚠️ Technical signal only.\n"
+        f"🧪 DEMO TEST ONLY."
     )
 
 
+# ==========================================
+# MAIN
+# ==========================================
+
 def main():
-    print("ROMARIO TRADER PRO 5.0 STARTING")
-    print("Florida time:", florida_now().strftime("%Y-%m-%d %I:%M:%S %p"))
+
+    print("=" * 45)
+    print(VERSION)
+    print("Starting OTC Forex scanner")
+    print("=" * 45)
+
+    print(
+        "Florida time:",
+        florida_now().strftime(
+            "%Y-%m-%d %I:%M:%S %p"
+        )
+    )
 
     if not API_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY is missing.")
+        raise RuntimeError(
+            "OTCHARTS_API_KEY is missing."
+        )
 
-    telegram("🟡 <b>ROMARIO TRADER PRO 5.0</b>\nAnalyzing OTC Forex markets...")
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "Telegram secrets are missing."
+        )
+
+    telegram(
+        "🟡 <b>ROMARIO TRADER PRO 5.1</b>\n"
+        "Analyzing OTC Forex markets..."
+    )
 
     pairs = get_symbols()
 
-    print("Pairs with verified payout >= 75%:", len(pairs))
+    print(
+        "Pairs with payout >= 75%:",
+        len(pairs)
+    )
 
     if not pairs:
-        print("No pairs passed the payout filter.")
+
+        print(
+            "No pairs passed payout filter."
+        )
+
         return
 
     candidates = []
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
+
         futures = {
             executor.submit(analyze, pair): pair
             for pair in pairs
         }
 
         for future in as_completed(futures):
+
             try:
-                candidates.extend(future.result())
+                candidates.extend(
+                    future.result()
+                )
+
             except Exception as exc:
                 print("Worker error:", exc)
 
-    print("Qualified setups:", len(candidates))
+    print(
+        "Qualified setups:",
+        len(candidates)
+    )
 
     if not candidates:
-        print("NO QUALIFIED SETUP. NO SIGNAL SENT.")
+
+        print(
+            "NO QUALIFIED SETUP. "
+            "NO SIGNAL SENT."
+        )
+
         return
 
     candidates.sort(
-        key=lambda x: (x["score"], x["payout"]),
+        key=lambda item: (
+            item["score"],
+            item["payout"]
+        ),
         reverse=True
     )
 
     best = candidates[0]
 
-    # Avoid sending a stale signal.
+    # Schedule signal 30 seconds before next minute.
     now = florida_now()
-    next_minute = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
-    send_at = next_minute - timedelta(seconds=30)
 
-    wait_seconds = (send_at - now).total_seconds()
+    entry = (
+        now.replace(
+            second=0,
+            microsecond=0
+        ) + timedelta(minutes=1)
+    )
+
+    signal_time = (
+        entry - timedelta(seconds=30)
+    )
+
+    wait_seconds = (
+        signal_time - now
+    ).total_seconds()
 
     if wait_seconds > 0:
-        print(f"Waiting {wait_seconds:.1f} seconds for signal time.")
+
+        print(
+            f"Waiting {wait_seconds:.1f} seconds."
+        )
+
         time.sleep(wait_seconds)
 
     current = florida_now()
 
-    if current >= next_minute - timedelta(seconds=2):
-        print("Signal too late. Skipping.")
+    if current >= entry - timedelta(seconds=2):
+
+        print(
+            "Signal is too late. Skipping."
+        )
+
         return
 
-    if current < next_minute - timedelta(seconds=32):
-        print("Signal timing not reached. Skipping.")
+    if current < entry - timedelta(seconds=32):
+
+        print(
+            "Signal timing not reached. Skipping."
+        )
+
         return
 
-    message = build_message(best)
+    message = build_message(
+        best,
+        entry
+    )
+
     sent = telegram(message)
 
-    print("Telegram signal sent:", sent)
+    print(
+        "Telegram signal sent:",
+        sent
+    )
+
+    print(
+        "Selected pair:",
+        best["symbol"]
+    )
+
+    print(
+        "Selected strategies:",
+        best["strategies"]
+    )
 
 
 if __name__ == "__main__":
