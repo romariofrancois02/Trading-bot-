@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 4.4"
+VERSION = "ROMARIO TRADER PRO 4.5"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -21,9 +21,9 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 TIMEOUT = 20
 MAX_WORKERS = 8
+MIN_PAYOUT = 75.0
 MIN_PREP_SECONDS = 30
 MAX_SIGNAL_DELAY = 2
-MIN_PAYOUT = 75.0
 
 CURRENCIES = set("""
 USD EUR GBP JPY CHF CAD AUD NZD
@@ -112,18 +112,15 @@ def get_symbols():
         if item.get("open") is False:
             continue
 
-        raw_payout = item.get("payout")
-
         try:
-            payout = float(raw_payout)
+            payout = float(item.get("payout"))
             if 0 < payout <= 1:
                 payout *= 100
         except (TypeError, ValueError):
-            log(f"SKIP {symbol}: payout missing")
+            log(f"SKIP {symbol}: payout unavailable")
             continue
 
         if payout < MIN_PAYOUT or payout > 100:
-            log(f"SKIP {symbol}: payout {payout}")
             continue
 
         result.append({
@@ -132,7 +129,7 @@ def get_symbols():
             "payout": payout
         })
 
-    log(f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: {len(result)}")
+    log(f"PAIRS WITH PAYOUT >= 75%: {len(result)}")
     return result
 
 
@@ -157,34 +154,29 @@ def get_candles(symbol, timeframe):
     for col in ["open", "high", "low", "close"]:
         if col not in df.columns:
             return None
-        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df = df.dropna(subset=["open", "high", "low", "close"])
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        )
 
-    if len(df) < 56:
+    df = df.dropna(
+        subset=["open", "high", "low", "close"]
+    )
+
+    if len(df) < 55:
         return None
 
     return df.reset_index(drop=True)
 
 
-def indicators(df):
+def add_ema(df, period):
     df = df.copy()
 
-    for period in [9, 20, 50]:
-        df[f"ema{period}"] = df["close"].ewm(
-            span=period,
-            adjust=False
-        ).mean()
-
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["rsi"] = 100 - (100 / (1 + rs))
+    df[f"ema{period}"] = df["close"].ewm(
+        span=period,
+        adjust=False
+    ).mean()
 
     return df
 
@@ -199,77 +191,89 @@ def analyze(item):
         if m1 is None or m5 is None:
             return None
 
-        m1 = indicators(m1.iloc[:-1].copy())
-        m5 = indicators(m5.iloc[:-1].copy())
+        # Retire dènye bouji a pou evite sèvi
+        # ak yon bouji ki poko fini.
+        m1 = add_ema(m1.iloc[:-1].copy(), 20)
+        m5 = add_ema(m5.iloc[:-1].copy(), 50)
 
-        if len(m1) < 55 or len(m5) < 55:
+        if len(m1) < 25 or len(m5) < 51:
             return None
 
         last = m1.iloc[-1]
         previous = m1.iloc[-2]
         trend = m5.iloc[-1]
 
-        rsi = float(last["rsi"])
-
-        if pd.isna(rsi) or rsi > 75 or rsi < 25:
-            return None
-
-        candle_range = float(last["high"] - last["low"])
-
-        if candle_range <= 0:
-            return None
-
-        body = abs(float(last["close"] - last["open"]))
-
-        if body / candle_range < 0.25:
-            return None
-
-        buy = 0
-        sell = 0
-
-        if last["ema9"] > last["ema20"]:
-            buy += 1
-        if last["ema20"] > last["ema50"]:
-            buy += 1
-
-        if last["ema9"] < last["ema20"]:
-            sell += 1
-        if last["ema20"] < last["ema50"]:
-            sell += 1
-
-        if trend["ema20"] > trend["ema50"]:
-            buy += 2
-        elif trend["ema20"] < trend["ema50"]:
-            sell += 2
-
-        if last["close"] > last["open"]:
-            buy += 1
-        elif last["close"] < last["open"]:
-            sell += 1
-
-        if previous["close"] > previous["open"]:
-            buy += 1
-        elif previous["close"] < previous["open"]:
-            sell += 1
-
-        if 50 <= rsi <= 68:
-            buy += 1
-        elif 32 <= rsi <= 50:
-            sell += 1
-
-        if buy >= 6 and buy > sell:
-            direction, score = "BUY", buy
-        elif sell >= 6 and sell > buy:
-            direction, score = "SELL", sell
+        # M5: direction of the main trend.
+        if trend["close"] > trend["ema50"]:
+            direction = "BUY"
+        elif trend["close"] < trend["ema50"]:
+            direction = "SELL"
         else:
             return None
+
+        # M1: pullback near EMA20.
+        ema20 = float(last["ema20"])
+        candle_range = float(last["high"] - last["low"])
+
+        if candle_range <= 0 or ema20 <= 0:
+            return None
+
+        distance = abs(float(last["close"]) - ema20) / ema20
+
+        # Price must be near EMA20, not far away.
+        if distance > 0.0015:
+            return None
+
+        # Avoid unusually large candles.
+        if candle_range / float(last["close"]) > 0.002:
+            return None
+
+        body = abs(float(last["close"]) - float(last["open"]))
+
+        if body / candle_range < 0.35:
+            return None
+
+        # CALL confirmation: bullish closed candle
+        # and previous candle touched/approached EMA20.
+        if direction == "BUY":
+            if last["close"] <= last["open"]:
+                return None
+
+            if previous["low"] > previous["ema20"] * 1.001:
+                return None
+
+            if last["close"] <= last["ema20"]:
+                return None
+
+        # PUT confirmation: bearish closed candle
+        # and previous candle touched/approached EMA20.
+        elif direction == "SELL":
+            if last["close"] >= last["open"]:
+                return None
+
+            if previous["high"] < previous["ema20"] * 0.999:
+                return None
+
+            if last["close"] >= last["ema20"]:
+                return None
+
+        # Score is a setup-strength score, not win probability.
+        score = 6
+
+        if body / candle_range >= 0.60:
+            score += 1
+
+        if direction == "BUY" and trend["close"] > trend["ema50"]:
+            score += 1
+
+        if direction == "SELL" and trend["close"] < trend["ema50"]:
+            score += 1
 
         return {
             "symbol": symbol,
             "name": item["name"],
             "direction": direction,
             "score": score,
-            "rsi": rsi,
             "payout": item["payout"],
             "reference": float(last["close"]),
             "analyzed_at": utc_now()
@@ -283,12 +287,17 @@ def analyze(item):
 def schedule_entry(now):
     earliest = now + timedelta(seconds=MIN_PREP_SECONDS)
 
-    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    entry = now.replace(
+        second=0,
+        microsecond=0
+    ) + timedelta(minutes=1)
 
     while entry < earliest:
         entry += timedelta(minutes=1)
 
-    signal_time = entry - timedelta(seconds=MIN_PREP_SECONDS)
+    signal_time = entry - timedelta(
+        seconds=MIN_PREP_SECONDS
+    )
 
     return signal_time, entry
 
@@ -320,8 +329,7 @@ def signal_message(signal, total, signal_time, entry_time):
         f"⏰ PREPARATION: 30 SECONDS\n"
         f"🏁 EXPIRATION: {expiry_local:%I:%M:%S %p}\n\n"
         f"📍 REFERENCE PRICE: {signal['reference']:.6f}\n"
-        f"📊 RSI: {signal['rsi']:.1f}\n"
-        f"⭐ TECHNICAL SCORE: {signal['score']}/7\n"
+        f"⭐ SETUP SCORE: {signal['score']}/8\n"
         f"💰 PAYOUT: {signal['payout']:.1f}%\n"
         f"💱 PAIRS SCANNED: {total}\n"
         f"📉 HISTORICAL WIN RATE: NOT AVAILABLE\n\n"
@@ -334,7 +342,7 @@ def main():
 
     log("=" * 45)
     log(VERSION)
-    log("MINIMUM PAYOUT: 75%")
+    log("SIMPLE M5 TREND + M1 EMA20 PULLBACK")
     log("=" * 45)
 
     if not API_KEY:
@@ -355,6 +363,7 @@ def main():
 
     except Exception as error:
         log(f"STARTUP ERROR: {error}")
+
         try:
             send_telegram(
                 f"🤖 <b>{VERSION}</b>\n"
@@ -363,10 +372,11 @@ def main():
             )
         except Exception:
             pass
+
         return
 
     if not symbols:
-        log("NO PAIRS WITH VERIFIED PAYOUT >= 75%")
+        log("No pairs with verified payout >= 75%.")
         return
 
     candidates = []
@@ -379,18 +389,19 @@ def main():
 
         for future in as_completed(futures):
             result = future.result()
+
             if result:
                 candidates.append(result)
 
     elapsed = time.time() - started
 
     log(f"PAIRS FOUND: {len(symbols)}")
-    log(f"VALID SIGNALS: {len(candidates)}")
+    log(f"VALID SETUPS: {len(candidates)}")
     log(f"ANALYSIS TIME: {elapsed:.1f}s")
 
-    # Do not send a fake WAIT or a forced signal.
+    # No forced trade. No normal WAIT Telegram message.
     if not candidates:
-        log("NO QUALIFIED SIGNAL. BOT FINISHED.")
+        log("NO QUALIFIED SETUP. NO SIGNAL SENT.")
         return
 
     candidates.sort(
@@ -404,23 +415,32 @@ def main():
 
     best = candidates[0]
 
+    # Recheck schedule after analysis.
     signal_time, entry_time = schedule_entry(utc_now())
 
     log(f"SELECTED: {best['direction']} {best['symbol']}")
     log(f"PAYOUT: {best['payout']}%")
 
-    wait_seconds = (signal_time - utc_now()).total_seconds()
+    wait_seconds = (
+        signal_time - utc_now()
+    ).total_seconds()
 
     if wait_seconds > 0:
         log(f"WAITING {wait_seconds:.1f}s")
         time.sleep(wait_seconds)
 
     actual_send = utc_now()
-    delay = (actual_send - signal_time).total_seconds()
-    remaining = (entry_time - actual_send).total_seconds()
+
+    delay = (
+        actual_send - signal_time
+    ).total_seconds()
+
+    remaining = (
+        entry_time - actual_send
+    ).total_seconds()
 
     if delay > MAX_SIGNAL_DELAY or remaining < 28:
-        log("SIGNAL TIMING MISSED. NOT SENDING LATE ENTRY.")
+        log("SIGNAL TIMING MISSED. NO LATE SIGNAL.")
         return
 
     send_telegram(
