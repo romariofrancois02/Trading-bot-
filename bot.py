@@ -8,7 +8,7 @@ from zoneinfo import ZoneInfo
 # ==================================================
 # ROMARIO TRADER PRO 9.0
 # EMA 50 + STOCHASTIC 14,3
-# ALERT ONLY - NO AUTOMATIC TRADING
+# OTC ONLY - ALERT ONLY
 # ==================================================
 
 BASE_URL = "https://otcharts.com"
@@ -25,10 +25,6 @@ TIMEFRAME = 60
 EXPIRATION = 60
 CANDLE_LIMIT = 300
 MIN_PAYOUT = 92.0
-MAX_PAIRS = 12
-
-# OTCharts candle timestamps are adjusted by this
-# offset in the existing bot configuration.
 OTC_OFFSET = 7200
 
 SESSION = requests.Session()
@@ -116,13 +112,8 @@ def api_get(endpoint, params=None):
 
 
 # ==================================================
-# SYMBOLS / PAYOUT
+# OTC SYMBOLS / PAYOUT
 # ==================================================
-
-def get_payout(symbol):
-    for item in symbol:
-        pass
-
 
 def get_pairs():
     data = api_get(
@@ -148,12 +139,13 @@ def get_pairs():
             or ""
         )
 
+        # OTC ONLY - NO REAL MARKETS
         if not name.lower().endswith("_otc"):
             continue
 
-        # OTC forex pairs only: six currency letters.
         base = name[:-4]
 
+        # Six-letter forex pairs only
         if len(base) != 6 or not base.isalpha():
             continue
 
@@ -171,7 +163,9 @@ def get_pairs():
         )
 
         try:
-            payout = float(str(payout_value).replace("%", ""))
+            payout = float(
+                str(payout_value).replace("%", "")
+            )
         except (ValueError, TypeError):
             continue
 
@@ -188,7 +182,8 @@ def get_pairs():
         reverse=True
     )
 
-    return pairs[:MAX_PAIRS]
+    # ALL qualifying OTC forex pairs, no 12-pair limit
+    return pairs
 
 
 # ==================================================
@@ -224,7 +219,6 @@ def get_candles(symbol):
                 or row.get("t")
             )
 
-            # Convert milliseconds to seconds if necessary.
             if timestamp > 100000000000:
                 timestamp /= 1000
 
@@ -241,7 +235,6 @@ def get_candles(symbol):
         except (ValueError, TypeError):
             continue
 
-    # Remove duplicate timestamps.
     unique = {}
 
     for candle in candles:
@@ -252,7 +245,6 @@ def get_candles(symbol):
         key=lambda candle: candle["time"]
     )
 
-    # Keep completed candles only.
     now = time.time()
 
     completed = [
@@ -373,15 +365,13 @@ def strategy_votes(candles):
     if any(value is None for value in values):
         return result
 
-    if k > previous_k and d > previous_d:
-        bullish_momentum = True
-    else:
-        bullish_momentum = False
+    bullish_momentum = (
+        k > previous_k and d > previous_d
+    )
 
-    if k < previous_k and d < previous_d:
-        bearish_momentum = True
-    else:
-        bearish_momentum = False
+    bearish_momentum = (
+        k < previous_k and d < previous_d
+    )
 
     uptrend = close > ema
     downtrend = close < ema
@@ -389,7 +379,6 @@ def strategy_votes(candles):
     crossed_up = previous_k <= previous_d and k > d
     crossed_down = previous_k >= previous_d and k < d
 
-    # CALL setup
     if uptrend and crossed_up and k < 30 and bullish_momentum:
         result["CALL"] = 1
         result["score"] = 1 + (30 - k) / 30
@@ -397,7 +386,6 @@ def strategy_votes(candles):
             f"EMA50 uptrend + Stochastic bullish cross ({k:.1f})"
         )
 
-    # PUT setup
     elif downtrend and crossed_down and k > 70 and bearish_momentum:
         result["PUT"] = 1
         result["score"] = 1 + (k - 70) / 30
@@ -473,6 +461,7 @@ def no_signal_message(scanned, errors):
         "No pair passed the EMA50 + Stochastic rules.\n\n"
         f"Pairs scanned: {scanned}\n"
         f"Minimum payout: {MIN_PAYOUT:.1f}%\n"
+        "Market: OTC Forex only\n"
         "Strategy: EMA50 + Stochastic 14,3\n"
         "Expiration: 60 seconds\n"
         f"Data errors: {errors}\n\n"
@@ -503,6 +492,8 @@ def main():
         log("No eligible OTC forex pairs.")
         return
 
+    log(f"Eligible OTC pairs found: {len(pairs)}")
+
     candidates = []
     errors = 0
     scanned = 0
@@ -511,7 +502,7 @@ def main():
         scanned += 1
         symbol = pair["symbol"]
 
-        log(f"Scanning {symbol}...")
+        log(f"Scanning {symbol} ({scanned}/{len(pairs)})...")
 
         try:
             candles = get_candles(symbol)
@@ -545,7 +536,6 @@ def main():
         log("No valid signal.")
         return
 
-    # Select only the strongest qualifying setup.
     candidates.sort(
         key=lambda item: (
             item["votes"]["score"],
