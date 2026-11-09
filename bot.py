@@ -8,34 +8,29 @@ from zoneinfo import ZoneInfo
 
 import requests
 
-# =========================================================
-# ROMARIO TRADER PRO 4.1
-# Pocket Option OTC | M1 Entry | 60 Seconds Expiration
-# =========================================================
+# =====================================================
+# ROMARIO TRADER PRO 7.0
+# 8 STRATEGY VOTING SYSTEM
+# =====================================================
 
-VERSION = "ROMARIO TRADER PRO 4.1"
+VERSION = "ROMARIO TRADER PRO 7.0"
 
 BASE_URL = "https://otcharts.com"
-VENUE = "otc"
-
 MIN_PAYOUT = 92.0
-MIN_SCORE = 6
+MIN_VOTES = 4
 MAX_PAIRS = 25
 
-TIMEFRAME_M1 = 60
-TIMEFRAME_M5 = 300
-EXPIRATION_SECONDS = 60
+M1 = 60
+M5 = 300
+EXPIRATION = 60
 
-FLORIDA = ZoneInfo("America/New_York")
+TZ = ZoneInfo("America/New_York")
 
-OTCHARTS_KEY = os.getenv("OTCHARTS_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+API_KEY = os.getenv("OTCHARTS_API_KEY")
+TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TG_CHAT = os.getenv("TELEGRAM_CHAT_ID")
 
-HEADERS = {
-    "Authorization": f"Bearer {OTCHARTS_KEY}",
-    "User-Agent": "ROMARIO-TRADER-PRO/4.1",
-}
+HEADERS = {"Authorization": f"Bearer {API_KEY}"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,355 +38,489 @@ logging.basicConfig(
 )
 
 
-# =========================================================
+# =====================================================
 # TELEGRAM
-# =========================================================
+# =====================================================
 
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Telegram secrets are missing.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+def telegram(message):
+    if not TG_TOKEN or not TG_CHAT:
+        logging.error("Telegram secrets missing")
+        return
 
     try:
-        response = requests.post(
-            url,
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             data={
-                "chat_id": TELEGRAM_CHAT_ID,
+                "chat_id": TG_CHAT,
                 "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True,
+                "parse_mode": "HTML"
             },
-            timeout=20,
+            timeout=20
         )
-
-        if response.status_code == 200:
-            logging.info("Telegram message sent.")
-            return True
-
-        logging.error("Telegram error: %s", response.text[:300])
-        return False
-
-    except requests.RequestException as error:
-        logging.error("Telegram connection error: %s", error)
-        return False
+        r.raise_for_status()
+    except Exception as e:
+        logging.error("Telegram error: %s", e)
 
 
-# =========================================================
-# OTCHARTS API
-# =========================================================
+# =====================================================
+# API
+# =====================================================
 
 def api_get(endpoint, params=None):
-    if not OTCHARTS_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY is missing.")
+    if not API_KEY:
+        raise RuntimeError("OTCHARTS_API_KEY missing")
 
-    response = requests.get(
-        f"{BASE_URL}{endpoint}",
+    r = requests.get(
+        BASE_URL + endpoint,
         headers=HEADERS,
         params=params,
-        timeout=25,
+        timeout=25
     )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"OTCharts HTTP {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
-    return response.json()
+    r.raise_for_status()
+    return r.json()
 
 
-def get_symbols():
-    data = api_get(
-        "/v1/symbols",
-        {"venue": VENUE},
-    )
+def get_pairs():
+    data = api_get("/v1/symbols", {"venue": "otc"})
+    pairs = data.get("symbols", [])
 
-    symbols = data.get("symbols", [])
+    valid = []
 
-    # Forex currency pairs only. Exclude stocks and other assets.
-    forex_pairs = []
-
-    for item in symbols:
-        symbol = item.get("symbol", "")
+    for p in pairs:
+        symbol = p.get("symbol", "")
 
         if not re.fullmatch(r"[A-Z]{6}_otc", symbol):
             continue
 
-        if item.get("open") is not True:
-            continue
-
-        payout = item.get("payout")
-
-        # Never invent a payout when the API returns null.
-        if payout is None:
-            continue
-
         try:
-            payout = float(payout)
-        except (TypeError, ValueError):
+            payout = float(p["payout"])
+        except (KeyError, TypeError, ValueError):
             continue
 
         if payout < MIN_PAYOUT:
             continue
 
-        if item.get("isOtc") is not True:
-            continue
+        valid.append({
+            "symbol": symbol,
+            "payout": payout
+        })
 
-        item["_payout"] = payout
-        forex_pairs.append(item)
-
-    forex_pairs.sort(
-        key=lambda item: item["_payout"],
-        reverse=True,
-    )
-
-    return forex_pairs[:MAX_PAIRS]
+    valid.sort(key=lambda x: x["payout"], reverse=True)
+    return valid[:MAX_PAIRS]
 
 
-def get_candles(symbol, timeframe):
+def get_candles(symbol, tf):
     data = api_get(
         "/v1/candles",
         {
-            "venue": VENUE,
+            "venue": "otc",
             "symbol": symbol,
-            "tf": timeframe,
-            "limit": 100,
-        },
+            "tf": tf,
+            "limit": 150
+        }
     )
 
-    candles = data.get("candles", [])
+    rows = data.get("candles", [])
+    result = []
 
-    if not isinstance(candles, list):
-        return []
-
-    if data.get("gaps", {}).get("runs", 0) > 0:
-        logging.warning("Missing candle gaps for %s", symbol)
-        return []
-
-    clean = []
-
-    for candle in candles:
+    for c in rows:
         try:
-            clean.append({
-                "open": float(candle["open"]),
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "close": float(candle["close"]),
-                "time": int(candle["time"]),
+            result.append({
+                "time": int(c.get("time", c.get("timestamp"))),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"])
             })
-        except (KeyError, TypeError, ValueError):
+        except (TypeError, ValueError, KeyError):
             continue
 
-    clean.sort(key=lambda candle: candle["time"])
+    result.sort(key=lambda x: x["time"])
 
-    # Use completed candles only; the newest returned bar may
-    # still be forming. This assumption must be checked against
-    # the timestamps in your OTCharts feed.
-    if len(clean) > 1:
-        clean = clean[:-1]
-
-    return clean
-
-
-# =========================================================
-# INDICATORS
-# =========================================================
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    multiplier = 2 / (period + 1)
-    result = sum(values[:period]) / period
-
-    for value in values[period:]:
-        result = (value * multiplier) + (
-            result * (1 - multiplier)
-        )
+    # Pwovizwa: retire dènye bouji a si li poko fini.
+    # Verifye timestamp OTCharts yo anvan nou konte sou sa.
+    if len(result) > 1:
+        result = result[:-1]
 
     return result
 
 
-def calculate_rsi(values, period=14):
+# =====================================================
+# INDICATORS
+# =====================================================
+
+def ema(values, period):
+    if len(values) < period:
+        return []
+
+    result = [sum(values[:period]) / period]
+    alpha = 2 / (period + 1)
+
+    for value in values[period:]:
+        result.append(
+            alpha * value + (1 - alpha) * result[-1]
+        )
+
+    return [None] * (period - 1) + result
+
+
+def rsi(values, period=14):
     if len(values) <= period:
-        return None
+        return []
 
     gains = []
     losses = []
 
-    for index in range(1, len(values)):
-        change = values[index] - values[index - 1]
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
 
-    average_gain = sum(gains[:period]) / period
-    average_loss = sum(losses[:period]) / period
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
 
-    for index in range(period, len(gains)):
-        average_gain = (
-            average_gain * (period - 1) + gains[index]
+    result = [None] * period
+
+    for i in range(period, len(gains)):
+        avg_gain = (
+            avg_gain * (period - 1) + gains[i]
+        ) / period
+        avg_loss = (
+            avg_loss * (period - 1) + losses[i]
         ) / period
 
-        average_loss = (
-            average_loss * (period - 1) + losses[index]
-        ) / period
+        if avg_loss == 0:
+            result.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            result.append(100 - 100 / (1 + rs))
 
-    if average_loss == 0:
-        return 100.0
-
-    relative_strength = average_gain / average_loss
-
-    return 100 - (100 / (1 + relative_strength))
+    return result
 
 
-# =========================================================
-# 4.1 STRATEGY
-# =========================================================
+def bollinger(values, period=20, multiplier=2):
+    upper, middle, lower = [], [], []
 
-def analyze_pair(symbol, payout):
-    m1 = get_candles(symbol, TIMEFRAME_M1)
-    m5 = get_candles(symbol, TIMEFRAME_M5)
+    for i in range(len(values)):
+        if i < period - 1:
+            upper.append(None)
+            middle.append(None)
+            lower.append(None)
+            continue
 
-    if len(m1) < 60 or len(m5) < 60:
+        window = values[i - period + 1:i + 1]
+        avg = sum(window) / period
+        variance = sum((x - avg) ** 2 for x in window) / period
+        sd = variance ** 0.5
+
+        middle.append(avg)
+        upper.append(avg + multiplier * sd)
+        lower.append(avg - multiplier * sd)
+
+    return upper, middle, lower
+
+
+def macd(values):
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    line = []
+
+    for a, b in zip(fast, slow):
+        if a is None or b is None:
+            line.append(None)
+        else:
+            line.append(a - b)
+
+    valid = [x for x in line if x is not None]
+    signal_valid = ema(valid, 9)
+
+    signal = [None] * (len(line) - len(signal_valid))
+    signal.extend(signal_valid)
+
+    return line, signal
+
+
+def stochastic(candles, period=14, smooth=3):
+    k = []
+
+    for i in range(len(candles)):
+        if i < period - 1:
+            k.append(None)
+            continue
+
+        window = candles[i - period + 1:i + 1]
+        highest = max(x["high"] for x in window)
+        lowest = min(x["low"] for x in window)
+
+        if highest == lowest:
+            k.append(50.0)
+        else:
+            k.append(
+                100 * (candles[i]["close"] - lowest)
+                / (highest - lowest)
+            )
+
+    d = []
+
+    for i in range(len(k)):
+        values = k[max(0, i - smooth + 1):i + 1]
+        values = [x for x in values if x is not None]
+
+        if len(values) < smooth:
+            d.append(None)
+        else:
+            d.append(sum(values) / len(values))
+
+    return k, d
+
+
+def supertrend(candles, period=10, multiplier=3):
+    atr = [None] * len(candles)
+    tr = []
+
+    for i, c in enumerate(candles):
+        if i == 0:
+            tr.append(c["high"] - c["low"])
+        else:
+            prev = candles[i - 1]["close"]
+            tr.append(max(
+                c["high"] - c["low"],
+                abs(c["high"] - prev),
+                abs(c["low"] - prev)
+            ))
+
+    for i in range(period - 1, len(candles)):
+        atr[i] = sum(tr[i - period + 1:i + 1]) / period
+
+    trend = [None] * len(candles)
+    upper_band = [None] * len(candles)
+    lower_band = [None] * len(candles)
+
+    for i, c in enumerate(candles):
+        if atr[i] is None:
+            continue
+
+        mid = (c["high"] + c["low"]) / 2
+        basic_upper = mid + multiplier * atr[i]
+        basic_lower = mid - multiplier * atr[i]
+
+        if i == 0 or trend[i - 1] is None:
+            upper_band[i] = basic_upper
+            lower_band[i] = basic_lower
+            trend[i] = 1 if c["close"] >= mid else -1
+            continue
+
+        prev_upper = upper_band[i - 1]
+        prev_lower = lower_band[i - 1]
+        prev_close = candles[i - 1]["close"]
+
+        upper_band[i] = (
+            min(basic_upper, prev_upper)
+            if prev_close <= prev_upper else basic_upper
+        )
+
+        lower_band[i] = (
+            max(basic_lower, prev_lower)
+            if prev_close >= prev_lower else basic_lower
+        )
+
+        if trend[i - 1] == -1 and c["close"] > upper_band[i]:
+            trend[i] = 1
+        elif trend[i - 1] == 1 and c["close"] < lower_band[i]:
+            trend[i] = -1
+        else:
+            trend[i] = trend[i - 1]
+
+    return trend
+
+
+# =====================================================
+# STRATEGY VOTING
+# =====================================================
+
+def analyze(candles):
+    if len(candles) < 60:
         return None
 
-    closes_m1 = [c["close"] for c in m1]
-    closes_m5 = [c["close"] for c in m5]
+    close = [c["close"] for c in candles]
 
-    ema9 = ema(closes_m1, 9)
-    ema20 = ema(closes_m1, 20)
-    ema50 = ema(closes_m1, 50)
+    e9 = ema(close, 9)
+    e21 = ema(close, 21)
+    e50 = ema(close, 50)
 
-    ema20_m5 = ema(closes_m5, 20)
-    ema50_m5 = ema(closes_m5, 50)
+    rv = rsi(close, 14)
+    bu, bm, bl = bollinger(close)
 
-    rsi = calculate_rsi(closes_m1, 14)
+    ml, ms = macd(close)
+    sk, sd = stochastic(candles)
+    st = supertrend(candles)
 
-    if None in (
-        ema9, ema20, ema50,
-        ema20_m5, ema50_m5, rsi
-    ):
+    i = len(candles) - 1
+    p = i - 1
+
+    needed = [
+        e9[i], e9[p], e21[i], e21[p],
+        e50[i], e50[p], rv[i], rv[p],
+        bu[i], bm[i], bl[i], bu[p], bl[p],
+        ml[i], ml[p], ms[i], ms[p],
+        sk[i], sk[p], sd[i], sd[p],
+        st[i], st[p]
+    ]
+
+    if any(x is None for x in needed):
         return None
 
-    last = m1[-1]
-    previous = m1[-2]
-    older = m1[-3]
+    c = candles[i]
+    prev = candles[p]
 
-    score_call = 0
-    score_put = 0
+    call = []
+    put = []
 
-    # 1. M1 EMA 9 / 20 / 50 direction
-    if ema9 > ema20 > ema50:
-        score_call += 1
+    def vote(condition, direction, name):
+        if condition:
+            if direction == "CALL":
+                call.append(name)
+            else:
+                put.append(name)
 
-    if ema9 < ema20 < ema50:
-        score_put += 1
+    # 1. RSI REVERSAL
+    vote(
+        rv[p] < 30 and rv[i] >= 30,
+        "CALL", "RSI Reversal"
+    )
+    vote(
+        rv[p] > 70 and rv[i] <= 70,
+        "PUT", "RSI Reversal"
+    )
 
-    # 2. M5 trend confirmation
-    if ema20_m5 > ema50_m5:
-        score_call += 1
+    # 2. EMA CROSS
+    vote(
+        e9[p] <= e21[p] and e9[i] > e21[i],
+        "CALL", "EMA Cross"
+    )
+    vote(
+        e9[p] >= e21[p] and e9[i] < e21[i],
+        "PUT", "EMA Cross"
+    )
 
-    if ema20_m5 < ema50_m5:
-        score_put += 1
+    # 3. BOLLINGER BOUNCE
+    vote(
+        prev["low"] <= bl[p] and c["close"] > bl[i],
+        "CALL", "Bollinger Bounce"
+    )
+    vote(
+        prev["high"] >= bu[p] and c["close"] < bu[i],
+        "PUT", "Bollinger Bounce"
+    )
 
-    # 3. First candle momentum
-    if last["close"] > last["open"]:
-        score_call += 1
+    # 4. MACD CROSS
+    vote(
+        ml[p] <= ms[p] and ml[i] > ms[i],
+        "CALL", "MACD Cross"
+    )
+    vote(
+        ml[p] >= ms[p] and ml[i] < ms[i],
+        "PUT", "MACD Cross"
+    )
 
-    if last["close"] < last["open"]:
-        score_put += 1
+    # 5. STOCHASTIC CROSS
+    vote(
+        sk[p] <= sd[p] and sk[i] > sd[i]
+        and sk[i] < 25,
+        "CALL", "Stochastic Cross"
+    )
+    vote(
+        sk[p] >= sd[p] and sk[i] < sd[i]
+        and sk[i] > 75,
+        "PUT", "Stochastic Cross"
+    )
 
-    # 4. Second candle momentum
-    if previous["close"] > previous["open"]:
-        score_call += 1
+    # 6. SUPERTREND FLIP
+    vote(
+        st[p] == -1 and st[i] == 1,
+        "CALL", "SuperTrend Flip"
+    )
+    vote(
+        st[p] == 1 and st[i] == -1,
+        "PUT", "SuperTrend Flip"
+    )
 
-    if previous["close"] < previous["open"]:
-        score_put += 1
+    # 7. COMBO: RSI + BOLLINGER + EMA TREND
+    combo_call = sum([
+        rv[i] > rv[p] and rv[i] < 50,
+        c["close"] > bl[i],
+        e9[i] > e21[i]
+    ])
 
-    # 5. RSI confirmation
-    if 50 <= rsi <= 68:
-        score_call += 1
+    combo_put = sum([
+        rv[i] < rv[p] and rv[i] > 50,
+        c["close"] < bu[i],
+        e9[i] < e21[i]
+    ])
 
-    if 32 <= rsi <= 50:
-        score_put += 1
+    vote(combo_call >= 2, "CALL", "Combo")
+    vote(combo_put >= 2, "PUT", "Combo")
 
-    # Reject extreme RSI conditions
-    if rsi > 75 or rsi < 25:
-        return None
+    # 8. TRIPLE EMA: FIRST ALIGNMENT
+    vote(
+        e9[i] > e21[i] > e50[i]
+        and not (e9[p] > e21[p] > e50[p]),
+        "CALL", "Triple EMA"
+    )
+    vote(
+        e9[i] < e21[i] < e50[i]
+        and not (e9[p] < e21[p] < e50[p]),
+        "PUT", "Triple EMA"
+    )
 
-    # 6. Candle body strength
-    candle_range = last["high"] - last["low"]
-
-    if candle_range <= 0:
-        return None
-
-    body_ratio = abs(
-        last["close"] - last["open"]
-    ) / candle_range
-
-    if body_ratio >= 0.25:
-        if last["close"] > last["open"]:
-            score_call += 1
-        elif last["close"] < last["open"]:
-            score_put += 1
-
-    # 7. Price position relative to EMA20
-    if last["close"] > ema20:
-        score_call += 1
-
-    if last["close"] < ema20:
-        score_put += 1
-
-    if score_call >= MIN_SCORE and score_call > score_put:
+    # Require a clear majority, not a tie.
+    if len(call) >= MIN_VOTES and len(call) > len(put):
         direction = "CALL"
-        score = score_call
+        votes = call
 
-    elif score_put >= MIN_SCORE and score_put > score_call:
+    elif len(put) >= MIN_VOTES and len(put) > len(call):
         direction = "PUT"
-        score = score_put
+        votes = put
 
     else:
         return None
 
     return {
-        "symbol": symbol,
         "direction": direction,
-        "score": score,
-        "rsi": rsi,
-        "price": last["close"],
-        "payout": payout,
-        "m1_time": last["time"],
+        "votes": len(votes),
+        "strategies": votes,
+        "rsi": rv[i],
+        "price": c["close"],
+        "candle_time": c["time"]
     }
 
 
-# =========================================================
-# ENTRY TIME
-# =========================================================
+# =====================================================
+# ENTRY AND MESSAGE
+# =====================================================
 
-def next_entry_time():
-    now = datetime.now(FLORIDA)
+def next_entry():
+    now = datetime.now(TZ)
 
-    next_minute = now.replace(
-        second=0,
-        microsecond=0,
+    entry = now.replace(
+        second=0, microsecond=0
     ) + timedelta(minutes=1)
 
-    signal_time = next_minute - timedelta(seconds=30)
+    signal = entry - timedelta(seconds=30)
 
-    # If scanning took too long, skip the missed entry.
-    if now >= signal_time:
-        next_minute += timedelta(minutes=1)
-        signal_time = next_minute - timedelta(seconds=30)
+    if now >= signal:
+        entry += timedelta(minutes=1)
+        signal = entry - timedelta(seconds=30)
 
-    return signal_time, next_minute
+    return signal, entry
 
 
 def wait_until(target):
     while True:
-        now = datetime.now(FLORIDA)
-        remaining = (target - now).total_seconds()
+        remaining = (
+            target - datetime.now(TZ)
+        ).total_seconds()
 
         if remaining <= 0:
             return
@@ -399,158 +528,127 @@ def wait_until(target):
         time.sleep(min(remaining, 2))
 
 
-# =========================================================
-# MESSAGE
-# =========================================================
-
-def build_signal(candidate, entry_time):
-    direction = candidate["direction"]
-
-    if direction == "CALL":
+def make_message(pair, payout, result, entry):
+    if result["direction"] == "CALL":
         emoji = "🟢"
         action = "BUY / CALL"
     else:
         emoji = "🔴"
         action = "SELL / PUT"
 
-    signal_time = entry_time - timedelta(seconds=30)
-    expiration = entry_time + timedelta(seconds=60)
+    signal = entry - timedelta(seconds=30)
+    expiration = entry + timedelta(seconds=EXPIRATION)
+
+    strategy_text = "\n".join(
+        f"✓ {name}" for name in result["strategies"]
+    )
 
     return (
         f"🤖 <b>{VERSION}</b>\n\n"
         f"{emoji} <b>{action}</b>\n\n"
-        f"💱 PAIR: <b>{candidate['symbol']}</b>\n"
-        f"💰 PAYOUT: <b>{candidate['payout']:.1f}%</b>\n"
-        f"📊 TIMEFRAME: M1\n"
+        f"💱 PAIR: <b>{pair}</b>\n"
+        f"💰 PAYOUT: <b>{payout:.1f}%</b>\n"
+        f"⏱ TIMEFRAME: M1\n"
         f"⌛ EXPIRATION: 60 SECONDS\n\n"
-        f"🕒 SIGNAL TIME: "
-        f"{signal_time.strftime('%I:%M:%S %p')}\n"
-        f"🎯 ENTRY TIME: "
-        f"{entry_time.strftime('%I:%M:%S %p')}\n"
-        f"🏁 EXPIRATION TIME: "
-        f"{expiration.strftime('%I:%M:%S %p')}\n"
-        f"💵 PRICE: {candidate['price']}\n"
-        f"📈 RSI: {candidate['rsi']:.2f}\n"
-        f"⭐ TECHNICAL SCORE: "
-        f"{candidate['score']}/7\n\n"
-        f"🕐 TIMEZONE: Florida\n"
-        f"📌 PAYOUT SOURCE: OTCharts\n"
-        f"⚪ VERIFIED WIN RATE: NOT AVAILABLE\n\n"
-        f"⚠️ Demo test recommended."
+        f"🕒 SIGNAL TIME: {signal.strftime('%I:%M:%S %p')}\n"
+        f"🎯 ENTRY TIME: {entry.strftime('%I:%M:%S %p')}\n"
+        f"🏁 EXPIRATION: {expiration.strftime('%I:%M:%S %p')}\n\n"
+        f"⭐ STRATEGY VOTES: {result['votes']}/8\n"
+        f"{strategy_text}\n\n"
+        f"📊 RSI: {result['rsi']:.2f}\n"
+        f"💵 PRICE: {result['price']}\n"
+        f"🕐 FLORIDA TIME\n"
+        f"⚠️ DEMO TEST RECOMMENDED"
     )
 
 
-# =========================================================
+# =====================================================
 # MAIN
-# =========================================================
+# =====================================================
 
 def main():
     print("=" * 45)
     print(VERSION)
-    print("POCKET OPTION OTC SCANNER")
+    print("8 STRATEGY VOTING SYSTEM")
     print("=" * 45)
 
-    try:
-        pairs = get_symbols()
+    pairs = get_pairs()
+    print(f"Eligible OTC Forex pairs: {len(pairs)}")
 
-        print(f"Pairs with payout >= {MIN_PAYOUT}%: {len(pairs)}")
+    candidates = []
 
-        if not pairs:
-            send_telegram(
-                f"🤖 <b>{VERSION}</b>\n\n"
-                "⚪ No eligible Forex OTC pair found.\n"
-                "Payout must be verified at 92% or higher.\n"
-                "No signal was forced."
-            )
-            return
+    for number, pair in enumerate(pairs, 1):
+        symbol = pair["symbol"]
+        payout = pair["payout"]
 
-        candidates = []
+        print(
+            f"[{number}/{len(pairs)}] "
+            f"Scanning {symbol} | {payout}%"
+        )
 
-        for index, item in enumerate(pairs, start=1):
-            symbol = item["symbol"]
-            payout = item["_payout"]
+        try:
+            candles = get_candles(symbol, M1)
+            result = analyze(candles)
 
-            print(
-                f"[{index}/{len(pairs)}] "
-                f"Scanning {symbol} | payout {payout}%"
-            )
+            if result:
+                result["symbol"] = symbol
+                result["payout"] = payout
+                candidates.append(result)
 
-            try:
-                result = analyze_pair(symbol, payout)
-
-                if result:
-                    candidates.append(result)
-                    print(
-                        f"VALID: {result['direction']} "
-                        f"{symbol} "
-                        f"score={result['score']}/7"
-                    )
-
-            except Exception as error:
-                logging.warning(
-                    "Could not analyze %s: %s",
-                    symbol,
-                    error,
+                print(
+                    f"VALID {result['direction']} "
+                    f"{symbol} "
+                    f"{result['votes']}/8"
                 )
 
-        if not candidates:
-            send_telegram(
-                f"🤖 <b>{VERSION}</b>\n\n"
-                "⚪ No setup passed the 6/7 filter.\n"
-                "No trade signal was forced."
-            )
-            return
+        except Exception as error:
+            logging.warning("%s: %s", symbol, error)
 
-        # Best technical score first, then highest payout.
-        candidates.sort(
-            key=lambda item: (
-                item["score"],
-                item["payout"],
-            ),
-            reverse=True,
-        )
-
-        best = candidates[0]
-
-        signal_time, entry_time = next_entry_time()
-
-        print(
-            f"BEST: {best['symbol']} "
-            f"{best['direction']} "
-            f"{best['score']}/7"
-        )
-
-        print(
-            "Signal scheduled:",
-            signal_time.strftime("%I:%M:%S %p"),
-        )
-
-        print(
-            "Entry scheduled:",
-            entry_time.strftime("%I:%M:%S %p"),
-        )
-
-        wait_until(signal_time)
-
-        # Do not send a late signal.
-        if datetime.now(FLORIDA) >= entry_time:
-            print("Entry time missed. Signal cancelled.")
-            return
-
-        message = build_signal(best, entry_time)
-        send_telegram(message)
-
-        print("Signal process completed.")
-
-    except Exception as error:
-        logging.exception("Bot error")
-
-        send_telegram(
+    if not candidates:
+        telegram(
             f"🤖 <b>{VERSION}</b>\n\n"
-            f"🔴 BOT ERROR\n"
-            f"<code>{str(error)[:500]}</code>"
+            "⚪ No pair reached the required 4/8 votes.\n"
+            "No signal generated."
         )
+        return
+
+    candidates.sort(
+        key=lambda x: (x["votes"], x["payout"]),
+        reverse=True
+    )
+
+    best = candidates[0]
+    signal_time, entry_time = next_entry()
+
+    print("BEST:", best["symbol"], best["direction"])
+    print("VOTES:", best["votes"], "/8")
+    print("SIGNAL:", signal_time)
+    print("ENTRY:", entry_time)
+
+    wait_until(signal_time)
+
+    if datetime.now(TZ) >= entry_time:
+        print("Entry time missed. Cancelled.")
+        return
+
+    message = make_message(
+        best["symbol"],
+        best["payout"],
+        best,
+        entry_time
+    )
+
+    telegram(message)
+    print("Signal sent.")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as error:
+        logging.exception("BOT FAILED")
+        telegram(
+            f"🤖 <b>{VERSION}</b>\n"
+            f"🔴 BOT ERROR\n"
+            f"<code>{str(error)[:400]}</code>"
+        )
