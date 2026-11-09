@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 8.1
+# ROMARIO TRADER PRO 8.2
 # POCKET OPTION OTC | M1 | 60 SECONDS
 # TELEGRAM ALERTS ONLY
 # =====================================================
@@ -20,8 +20,8 @@ OTC_OFFSET = 7200
 
 MIN_PAYOUT = 92.0
 MIN_VOTES = 2
-MIN_TEST_TRADES = 20
-MIN_TEST_WINRATE = 53.0
+MIN_TEST_TRADES = 20       # Informational only; no longer blocks signals
+MIN_TEST_WINRATE = 53.0    # Informational only; no longer blocks signals
 MAX_PAIRS = 12
 
 FLORIDA = ZoneInfo("America/New_York")
@@ -47,7 +47,7 @@ logging.basicConfig(
 http = requests.Session()
 http.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTrader/8.1",
+    "User-Agent": "RomarioTrader/8.2",
     "Accept": "application/json"
 })
 
@@ -77,10 +77,17 @@ def telegram(message):
     try:
         response = requests.post(
             url,
-            json={"chat_id": TG_CHAT, "text": message},
+            json={
+                "chat_id": TG_CHAT,
+                "text": message
+            },
             timeout=20
         )
-        data = response.json()
+
+        try:
+            data = response.json()
+        except ValueError:
+            data = {"description": response.text[:300]}
 
         if response.ok and data.get("ok"):
             logging.info("Telegram message sent")
@@ -122,7 +129,11 @@ def api_get(endpoint, params=None):
                 )
 
         except requests.RequestException as exc:
-            logging.warning("API attempt %s: %s", attempt + 1, exc)
+            logging.warning(
+                "API attempt %s: %s",
+                attempt + 1,
+                exc
+            )
 
         if attempt < 2:
             time.sleep(2)
@@ -159,11 +170,18 @@ def valid_forex_pair(symbol):
     base = pair[:3]
     quote = pair[3:]
 
-    return base in CURRENCIES and quote in CURRENCIES
+    return (
+        base in CURRENCIES
+        and quote in CURRENCIES
+        and base != quote
+    )
 
 
 def get_pairs():
-    data = api_get("/v1/symbols", {"venue": VENUE})
+    data = api_get(
+        "/v1/symbols",
+        {"venue": VENUE}
+    )
 
     if not data:
         raise RuntimeError("Could not retrieve OTC symbols")
@@ -199,9 +217,12 @@ def get_pairs():
             "payout": payout
         })
 
-    pairs.sort(key=lambda x: x["payout"], reverse=True)
+    pairs.sort(
+        key=lambda item: item["payout"],
+        reverse=True
+    )
 
-    # Rotate scan order to vary which pairs are examined first.
+    # Rotate scan order every five minutes.
     if pairs:
         offset = (int(time.time()) // 300) % len(pairs)
         pairs = pairs[offset:] + pairs[:offset]
@@ -251,21 +272,47 @@ def get_candles(symbol):
             ) <= 0:
                 continue
 
+            if candle["high"] < max(
+                candle["open"], candle["close"]
+            ):
+                continue
+
+            if candle["low"] > min(
+                candle["open"], candle["close"]
+            ):
+                continue
+
             unique[candle["time"]] = candle
 
         except (KeyError, TypeError, ValueError):
             continue
 
-    candles = sorted(unique.values(), key=lambda x: x["time"])
+    candles = sorted(
+        unique.values(),
+        key=lambda item: item["time"]
+    )
 
     now = time.time()
 
     completed = [
-        c for c in candles
-        if c["time"] - OTC_OFFSET + TIMEFRAME <= now
+        candle for candle in candles
+        if candle["time"] - OTC_OFFSET + TIMEFRAME <= now
     ]
 
     return completed, gaps
+
+
+def has_missing_gaps(gaps):
+    if isinstance(gaps, dict):
+        try:
+            return int(gaps.get("missingBars", 0)) > 0
+        except (TypeError, ValueError):
+            return False
+
+    if isinstance(gaps, list):
+        return len(gaps) > 0
+
+    return False
 
 
 # ---------------- INDICATORS ----------------
@@ -281,7 +328,10 @@ def ema(values, period):
     alpha = 2 / (period + 1)
 
     for value in values[period:]:
-        current = alpha * value + (1 - alpha) * current
+        current = (
+            alpha * value
+            + (1 - alpha) * current
+        )
         result.append(current)
 
     return result
@@ -296,14 +346,17 @@ def rsi(values, period=14):
         for i in range(1, len(values))
     ]
 
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
+    gains = [max(value, 0) for value in changes]
+    losses = [max(-value, 0) for value in changes]
 
     avg_gain = sum(gains[-period:]) / period
     avg_loss = sum(losses[-period:]) / period
 
     if avg_loss == 0:
         return 100.0
+
+    if avg_gain == 0:
+        return 0.0
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
@@ -317,7 +370,8 @@ def bollinger(values, period=20):
     middle = sum(sample) / period
 
     variance = sum(
-        (x - middle) ** 2 for x in sample
+        (value - middle) ** 2
+        for value in sample
     ) / period
 
     deviation = variance ** 0.5
@@ -342,7 +396,8 @@ def strategy_votes(candles):
     if len(candles) < 60:
         return result
 
-    closes = [c["close"] for c in candles]
+    closes = [candle["close"] for candle in candles]
+
     previous = candles[-2]
     current = candles[-1]
 
@@ -387,7 +442,9 @@ def strategy_votes(candles):
             and bullish
         ):
             result["CALL"] += 1
-            result["call_reasons"].append("Bollinger reversal")
+            result["call_reasons"].append(
+                "Bollinger reversal"
+            )
 
         elif (
             previous["close"] >= old_bands[2]
@@ -396,14 +453,21 @@ def strategy_votes(candles):
             and bearish
         ):
             result["PUT"] += 1
-            result["put_reasons"].append("Bollinger reversal")
+            result["put_reasons"].append(
+                "Bollinger reversal"
+            )
 
     # 3. Ten-candle breakout
     if e21 and len(candles) >= 12:
         previous_window = candles[-11:-1]
 
-        highest = max(c["high"] for c in previous_window)
-        lowest = min(c["low"] for c in previous_window)
+        highest = max(
+            candle["high"] for candle in previous_window
+        )
+
+        lowest = min(
+            candle["low"] for candle in previous_window
+        )
 
         if (
             current["close"] > highest
@@ -421,7 +485,7 @@ def strategy_votes(candles):
             result["PUT"] += 1
             result["put_reasons"].append("Breakout")
 
-    # 4. Engulfing reversal with RSI filter
+    # 4. Engulfing reversal + RSI
     if current_rsi is not None:
         bullish_engulfing = (
             previous["close"] < previous["open"]
@@ -439,11 +503,15 @@ def strategy_votes(candles):
 
         if bullish_engulfing and current_rsi < 60:
             result["CALL"] += 1
-            result["call_reasons"].append("Bullish engulfing")
+            result["call_reasons"].append(
+                "Bullish engulfing"
+            )
 
         elif bearish_engulfing and current_rsi > 40:
             result["PUT"] += 1
-            result["put_reasons"].append("Bearish engulfing")
+            result["put_reasons"].append(
+                "Bearish engulfing"
+            )
 
     return result
 
@@ -468,8 +536,13 @@ def backtest(candles):
     losses = 0
 
     for index in range(60, len(candles) - 1):
-        # Skip gaps: these must be consecutive one-minute candles.
-        if candles[index + 1]["time"] - candles[index]["time"] != TIMEFRAME:
+
+        # Only test consecutive one-minute candles.
+        if (
+            candles[index + 1]["time"]
+            - candles[index]["time"]
+            != TIMEFRAME
+        ):
             continue
 
         history = candles[:index + 1]
@@ -484,6 +557,7 @@ def backtest(candles):
         if next_candle["close"] == next_candle["open"]:
             continue
 
+        # Approximate historical candle-direction test.
         if (
             direction == "CALL"
             and next_candle["close"] > next_candle["open"]
@@ -507,10 +581,12 @@ def backtest(candles):
     return total, wins / total * 100
 
 
-# ---------------- REPORT ----------------
+# ---------------- NO SIGNAL REPORT ----------------
 
 def no_signal(pairs, reasons):
-    now_text = florida_now().strftime("%Y-%m-%d %I:%M:%S %p")
+    now_text = florida_now().strftime(
+        "%Y-%m-%d %I:%M:%S %p"
+    )
 
     detail = "\n".join(
         f"• {key}: {value}"
@@ -518,13 +594,13 @@ def no_signal(pairs, reasons):
     )
 
     message = (
-        "🤖 ROMARIO TRADER PRO 8.1\n\n"
+        "🤖 ROMARIO TRADER PRO 8.2\n\n"
         "⚪ NO VALID SIGNAL\n"
-        "No setup passed all filters.\n\n"
+        "No current setup reached the confirmation rules.\n\n"
         f"Pairs scanned: {len(pairs)}\n"
         f"Minimum payout: {MIN_PAYOUT}%\n"
-        f"Minimum test trades: {MIN_TEST_TRADES}\n"
-        f"Minimum historical win rate: {MIN_TEST_WINRATE}%\n\n"
+        f"Minimum strategy votes: {MIN_VOTES}/4\n"
+        "Historical test: informational only\n\n"
         "📋 SCAN REPORT:\n"
         f"{detail}\n\n"
         f"🕒 FLORIDA TIME: {now_text}"
@@ -538,7 +614,7 @@ def no_signal(pairs, reasons):
 
 def main():
     print("=" * 55)
-    print("ROMARIO TRADER PRO 8.1")
+    print("ROMARIO TRADER PRO 8.2")
     print("OTC FOREX SCANNER")
     print("=" * 55)
 
@@ -552,13 +628,21 @@ def main():
 
     print("Pairs selected:", len(pairs))
 
+    if not pairs:
+        reasons = {
+            "No pairs with payout >= 92%": 1,
+            "Current setups": 0
+        }
+        no_signal(pairs, reasons)
+        return
+
     candidates = []
 
     reasons = {
         "Insufficient candles": 0,
         "Candle gaps": 0,
         "Insufficient historical signals": 0,
-        "Historical result below threshold": 0,
+        "Historical result below 53% (informational)": 0,
         "No current setup": 0,
         "API/data errors": 0
     }
@@ -580,37 +664,39 @@ def main():
                 reasons["Insufficient candles"] += 1
                 continue
 
-            if (
-                isinstance(gaps, dict)
-                and gaps.get("missingBars", 0) > 0
-            ):
+            if has_missing_gaps(gaps):
                 print("Skipped: missing historical candles")
                 reasons["Candle gaps"] += 1
                 continue
 
-            total, winrate = backtest(candles)
-
-            print(
-                f"Historical signals: {total} "
-                f"| Win rate: {winrate:.1f}%"
-            )
-
-            if total < MIN_TEST_TRADES:
-                reasons["Insufficient historical signals"] += 1
-                continue
-
-            if winrate < MIN_TEST_WINRATE:
-                reasons["Historical result below threshold"] += 1
-                continue
-
+            # Check the CURRENT setup first.
             votes = strategy_votes(candles)
             direction = get_direction(votes)
 
             if not direction:
                 reasons["No current setup"] += 1
+                print(
+                    "No current setup | "
+                    f"CALL {votes['CALL']}/4 | "
+                    f"PUT {votes['PUT']}/4"
+                )
                 continue
 
             score = votes[direction]
+
+            # Historical results are recorded but do not block
+            # a valid current setup.
+            total, winrate = backtest(candles)
+
+            if total < MIN_TEST_TRADES:
+                reasons[
+                    "Insufficient historical signals"
+                ] += 1
+
+            elif winrate < MIN_TEST_WINRATE:
+                reasons[
+                    "Historical result below 53% (informational)"
+                ] += 1
 
             reasons_text = (
                 votes["call_reasons"]
@@ -628,9 +714,14 @@ def main():
                 "reasons": reasons_text
             })
 
-            print("QUALIFIED:", direction, score, "/4")
+            print(
+                f"CURRENT SETUP: {direction} "
+                f"| Votes: {score}/4 "
+                f"| Historical signals: {total} "
+                f"| Historical rate: {winrate:.1f}%"
+            )
 
-        except Exception as exc:
+        except Exception:
             logging.exception("Pair scan error: %s", symbol)
             reasons["API/data errors"] += 1
 
@@ -638,19 +729,21 @@ def main():
         no_signal(pairs, reasons)
         return
 
+    # Prefer more confirmations first.
+    # Historical figures are secondary, not guarantees.
     candidates.sort(
-        key=lambda x: (
-            x["winrate"],
-            x["total"],
-            x["score"],
-            x["payout"]
+        key=lambda item: (
+            item["score"],
+            item["total"] >= MIN_TEST_TRADES,
+            item["winrate"],
+            item["payout"]
         ),
         reverse=True
     )
 
     best = candidates[0]
 
-    # Re-fetch the selected pair to verify the setup is still current.
+    # Re-fetch the selected pair before sending.
     print("\nRechecking best pair:", best["symbol"])
 
     fresh_candles, fresh_gaps = get_candles(best["symbol"])
@@ -660,10 +753,7 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    if (
-        isinstance(fresh_gaps, dict)
-        and fresh_gaps.get("missingBars", 0) > 0
-    ):
+    if has_missing_gaps(fresh_gaps):
         reasons["Candle gaps"] += 1
         no_signal(pairs, reasons)
         return
@@ -676,35 +766,47 @@ def main():
         no_signal(pairs, reasons)
         return
 
-    # Make sure the newest candle is recent.
+    # Check that the latest completed candle is recent.
     newest = fresh_candles[-1]["time"] - OTC_OFFSET
     age = time.time() - (newest + TIMEFRAME)
 
-    if age > 90:
+    if age < 0 or age > 90:
         reasons["API/data errors"] += 1
         no_signal(pairs, reasons)
         return
 
-    # Entry time is calculated after the final verification.
+    # Calculate entry time after the final verification.
     entry = entry_time()
-    now_text = florida_now().strftime("%Y-%m-%d %I:%M:%S %p")
 
-    icon = "🟢" if best["direction"] == "CALL" else "🔴"
+    now_text = florida_now().strftime(
+        "%Y-%m-%d %I:%M:%S %p"
+    )
+
+    icon = (
+        "🟢" if fresh_direction == "CALL"
+        else "🔴"
+    )
+
+    confirmations_list = (
+        fresh_votes["call_reasons"]
+        if fresh_direction == "CALL"
+        else fresh_votes["put_reasons"]
+    )
+
     confirmations = "\n".join(
-        f"• {item}" for item in (
-            fresh_votes["call_reasons"]
-            if fresh_direction == "CALL"
-            else fresh_votes["put_reasons"]
-        )
+        f"• {item}"
+        for item in confirmations_list
     )
 
     message = (
-        "🤖 ROMARIO TRADER PRO 8.1\n\n"
-        f"{icon} {best['direction']}\n\n"
+        "🤖 ROMARIO TRADER PRO 8.2\n\n"
+        f"{icon} {fresh_direction}\n\n"
         f"💱 PAIR: {best['symbol']}\n"
         f"💰 PAYOUT: {best['payout']:.1f}%\n"
-        f"📊 STRATEGY VOTES: {fresh_votes[fresh_direction]}/4\n"
-        f"📈 HISTORICAL WIN RATE: {best['winrate']:.1f}%\n"
+        f"📊 STRATEGY VOTES: "
+        f"{fresh_votes[fresh_direction]}/4\n"
+        f"📈 HISTORICAL WIN RATE: "
+        f"{best['winrate']:.1f}%\n"
         f"🧪 HISTORICAL SIGNALS: {best['total']}\n"
         "⏱ TIMEFRAME: M1\n"
         "⌛ EXPIRATION: 60 SECONDS\n"
@@ -712,12 +814,14 @@ def main():
         "📌 CONFIRMATIONS:\n"
         f"{confirmations}\n\n"
         f"🕒 FLORIDA TIME: {now_text}\n\n"
-        "⚠️ Historical performance is not a guarantee."
+        "⚠️ Historical results do not guarantee a win."
     )
 
     print(message)
     telegram(message)
 
+
+# ---------------- RUN ----------------
 
 if __name__ == "__main__":
     try:
@@ -727,10 +831,10 @@ if __name__ == "__main__":
         logging.exception("BOT FAILED")
 
         error_message = (
-            "🤖 ROMARIO TRADER PRO 8.1\n\n"
+            "🤖 ROMARIO TRADER PRO 8.2\n\n"
             "⚠️ BOT ERROR\n"
             f"{str(exc)[:400]}\n"
-            f"🕒 FLORIDA TIME: "
+            "🕒 FLORIDA TIME: "
             f"{florida_now().strftime('%Y-%m-%d %I:%M:%S %p')}"
         )
 
