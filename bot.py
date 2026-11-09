@@ -6,14 +6,12 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ==================================================
-# ROMARIO TRADER PRO 9.0
-# EMA 50 + STOCHASTIC 14,3
-# OTC ONLY - ALERT ONLY
+# ROMARIO TRADER PRO 9.2
+# OTC ONLY | EMA50 + STOCHASTIC 14,3
+# MANUAL RUN | ALERT ONLY
 # ==================================================
 
 BASE_URL = "https://otcharts.com"
-SYMBOLS_ENDPOINT = "/v1/symbols"
-CANDLES_ENDPOINT = "/v1/candles"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -31,12 +29,12 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/9.0"
+    "User-Agent": "ROMARIO-TRADER-PRO/9.2"
 })
 
 
 # ==================================================
-# GENERAL HELPERS
+# TIME
 # ==================================================
 
 def florida_time():
@@ -51,6 +49,37 @@ def log(message):
     )
 
 
+# ==================================================
+# TELEGRAM
+# ==================================================
+
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram credentials missing.")
+        return
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    response = requests.post(
+        url,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        },
+        timeout=20
+    )
+
+    response.raise_for_status()
+
+
+# ==================================================
+# API
+# ==================================================
+
 def extract_list(data, keys):
     if isinstance(data, list):
         return data
@@ -58,7 +87,6 @@ def extract_list(data, keys):
     if isinstance(data, dict):
         for key in keys:
             value = data.get(key)
-
             if isinstance(value, list):
                 return value
 
@@ -71,38 +99,9 @@ def extract_list(data, keys):
     return []
 
 
-def telegram_send(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials are missing.")
-        return
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
-    try:
-        response = requests.post(
-            url,
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML"
-            },
-            timeout=20
-        )
-
-        response.raise_for_status()
-
-    except Exception as exc:
-        log(f"Telegram error: {exc}")
-
-
 def api_get(endpoint, params=None):
-    url = BASE_URL + endpoint
-
     response = SESSION.get(
-        url,
+        BASE_URL + endpoint,
         params=params,
         timeout=30
     )
@@ -112,12 +111,12 @@ def api_get(endpoint, params=None):
 
 
 # ==================================================
-# OTC SYMBOLS / PAYOUT
+# FIND ALL QUALIFYING OTC FOREX PAIRS
 # ==================================================
 
 def get_pairs():
     data = api_get(
-        SYMBOLS_ENDPOINT,
+        "/v1/symbols",
         {"venue": "otc"}
     )
 
@@ -139,13 +138,13 @@ def get_pairs():
             or ""
         )
 
-        # OTC ONLY - NO REAL MARKETS
+        # OTC ONLY
         if not name.lower().endswith("_otc"):
             continue
 
         base = name[:-4]
 
-        # Six-letter forex pairs only
+        # Forex currency pairs only
         if len(base) != 6 or not base.isalpha():
             continue
 
@@ -182,17 +181,17 @@ def get_pairs():
         reverse=True
     )
 
-    # ALL qualifying OTC forex pairs, no 12-pair limit
+    # No 12-pair limit
     return pairs
 
 
 # ==================================================
-# CANDLE DATA
+# CANDLES
 # ==================================================
 
 def get_candles(symbol):
     data = api_get(
-        CANDLES_ENDPOINT,
+        "/v1/candles",
         {
             "venue": "otc",
             "symbol": symbol,
@@ -224,10 +223,18 @@ def get_candles(symbol):
 
             candle = {
                 "time": timestamp,
-                "open": float(row.get("open", row.get("o"))),
-                "high": float(row.get("high", row.get("h"))),
-                "low": float(row.get("low", row.get("l"))),
-                "close": float(row.get("close", row.get("c")))
+                "open": float(
+                    row.get("open", row.get("o"))
+                ),
+                "high": float(
+                    row.get("high", row.get("h"))
+                ),
+                "low": float(
+                    row.get("low", row.get("l"))
+                ),
+                "close": float(
+                    row.get("close", row.get("c"))
+                )
             }
 
             candles.append(candle)
@@ -235,10 +242,10 @@ def get_candles(symbol):
         except (ValueError, TypeError):
             continue
 
-    unique = {}
-
-    for candle in candles:
-        unique[candle["time"]] = candle
+    unique = {
+        candle["time"]: candle
+        for candle in candles
+    }
 
     candles = sorted(
         unique.values(),
@@ -247,12 +254,11 @@ def get_candles(symbol):
 
     now = time.time()
 
-    completed = [
+    # Completed candles only
+    return [
         candle for candle in candles
         if candle["time"] - OTC_OFFSET + TIMEFRAME <= now
     ]
-
-    return completed
 
 
 # ==================================================
@@ -268,12 +274,10 @@ def calculate_ema(values, period):
     ema = [sum(values[:period]) / period]
 
     for value in values[period:]:
-        next_value = (
+        ema.append(
             value * multiplier
             + ema[-1] * (1 - multiplier)
         )
-
-        ema.append(next_value)
 
     return [None] * (period - 1) + ema
 
@@ -360,7 +364,10 @@ def strategy_votes(candles):
     previous_k = k_values[previous]
     previous_d = d_values[previous]
 
-    values = [close, ema, k, d, previous_k, previous_d]
+    values = [
+        close, ema, k, d,
+        previous_k, previous_d
+    ]
 
     if any(value is None for value in values):
         return result
@@ -376,19 +383,38 @@ def strategy_votes(candles):
     uptrend = close > ema
     downtrend = close < ema
 
-    crossed_up = previous_k <= previous_d and k > d
-    crossed_down = previous_k >= previous_d and k < d
+    crossed_up = (
+        previous_k <= previous_d and k > d
+    )
 
-    if uptrend and crossed_up and k < 30 and bullish_momentum:
+    crossed_down = (
+        previous_k >= previous_d and k < d
+    )
+
+    # CALL
+    if (
+        uptrend
+        and crossed_up
+        and k < 30
+        and bullish_momentum
+    ):
         result["CALL"] = 1
         result["score"] = 1 + (30 - k) / 30
+
         result["call_reasons"].append(
             f"EMA50 uptrend + Stochastic bullish cross ({k:.1f})"
         )
 
-    elif downtrend and crossed_down and k > 70 and bearish_momentum:
+    # PUT
+    elif (
+        downtrend
+        and crossed_down
+        and k > 70
+        and bearish_momentum
+    ):
         result["PUT"] = 1
         result["score"] = 1 + (k - 70) / 30
+
         result["put_reasons"].append(
             f"EMA50 downtrend + Stochastic bearish cross ({k:.1f})"
         )
@@ -407,25 +433,50 @@ def get_direction(votes):
 
 
 # ==================================================
-# ENTRY TIME
+# WAIT UNTIL 15 SECONDS BEFORE ENTRY
 # ==================================================
 
-def entry_time():
+def wait_for_entry():
     now = florida_time()
 
-    next_minute = (
+    # Next M1 minute boundary
+    entry = (
         now.replace(second=0, microsecond=0)
         + timedelta(minutes=1)
     )
 
-    return next_minute.strftime("%I:%M:%S %p")
+    send_at = entry - timedelta(seconds=15)
+
+    # If the 15-second alert time has passed,
+    # use the following M1 candle instead.
+    if send_at <= now:
+        entry += timedelta(minutes=1)
+        send_at = entry - timedelta(seconds=15)
+
+    log(
+        "Signal selected. Waiting for "
+        + send_at.strftime("%I:%M:%S %p")
+        + " Florida time."
+    )
+
+    while True:
+        remaining = (
+            send_at - florida_time()
+        ).total_seconds()
+
+        if remaining <= 0:
+            break
+
+        time.sleep(min(remaining, 0.25))
+
+    return entry
 
 
 # ==================================================
 # SIGNAL MESSAGE
 # ==================================================
 
-def signal_message(pair, direction, votes):
+def signal_message(pair, direction, votes, entry):
     emoji = "🟢" if direction == "CALL" else "🔴"
 
     reasons = (
@@ -436,29 +487,32 @@ def signal_message(pair, direction, votes):
 
     reason_text = "\n".join(reasons)
 
+    sent_time = florida_time()
+
     return (
-        "🤖 <b>ROMARIO TRADER PRO 9.0</b>\n\n"
+        "🤖 <b>ROMARIO TRADER PRO 9.2</b>\n\n"
         f"{emoji} <b>{direction}</b>\n\n"
         f"💱 PAIR: <b>{pair['symbol']}</b>\n"
         f"💰 PAYOUT: <b>{pair['payout']:.1f}%</b>\n"
-        f"📊 TIMEFRAME: <b>M1</b>\n"
-        f"⌛ EXPIRATION: <b>60 SECONDS</b>\n"
-        f"🎯 ENTRY TIME: <b>{entry_time()} Florida</b>\n\n"
+        "📊 TIMEFRAME: <b>M1</b>\n"
+        "⌛ EXPIRATION: <b>60 SECONDS</b>\n\n"
+        f"🎯 ENTRY TIME: <b>{entry.strftime('%I:%M:%S %p')}</b>\n"
+        f"⚡ SIGNAL SENT: <b>{sent_time.strftime('%I:%M:%S %p')}</b>\n\n"
         f"📌 STRATEGY:\n{reason_text}\n\n"
         f"🕒 FLORIDA TIME: "
-        f"{florida_time().strftime('%Y-%m-%d %I:%M:%S %p')}"
+        f"{sent_time.strftime('%Y-%m-%d %I:%M:%S %p')}"
     )
 
 
 # ==================================================
-# NO SIGNAL MESSAGE
+# NO SIGNAL
 # ==================================================
 
 def no_signal_message(scanned, errors):
     return (
-        "🤖 <b>ROMARIO TRADER PRO 9.0</b>\n\n"
+        "🤖 <b>ROMARIO TRADER PRO 9.2</b>\n\n"
         "⚪ <b>NO VALID SIGNAL</b>\n"
-        "No pair passed the EMA50 + Stochastic rules.\n\n"
+        "No pair passed the strategy rules.\n\n"
         f"Pairs scanned: {scanned}\n"
         f"Minimum payout: {MIN_PAYOUT:.1f}%\n"
         "Market: OTC Forex only\n"
@@ -481,7 +535,7 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing Telegram credentials")
 
-    log("ROMARIO TRADER PRO 9.0 starting...")
+    log("ROMARIO TRADER PRO 9.2 starting...")
 
     pairs = get_pairs()
 
@@ -489,7 +543,7 @@ def main():
         telegram_send(
             no_signal_message(0, 0)
         )
-        log("No eligible OTC forex pairs.")
+        log("No eligible OTC pairs.")
         return
 
     log(f"Eligible OTC pairs found: {len(pairs)}")
@@ -502,13 +556,16 @@ def main():
         scanned += 1
         symbol = pair["symbol"]
 
-        log(f"Scanning {symbol} ({scanned}/{len(pairs)})...")
+        log(
+            f"Scanning {symbol} "
+            f"({scanned}/{len(pairs)})..."
+        )
 
         try:
             candles = get_candles(symbol)
 
             if len(candles) < 60:
-                log(f"{symbol}: insufficient completed candles.")
+                log(f"{symbol}: insufficient candles.")
                 continue
 
             votes = strategy_votes(candles)
@@ -522,6 +579,7 @@ def main():
                 })
 
                 log(f"{symbol}: {direction} setup found.")
+
             else:
                 log(f"{symbol}: no setup.")
 
@@ -536,6 +594,7 @@ def main():
         log("No valid signal.")
         return
 
+    # Choose one strongest qualifying signal
     candidates.sort(
         key=lambda item: (
             item["votes"]["score"],
@@ -546,17 +605,27 @@ def main():
 
     best = candidates[0]
 
+    log(
+        f"Best setup: {best['pair']['symbol']} "
+        f"{best['direction']}"
+    )
+
+    # Wait for 15 seconds before the entry minute
+    entry = wait_for_entry()
+
     message = signal_message(
         best["pair"],
         best["direction"],
-        best["votes"]
+        best["votes"],
+        entry
     )
 
     telegram_send(message)
 
     log(
         f"SIGNAL SENT: {best['pair']['symbol']} "
-        f"{best['direction']}"
+        f"{best['direction']} "
+        f"ENTRY: {entry.strftime('%I:%M:%S %p')}"
     )
 
 
@@ -567,10 +636,13 @@ if __name__ == "__main__":
     except Exception as exc:
         log(f"FATAL ERROR: {exc}")
 
-        telegram_send(
-            "⚠️ <b>ROMARIO TRADER PRO 9.0 ERROR</b>\n\n"
-            f"<code>{str(exc)[:800]}</code>\n\n"
-            f"🕒 {florida_time().strftime('%Y-%m-%d %I:%M:%S %p')}"
-        )
+        try:
+            telegram_send(
+                "⚠️ <b>ROMARIO TRADER PRO 9.2 ERROR</b>\n\n"
+                f"<code>{str(exc)[:800]}</code>\n\n"
+                f"🕒 {florida_time().strftime('%Y-%m-%d %I:%M:%S %p')}"
+            )
+        except Exception:
+            pass
 
         raise
