@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 4.3"
+VERSION = "ROMARIO TRADER PRO 4.4"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -23,7 +23,7 @@ TIMEOUT = 20
 MAX_WORKERS = 8
 MIN_PREP_SECONDS = 30
 MAX_SIGNAL_DELAY = 2
-MIN_PAYOUT = 80.0
+MIN_PAYOUT = 75.0
 
 CURRENCIES = set("""
 USD EUR GBP JPY CHF CAD AUD NZD
@@ -87,57 +87,9 @@ def send_telegram(message):
     if not result.get("ok"):
         raise RuntimeError("Telegram delivery not confirmed")
 
-    return result
-
-
-def get_payout(symbol):
-    """
-    Fail closed: no payout is accepted unless a verified
-    payout endpoint and response field are configured.
-
-    Do not invent an endpoint or assume payout from a symbol.
-    """
-    payout_endpoint = os.getenv("OTCHARTS_PAYOUT_ENDPOINT")
-    payout_field = os.getenv("OTCHARTS_PAYOUT_FIELD")
-
-    if not payout_endpoint or not payout_field:
-        log(f"PAYOUT NOT CONFIGURED: {symbol}")
-        return None
-
-    try:
-        data = api_get(
-            payout_endpoint,
-            {"venue": "otc", "symbol": symbol}
-        )
-
-        value = data
-
-        for key in payout_field.split("."):
-            if not isinstance(value, dict) or key not in value:
-                return None
-            value = value[key]
-
-        payout = float(value)
-
-        if 0 < payout <= 1:
-            payout *= 100
-
-        if not 0 < payout <= 100:
-            return None
-
-        return payout
-
-    except Exception as error:
-        log(f"PAYOUT ERROR {symbol}: {error}")
-        return None
-
 
 def get_symbols():
-    data = api_get(
-        "/v1/symbols",
-        {"venue": "otc"}
-    )
-
+    data = api_get("/v1/symbols", {"venue": "otc"})
     symbols = data.get("symbols", [])
 
     if not isinstance(symbols, list):
@@ -160,12 +112,27 @@ def get_symbols():
         if item.get("open") is False:
             continue
 
+        raw_payout = item.get("payout")
+
+        try:
+            payout = float(raw_payout)
+            if 0 < payout <= 1:
+                payout *= 100
+        except (TypeError, ValueError):
+            log(f"SKIP {symbol}: payout missing")
+            continue
+
+        if payout < MIN_PAYOUT or payout > 100:
+            log(f"SKIP {symbol}: payout {payout}")
+            continue
+
         result.append({
             "symbol": symbol,
-            "name": str(item.get("name", symbol))
+            "name": str(item.get("name", symbol)),
+            "payout": payout
         })
 
-    log(f"FOREX OTC PAIRS FOUND: {len(result)}")
+    log(f"PAIRS WITH PAYOUT >= {MIN_PAYOUT}%: {len(result)}")
     return result
 
 
@@ -213,8 +180,8 @@ def indicators(df):
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
 
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["rsi"] = 100 - (100 / (1 + rs))
@@ -226,12 +193,6 @@ def analyze(item):
     symbol = item["symbol"]
 
     try:
-        payout = get_payout(symbol)
-
-        if payout is None or payout < MIN_PAYOUT:
-            log(f"SKIP {symbol}: payout unavailable or below 80%")
-            return None
-
         m1 = get_candles(symbol, 60)
         m5 = get_candles(symbol, 300)
 
@@ -309,7 +270,7 @@ def analyze(item):
             "direction": direction,
             "score": score,
             "rsi": rsi,
-            "payout": payout,
+            "payout": item["payout"],
             "reference": float(last["close"]),
             "analyzed_at": utc_now()
         }
@@ -327,7 +288,9 @@ def schedule_entry(now):
     while entry < earliest:
         entry += timedelta(minutes=1)
 
-    return entry - timedelta(seconds=MIN_PREP_SECONDS), entry
+    signal_time = entry - timedelta(seconds=MIN_PREP_SECONDS)
+
+    return signal_time, entry
 
 
 def signal_message(signal, total, signal_time, entry_time):
@@ -359,7 +322,7 @@ def signal_message(signal, total, signal_time, entry_time):
         f"📍 REFERENCE PRICE: {signal['reference']:.6f}\n"
         f"📊 RSI: {signal['rsi']:.1f}\n"
         f"⭐ TECHNICAL SCORE: {signal['score']}/7\n"
-        f"💰 VERIFIED PAYOUT: {signal['payout']:.1f}%\n"
+        f"💰 PAYOUT: {signal['payout']:.1f}%\n"
         f"💱 PAIRS SCANNED: {total}\n"
         f"📉 HISTORICAL WIN RATE: NOT AVAILABLE\n\n"
         f"<i>Manual signal only. Demo testing recommended.</i>"
@@ -371,7 +334,7 @@ def main():
 
     log("=" * 45)
     log(VERSION)
-    log("MINIMUM VERIFIED PAYOUT: 80%")
+    log("MINIMUM PAYOUT: 75%")
     log("=" * 45)
 
     if not API_KEY:
@@ -403,16 +366,16 @@ def main():
         return
 
     if not symbols:
-        send_telegram(
-            f"🤖 <b>{VERSION}</b>\n"
-            f"⚪ WAIT\nNo recognized Forex OTC pairs."
-        )
+        log("NO PAIRS WITH VERIFIED PAYOUT >= 75%")
         return
 
     candidates = []
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = [executor.submit(analyze, item) for item in symbols]
+        futures = [
+            executor.submit(analyze, item)
+            for item in symbols
+        ]
 
         for future in as_completed(futures):
             result = future.result()
@@ -422,26 +385,29 @@ def main():
     elapsed = time.time() - started
 
     log(f"PAIRS FOUND: {len(symbols)}")
-    log(f"VALID CANDIDATES: {len(candidates)}")
+    log(f"VALID SIGNALS: {len(candidates)}")
     log(f"ANALYSIS TIME: {elapsed:.1f}s")
 
+    # Do not send a fake WAIT or a forced signal.
     if not candidates:
-        send_telegram(
-            f"🤖 <b>{VERSION}</b>\n\n"
-            f"⚪ <b>WAIT</b>\n"
-            f"No signal with verified payout of at least 80%.\n"
-            f"💱 PAIRS SCANNED: {len(symbols)}"
-        )
+        log("NO QUALIFIED SIGNAL. BOT FINISHED.")
         return
 
     candidates.sort(
-        key=lambda x: (x["score"], x["payout"], x["analyzed_at"]),
+        key=lambda x: (
+            x["score"],
+            x["payout"],
+            x["analyzed_at"]
+        ),
         reverse=True
     )
 
     best = candidates[0]
 
     signal_time, entry_time = schedule_entry(utc_now())
+
+    log(f"SELECTED: {best['direction']} {best['symbol']}")
+    log(f"PAYOUT: {best['payout']}%")
 
     wait_seconds = (signal_time - utc_now()).total_seconds()
 
@@ -454,18 +420,20 @@ def main():
     remaining = (entry_time - actual_send).total_seconds()
 
     if delay > MAX_SIGNAL_DELAY or remaining < 28:
-        send_telegram(
-            f"🤖 <b>{VERSION}</b>\n"
-            f"⚪ <b>WAIT</b>\n"
-            f"Signal timing missed. No late entry."
-        )
+        log("SIGNAL TIMING MISSED. NOT SENDING LATE ENTRY.")
         return
 
     send_telegram(
-        signal_message(best, len(symbols), signal_time, entry_time)
+        signal_message(
+            best,
+            len(symbols),
+            signal_time,
+            entry_time
+        )
     )
 
     log("SIGNAL SENT.")
+    log("BOT FINISHED.")
 
 
 if __name__ == "__main__":
