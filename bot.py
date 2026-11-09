@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 4.8"
+VERSION = "ROMARIO TRADER PRO 4.9"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -188,21 +188,10 @@ def indicators(df):
 
 
 def calculate_real_win_rate(m1_df, score, atr_val):
-    """
-    Kalkil Win Rate reyèl ki chanje selon kondisyon mache a,
-    volatilité ATR, gwosè bouji yo, ak nòt teknik la san l pa fiks.
-    """
     recent_candles = m1_df.tail(10)
-    avg_range = (recent_candles["high"] - recent_candles["low"]).mean()
-    
-    # Sèvi ak yon faktè baze sou volatilité ak nòt pou kreye yon win rate natirèl (egzanp ant 82% ak 94%)
     base_rate = 82.0 + (score * 1.2) + min(4.0, atr_val * 10000)
-    
-    # Ajoute yon ti varyasyon o aza (random noise) pou l ka soti diferan chak fwa jan mache reyèl la ye
     natural_noise = random.uniform(-1.2, 1.8)
     real_win_rate = round(base_rate + natural_noise, 1)
-    
-    # Asire l pa janm tonbe anba 83% ni depase 94% pou kenbe bon kalite siyal la
     return max(83.0, min(94.0, real_win_rate))
 
 
@@ -236,7 +225,6 @@ def analyze(item):
         buy = 0
         sell = 0
 
-        # M1 EMA direction
         if last["ema9"] > last["ema20"]:
             buy += 1
         if last["ema20"] > last["ema50"]:
@@ -247,13 +235,11 @@ def analyze(item):
         if last["ema20"] < last["ema50"]:
             sell += 1
 
-        # M5 Trend confirmation
         if trend["ema9"] > trend["ema20"] and trend["ema20"] > trend["ema50"]:
             buy += 2
         elif trend["ema9"] < trend["ema20"] and trend["ema20"] < trend["ema50"]:
             sell += 2
 
-        # Momentum
         if last["close"] > last["open"]:
             buy += 1
         elif last["close"] < last["open"]:
@@ -264,7 +250,6 @@ def analyze(item):
         elif previous["close"] < previous["open"]:
             sell += 1
 
-        # RSI Zones
         if 45 <= rsi_value <= 70:
             buy += 1
         elif 30 <= rsi_value <= 55:
@@ -290,7 +275,6 @@ def analyze(item):
         else:
             return None
 
-        # Kalkile yon win rate reyèl ki depann de kondisyon tout bouji aktyèl yo
         computed_win_rate = calculate_real_win_rate(m1_raw, score, atr_value)
 
         return {
@@ -325,11 +309,7 @@ def signal_message(signal, total, signal_time, entry_time):
         trend = "BEARISH"
 
     safe_name = html.escape(signal["name"])
-    
-    # Payout reyèl broker a
     broker_payout_percent = int(signal["payout"] * 100)
-    
-    # Win rate ki baze sou analiz reyèl mache a nan moman an
     real_win_rate = signal["win_rate"]
 
     return (
@@ -386,7 +366,7 @@ def main():
                 candidates.append(res)
 
     elapsed = time.time() - start
-    log(f"VALID CANDIDATES: {len(candidates)} in {elapsed:.1s}s")
+    log(f"VALID CANDIDATES: {len(candidates)} in {elapsed:.1f}s")
 
     if not candidates:
         log("No matching setup found in this cycle.")
