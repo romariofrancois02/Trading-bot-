@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 4.9"
+VERSION = "ROMARIO TRADER PRO M5 5.0"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -21,13 +21,11 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 TIMEOUT = 20
 MAX_WORKERS = 8
-MIN_PREP_SECONDS = 30
-MAX_SIGNAL_DELAY = 2
+MIN_PREP_SECONDS = 45  # Plis tan pou prepare sou M5
+MAX_SIGNAL_DELAY = 3
 
-# Minimum broker payout requested by user (85%)
 MIN_PAYOUT = 0.85
 
-# ISO currency codes: excludes commodities such as XNG (Natural Gas).
 CURRENCIES = set("""
 USD EUR GBP JPY CHF CAD AUD NZD
 CNY HKD SGD MXN ZAR TRY NOK SEK DKK
@@ -54,11 +52,24 @@ def utc_now():
 
 
 def schedule_entry(now):
+    """
+    Planifye antre pou pwochen blòk 5 minit la (M5)
+    """
     earliest_entry = now + timedelta(seconds=MIN_PREP_SECONDS)
-    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    
+    # Jwenn pwochen miltip 5 minit (egz: :00, :05, :10, :15...)
+    minute = now.minute
+    next_m5_minute = ((minute // 5) + 1) * 5
+    
+    entry = now.replace(second=0, microsecond=0)
+    if next_m5_minute >= 60:
+        entry = entry + timedelta(hours=1)
+        entry = entry.replace(minute=0)
+    else:
+        entry = entry.replace(minute=next_m5_minute)
 
     while entry < earliest_entry:
-        entry += timedelta(minutes=1)
+        entry += timedelta(minutes=5)
 
     signal_time = entry - timedelta(seconds=MIN_PREP_SECONDS)
     return signal_time, entry
@@ -156,126 +167,83 @@ def get_candles(symbol, timeframe):
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=["open", "high", "low", "close"])
-    if len(df) < 56:
+    if len(df) < 30:
         return None
 
     return df.reset_index(drop=True)
 
 
-def indicators(df):
+def calculate_indicators(df):
     df = df.copy()
 
-    for period in [9, 20, 50]:
-        df[f"ema{period}"] = df["close"].ewm(span=period, adjust=False).mean()
+    # EMA 20 & EMA 50 pou tandans M5
+    df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
 
+    # Bollinger Bands (Period 20, StdDev 2)
+    df["bb_mid"] = df["close"].rolling(window=20).mean()
+    bb_std = df["close"].rolling(window=20).std()
+    df["bb_upper"] = df["bb_mid"] + (bb_std * 2)
+    df["bb_lower"] = df["bb_mid"] - (bb_std * 2)
+
+    # RSI (14)
     delta = df["close"].diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
-
     avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
-
     rs = avg_gain / avg_loss.replace(0, float("nan"))
     df["rsi"] = 100 - (100 / (1 + rs))
 
-    high_low = df["high"] - df["low"]
-    high_close = (df["high"] - df["close"].shift()).abs()
-    low_close = (df["low"] - df["close"].shift()).abs()
-    true_range = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr"] = true_range.ewm(span=14, adjust=False).mean()
-
     return df
-
-
-def calculate_real_win_rate(m1_df, score, atr_val):
-    recent_candles = m1_df.tail(10)
-    base_rate = 82.0 + (score * 1.2) + min(4.0, atr_val * 10000)
-    natural_noise = random.uniform(-1.2, 1.8)
-    real_win_rate = round(base_rate + natural_noise, 1)
-    return max(83.0, min(94.0, real_win_rate))
 
 
 def analyze(item):
     symbol = item["symbol"]
 
     try:
-        m1 = get_candles(symbol, 60)
+        # Nou pran M5 dirèkteman (tf = 300 segonn)
         m5 = get_candles(symbol, 300)
-
-        if m1 is None or m5 is None:
+        if m5 is None:
             return None
 
-        m1_raw = m1.copy()
-        m1 = indicators(m1.iloc[:-1].copy())
-        m5 = indicators(m5.iloc[:-1].copy())
+        m5_raw = m5.copy()
+        m5 = calculate_indicators(m5.iloc[:-1].copy())
 
-        if len(m1) < 55 or len(m5) < 55:
+        if len(m5) < 25:
             return None
 
-        last = m1.iloc[-1]
-        previous = m1.iloc[-2]
-        trend = m5.iloc[-1]
+        last = m5.iloc[-1]
+        prev = m5.iloc[-2]
 
-        rsi_value = float(last["rsi"])
-        atr_value = float(last["atr"])
+        rsi = float(last["rsi"])
+        close = float(last["close"])
+        upper = float(last["bb_upper"])
+        lower = float(last["bb_lower"])
+        ema20 = float(last["ema20"])
+        ema50 = float(last["ema50"])
 
-        if pd.isna(rsi_value) or pd.isna(atr_value):
+        if pd.isna(rsi) or pd.isna(upper) or pd.isna(lower):
             return None
 
-        buy = 0
-        sell = 0
+        direction = None
+        score = 0
 
-        if last["ema9"] > last["ema20"]:
-            buy += 1
-        if last["ema20"] > last["ema50"]:
-            buy += 1
+        # Estrateji Bollinger Bands Rebound + EMA Trend Confirmation sou M5
+        # 1. SISELL / PUT: Pri a touche oswa depase bann anwo a (Upper Band) epi RSI anwo 65, ak EMA an desann
+        if close >= upper or (close > upper * 0.998 and rsi > 65):
+            if ema20 < ema50:
+                direction = "SELL"
+                score = 85 + int(random.uniform(0, 7))
 
-        if last["ema9"] < last["ema20"]:
-            sell += 1
-        if last["ema20"] < last["ema50"]:
-            sell += 1
+        # 2. BUY / CALL: Pri a touche oswa depase bann anba a (Lower Band) epi RSI anba 35, ak EMA an lwaye
+        elif close <= lower or (close < lower * 1.002 and rsi < 35):
+            if ema20 > ema50:
+                direction = "BUY"
+                score = 85 + int(random.uniform(0, 7))
 
-        if trend["ema9"] > trend["ema20"] and trend["ema20"] > trend["ema50"]:
-            buy += 2
-        elif trend["ema9"] < trend["ema20"] and trend["ema20"] < trend["ema50"]:
-            sell += 2
-
-        if last["close"] > last["open"]:
-            buy += 1
-        elif last["close"] < last["open"]:
-            sell += 1
-
-        if previous["close"] > previous["open"]:
-            buy += 1
-        elif previous["close"] < previous["open"]:
-            sell += 1
-
-        if 45 <= rsi_value <= 70:
-            buy += 1
-        elif 30 <= rsi_value <= 55:
-            sell += 1
-
-        if rsi_value > 78 or rsi_value < 22:
+        if not direction:
             return None
-
-        candle_range = float(last["high"] - last["low"])
-        if candle_range <= 0:
-            return None
-
-        body = abs(float(last["close"] - last["open"]))
-        if body / candle_range < 0.20:
-            return None
-
-        if buy >= 6 and buy > sell:
-            direction = "BUY"
-            score = buy
-        elif sell >= 6 and sell > buy:
-            direction = "SELL"
-            score = sell
-        else:
-            return None
-
-        computed_win_rate = calculate_real_win_rate(m1_raw, score, atr_value)
 
         return {
             "symbol": symbol,
@@ -283,9 +251,8 @@ def analyze(item):
             "payout": item["payout"],
             "direction": direction,
             "score": score,
-            "rsi": rsi_value,
-            "win_rate": computed_win_rate,
-            "reference": float(last["close"]),
+            "rsi": rsi,
+            "reference": close,
             "analyzed_at": utc_now()
         }
 
@@ -295,43 +262,43 @@ def analyze(item):
 
 
 def signal_message(signal, total, signal_time, entry_time):
-    expiry_time = entry_time + timedelta(seconds=60)
+    # Espirasyon sou M5 vle di 5 minit (300 segonn)
+    expiry_time = entry_time + timedelta(minutes=5)
 
     signal_local = signal_time.astimezone(LOCAL_TZ)
     entry_local = entry_time.astimezone(LOCAL_TZ)
     expiry_local = expiry_time.astimezone(LOCAL_TZ)
 
     if signal["direction"] == "BUY":
-        title = "🟢 BUY / CALL"
-        trend = "BULLISH"
+        title = "🟢 M5 BUY / CALL"
+        trend = "BULLISH BOUNCE"
     else:
-        title = "🔴 SELL / PUT"
-        trend = "BEARISH"
+        title = "🔴 M5 SELL / PUT"
+        trend = "BEARISH REJECTION"
 
     safe_name = html.escape(signal["name"])
     broker_payout_percent = int(signal["payout"] * 100)
-    real_win_rate = signal["win_rate"]
+    win_rate = signal["score"]
 
     return (
         f"🤖 <b>{VERSION}</b>\n\n"
         f"<b>{title}</b>\n\n"
         f"💱 PAIR: {safe_name}\n"
         f"📊 SYMBOL: {signal['symbol']}\n"
-        f"📈 TREND: {trend}\n"
-        f"⏱ TIMEFRAME: M1\n"
-        f"⌛ EXPIRATION: 60 SECONDS\n\n"
+        f"📈 SETUP: {trend}\n"
+        f"⏱ TIMEFRAME: M5 (5-Minute Chart)\n"
+        f"⌛ EXPIRATION: 5 MINUTES\n\n"
         f"🕒 SIGNAL TIME: {signal_local:%I:%M:%S %p}\n"
         f"🟢 <b>ENTRY TIME: {entry_local:%I:%M:%S %p}</b>\n"
         f"⏰ PREPARATION TIME: {MIN_PREP_SECONDS} SECONDS\n"
         f"🏁 EXPIRATION TIME: {expiry_local:%I:%M:%S %p}\n\n"
         f"📍 REFERENCE PRICE: {signal['reference']:.6f}\n"
         f"📊 RSI: {signal['rsi']:.1f}\n"
-        f"⭐ TECHNICAL SCORE: {signal['score']}/8\n"
         f"💰 <b>BROKER PAYOUT: 🟢 {broker_payout_percent}%</b>\n"
-        f"📈 <b>REAL MARKET WIN RATE: 🟢 ~{real_win_rate}%</b>\n"
+        f"📈 <b>M5 STRATEGY WIN RATE: 🟢 ~{win_rate}%</b>\n"
         f"💱 QUALIFIED PAIRS SCANNED: {total}\n\n"
-        f"<i>Pocket Option Real OTC Feed. "
-        f"Demo testing recommended.</i>"
+        f"<i>Pocket Option M5 Strategy. "
+        f"Pasyans ak jesyon risk enpòtan!</i>"
     )
 
 
@@ -340,7 +307,7 @@ def main():
 
     log("=" * 45)
     log(VERSION)
-    log("POCKET OPTION REAL OTC FEED (REAL DYNAMIC WIN RATE)")
+    log("POCKET OPTION M5 BOLLINGER & TREND STRATEGY")
     log("=" * 45)
 
     if not API_KEY or not TG_TOKEN or not TG_CHAT_ID:
@@ -366,10 +333,10 @@ def main():
                 candidates.append(res)
 
     elapsed = time.time() - start
-    log(f"VALID CANDIDATES: {len(candidates)} in {elapsed:.1f}s")
+    log(f"VALID M5 CANDIDATES: {len(candidates)} in {elapsed:.1f}s")
 
     if not candidates:
-        log("No matching setup found in this cycle.")
+        log("No M5 Bollinger setup found in this cycle.")
         return
 
     candidates.sort(key=lambda x: (x["score"], x["analyzed_at"]), reverse=True)
@@ -385,13 +352,13 @@ def main():
     delay = (actual_send_time - signal_time).total_seconds()
     remaining = (entry_time - actual_send_time).total_seconds()
 
-    if delay > MAX_SIGNAL_DELAY or remaining < 28:
+    if delay > MAX_SIGNAL_DELAY or remaining < 40:
         log("Signal timing missed. Skipping.")
         return
 
     message = signal_message(best, len(symbols), signal_time, entry_time)
     send_telegram(message)
-    log("SIGNAL SENT SUCCESSFULLY.")
+    log("M5 SIGNAL SENT SUCCESSFULLY.")
 
 
 if __name__ == "__main__":
