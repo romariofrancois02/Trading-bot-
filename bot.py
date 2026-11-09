@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-VERSION = "ROMARIO TRADER PRO 6.1"
+VERSION = "ROMARIO TRADER PRO 6.2"
 
 API_KEY = os.getenv("OTCHARTS_API_KEY")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -21,12 +21,14 @@ LOCAL_TZ = ZoneInfo("America/New_York")
 
 TIMEOUT = 20
 MAX_WORKERS = 8
-
 MIN_PREP_SECONDS = 30
 MAX_SIGNAL_DELAY = 2
 
-# 92% minimum payout
 MIN_PAYOUT = 0.92
+
+SR_LOOKBACK = 20
+STOCH_PERIOD = 14
+STOCH_SMOOTH = 3
 
 CURRENCIES = set("""
 USD EUR GBP JPY CHF CAD AUD NZD
@@ -54,24 +56,25 @@ def utc_now():
 
 
 def florida_time(dt=None):
-    if dt is None:
-        dt = utc_now()
-    return dt.astimezone(LOCAL_TZ)
+    return (dt or utc_now()).astimezone(LOCAL_TZ)
 
 
 def api_get(path, params=None):
-    url = BASE_URL + path
-    response = session.get(url, params=params, timeout=TIMEOUT)
+    response = session.get(
+        BASE_URL + path,
+        params=params,
+        timeout=TIMEOUT
+    )
     response.raise_for_status()
     return response.json()
 
 
-def extract_list(data, possible_keys):
+def extract_list(data, keys):
     if isinstance(data, list):
         return data
 
     if isinstance(data, dict):
-        for key in possible_keys:
+        for key in keys:
             value = data.get(key)
             if isinstance(value, list):
                 return value
@@ -87,9 +90,9 @@ def normalize_payout(raw):
         value = float(str(raw).replace("%", "").strip())
 
         if value > 1:
-            value /= 100.0
+            value /= 100
 
-        if value <= 0 or value > 1:
+        if not 0 < value <= 1:
             return None
 
         return value
@@ -100,18 +103,11 @@ def normalize_payout(raw):
 
 def get_symbols():
     data = api_get("/v1/symbols", {"venue": "otc"})
+    items = extract_list(data, ["symbols", "data"])
 
-    symbols = extract_list(data, ["symbols", "data"])
+    results = []
 
-    if not symbols:
-        log("WARNING: No symbols returned by OTCharts.")
-        if isinstance(data, dict):
-            log(f"API response keys: {list(data.keys())}")
-        return []
-
-    result = []
-
-    for item in symbols:
+    for item in items:
         if not isinstance(item, dict):
             continue
 
@@ -133,36 +129,28 @@ def get_symbols():
         if item.get("open") is False:
             continue
 
-        # Never invent a payout if API does not provide one.
-        raw_payout = item.get("payout")
+        payout = normalize_payout(
+            item.get("payout", item.get("profit"))
+        )
 
-        if raw_payout is None:
-            raw_payout = item.get("profit")
-
-        payout = normalize_payout(raw_payout)
-
-        if payout is None:
+        if payout is None or payout < MIN_PAYOUT:
             continue
 
-        if payout < MIN_PAYOUT:
-            continue
-
-        result.append({
+        results.append({
             "symbol": symbol,
             "name": str(item.get("name", symbol)),
             "payout": payout
         })
 
-    log(f"FOREX OTC PAIRS WITH PAYOUT >= 92%: {len(result)}")
+    log(f"FOREX OTC PAIRS WITH PAYOUT >= 92%: {len(results)}")
+    return results
 
-    return result
 
-
-def get_candles(symbol, timeframe):
+def get_candles(symbol):
     data = api_get("/v1/candles", {
         "venue": "otc",
         "symbol": symbol,
-        "tf": timeframe,
+        "tf": 60,
         "limit": 100
     })
 
@@ -177,134 +165,174 @@ def get_candles(symbol, timeframe):
 
     for col in required:
         if col not in df.columns:
-            log(f"{symbol}: Missing candle field {col}")
+            log(f"{symbol}: missing {col} candle field")
             return None
 
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df = df.dropna(subset=required).reset_index(drop=True)
 
-    if len(df) < 60:
+    if len(df) < 40:
         return None
 
     return df
 
 
-def calculate_indicators(df):
-    df = df.copy()
+def calculate_stochastic(df):
+    lowest = df["low"].rolling(STOCH_PERIOD).min()
+    highest = df["high"].rolling(STOCH_PERIOD).max()
 
-    # EMA 50
-    df["ema50"] = df["close"].ewm(
-        span=50,
-        adjust=False
-    ).mean()
+    difference = (highest - lowest).replace(0, float("nan"))
 
-    # Bollinger Bands: 20 / 2
-    df["bb_mid"] = df["close"].rolling(20).mean()
+    raw_k = 100 * (df["close"] - lowest) / difference
 
-    bb_std = df["close"].rolling(20).std()
-
-    df["bb_upper"] = df["bb_mid"] + (bb_std * 2)
-    df["bb_lower"] = df["bb_mid"] - (bb_std * 2)
-
-    # RSI 14
-    delta = df["close"].diff()
-
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    avg_loss = loss.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-
-    df["rsi"] = 100 - (100 / (1 + rs))
+    df["stoch_k"] = raw_k
+    df["stoch_d"] = raw_k.rolling(STOCH_SMOOTH).mean()
 
     return df
+
+
+def candle_patterns(previous, current):
+    body = abs(current["close"] - current["open"])
+    full_range = max(current["high"] - current["low"], 1e-10)
+
+    upper_wick = current["high"] - max(
+        current["open"], current["close"]
+    )
+
+    lower_wick = min(
+        current["open"], current["close"]
+    ) - current["low"]
+
+    bullish = (
+        current["close"] > current["open"]
+        and (
+            lower_wick >= body * 2
+            or (
+                previous["close"] < previous["open"]
+                and current["close"] > current["open"]
+                and current["open"] <= previous["close"]
+                and current["close"] >= previous["open"]
+            )
+        )
+    )
+
+    bearish = (
+        current["close"] < current["open"]
+        and (
+            upper_wick >= body * 2
+            or (
+                previous["close"] > previous["open"]
+                and current["close"] < current["open"]
+                and current["open"] >= previous["close"]
+                and current["close"] <= previous["open"]
+            )
+        )
+    )
+
+    return bullish, bearish, upper_wick, lower_wick, full_range
 
 
 def analyze(item):
     symbol = item["symbol"]
 
     try:
-        raw = get_candles(symbol, 60)
+        raw = get_candles(symbol)
 
         if raw is None:
             return None
 
-        # Retain the original strategy's approach:
-        # assume the final API row is the currently forming candle.
-        # This depends on OTCharts returning candles oldest to newest.
-        closed = raw.iloc[:-1].copy()
+        # Assumption: API returns candles oldest to newest,
+        # with the final row being the currently forming candle.
+        # Confirm this against actual OTCharts timestamps.
+        df = raw.iloc[:-1].copy().reset_index(drop=True)
 
-        if len(closed) < 55:
+        if len(df) < 40:
             return None
 
-        df = calculate_indicators(closed)
+        df = calculate_stochastic(df)
 
-        last = df.iloc[-1]
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
 
-        values = [
-            last["open"],
-            last["high"],
-            last["low"],
-            last["close"],
-            last["rsi"],
-            last["ema50"],
-            last["bb_upper"],
-            last["bb_lower"]
-        ]
+        k = float(current["stoch_k"])
+        d = float(current["stoch_d"])
 
-        if any(pd.isna(value) for value in values):
+        if pd.isna(k) or pd.isna(d):
             return None
 
-        open_price = float(last["open"])
-        high = float(last["high"])
-        low = float(last["low"])
-        close = float(last["close"])
-        rsi = float(last["rsi"])
-        ema50 = float(last["ema50"])
-        upper = float(last["bb_upper"])
-        lower = float(last["bb_lower"])
+        # Levels use earlier candles, excluding current candle.
+        history = df.iloc[-(SR_LOOKBACK + 1):-1]
 
-        # Original 3-step strategy.
-        # PUT: Upper Band + RSI >= 70 + price below EMA50.
-        put_checks = [
-            high >= upper,
-            rsi >= 70,
-            close < ema50
-        ]
+        support = float(history["low"].min())
+        resistance = float(history["high"].max())
 
-        # CALL: Lower Band + RSI <= 30 + price above EMA50.
+        close = float(current["close"])
+        open_price = float(current["open"])
+        high = float(current["high"])
+        low = float(current["low"])
+
+        price_range = max(high - low, 1e-10)
+
+        # Tolerance: 15% of the recent average candle range.
+        average_range = float(
+            (history["high"] - history["low"]).mean()
+        )
+
+        tolerance = max(
+            average_range * 0.15,
+            close * 0.00005
+        )
+
+        near_support = abs(low - support) <= tolerance
+        near_resistance = abs(high - resistance) <= tolerance
+
+        bullish_pattern, bearish_pattern, upper_wick, lower_wick, candle_range = (
+            candle_patterns(previous, current)
+        )
+
+        bullish_close = close > open_price
+        bearish_close = close < open_price
+
+        # Six CALL checks.
         call_checks = [
-            low <= lower,
-            rsi <= 30,
-            close > ema50
+            near_support,
+            k <= 25,
+            k > d,
+            bullish_pattern,
+            bullish_close,
+            close > support
         ]
 
-        put_score = sum(bool(x) for x in put_checks)
+        # Six PUT checks.
+        put_checks = [
+            near_resistance,
+            k >= 75,
+            k < d,
+            bearish_pattern,
+            bearish_close,
+            close < resistance
+        ]
+
         call_score = sum(bool(x) for x in call_checks)
+        put_score = sum(bool(x) for x in put_checks)
 
-        # Select the strongest direction.
-        if put_score > call_score:
-            direction = "SELL"
-            score = put_score
-
-        elif call_score > put_score:
+        # Choose the strongest reversal candidate.
+        if call_score > put_score:
             direction = "BUY"
             score = call_score
 
+        elif put_score > call_score:
+            direction = "SELL"
+            score = put_score
+
         else:
-            # Tie-breaker: use EMA50 direction.
-            # This is a fallback, not a confirmed 3/3 setup.
-            if close > ema50:
+            # Fallback: choose the nearest level.
+            # This is not a confirmed reversal.
+            support_distance = abs(close - support)
+            resistance_distance = abs(resistance - close)
+
+            if support_distance <= resistance_distance:
                 direction = "BUY"
                 score = call_score
             else:
@@ -317,11 +345,11 @@ def analyze(item):
             "payout": item["payout"],
             "direction": direction,
             "score": score,
-            "rsi": rsi,
+            "rsi_k": k,
+            "rsi_d": d,
+            "support": support,
+            "resistance": resistance,
             "reference": close,
-            "ema50": ema50,
-            "upper": upper,
-            "lower": lower,
             "analyzed_at": utc_now()
         }
 
@@ -334,14 +362,14 @@ def analyze(item):
 
 
 def schedule_entry(now):
-    earliest_entry = now + timedelta(seconds=MIN_PREP_SECONDS)
+    earliest = now + timedelta(seconds=MIN_PREP_SECONDS)
 
     entry = now.replace(
         second=0,
         microsecond=0
     ) + timedelta(minutes=1)
 
-    while entry < earliest_entry:
+    while entry < earliest:
         entry += timedelta(minutes=1)
 
     signal_time = entry - timedelta(
@@ -352,46 +380,49 @@ def schedule_entry(now):
 
 
 def signal_message(signal, total, signal_time, entry_time):
-    expiry_time = entry_time + timedelta(minutes=1)
+    expiry = entry_time + timedelta(minutes=1)
 
     signal_local = florida_time(signal_time)
     entry_local = florida_time(entry_time)
-    expiry_local = florida_time(expiry_time)
+    expiry_local = florida_time(expiry)
 
     if signal["direction"] == "BUY":
         title = "🟢 CALL / BUY"
-        setup = "Lower Band + RSI Oversold + Above EMA50"
+        setup = "SUPPORT REVERSAL"
+        level = signal["support"]
     else:
         title = "🔴 PUT / SELL"
-        setup = "Upper Band + RSI Overbought + Below EMA50"
+        setup = "RESISTANCE REVERSAL"
+        level = signal["resistance"]
 
     score = signal["score"]
 
-    if score == 3:
-        quality = "3/3 - FULL CONFIRMATION"
-    elif score == 2:
-        quality = "2/3 - PARTIAL CONFIRMATION"
-    elif score == 1:
-        quality = "1/3 - WEAK SETUP"
+    if score == 6:
+        quality = "6/6 - FULL CONFIRMATION"
+    elif score >= 4:
+        quality = f"{score}/6 - PARTIAL CONFIRMATION"
+    elif score >= 1:
+        quality = f"{score}/6 - LOW CONFIRMATION"
     else:
-        quality = "0/3 - FALLBACK DIRECTION"
+        quality = "0/6 - FALLBACK DIRECTION"
 
-    safe_name = html.escape(signal["name"])
-    payout_percent = round(signal["payout"] * 100)
+    payout = round(signal["payout"] * 100)
 
     return (
         f"🤖 <b>{VERSION}</b>\n\n"
         f"<b>{title}</b>\n\n"
-        f"💱 PAIR: {safe_name}\n"
+        f"💱 PAIR: {html.escape(signal['name'])}\n"
         f"📊 SYMBOL: {signal['symbol']}\n"
-        f"📈 STRATEGY: BB + RSI + EMA50\n"
+        f"📈 STRATEGY: SUPPORT-RESISTANCE REVERSAL\n"
         f"🧩 SETUP: {setup}\n\n"
         f"⏱ TIMEFRAME: M1\n"
-        f"⌛ EXPIRATION: 60 SECONDS\n\n"
-        f"⭐ SETUP SCORE: {quality}\n"
-        f"📊 RSI: {signal['rsi']:.1f}\n"
-        f"💰 BROKER PAYOUT: {payout_percent}%\n"
-        f"📍 REFERENCE PRICE: {signal['reference']:.6f}\n\n"
+        f"⌛ EXPIRATION: 60 SECONDS\n"
+        f"⭐ SETUP SCORE: {quality}\n\n"
+        f"📊 STOCH K: {signal['rsi_k']:.1f}\n"
+        f"📊 STOCH D: {signal['rsi_d']:.1f}\n"
+        f"📍 REFERENCE PRICE: {signal['reference']:.6f}\n"
+        f"🎯 KEY LEVEL: {level:.6f}\n"
+        f"💰 BROKER PAYOUT: {payout}%\n\n"
         f"🕒 SIGNAL TIME: {signal_local:%I:%M:%S %p}\n"
         f"🟢 <b>ENTRY TIME: {entry_local:%I:%M:%S %p}</b>\n"
         f"🏁 EXPIRATION: {expiry_local:%I:%M:%S %p}\n\n"
@@ -399,13 +430,13 @@ def signal_message(signal, total, signal_time, entry_time):
         f"🔎 QUALIFIED PAIRS: {total}\n\n"
         f"<i>⚠️ Best available candidate. "
         f"Score is not a win probability. "
-        f"No Martingale.</i>"
+        f"Fallback signals may be weak. No Martingale.</i>"
     )
 
 
 def send_telegram(message):
     if not TG_TOKEN or not TG_CHAT_ID:
-        raise ValueError("Telegram secrets missing")
+        raise RuntimeError("Telegram secrets missing")
 
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
@@ -424,28 +455,24 @@ def send_telegram(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram did not confirm message delivery")
+        raise RuntimeError("Telegram did not confirm delivery")
 
     return result
 
 
 def main():
-    start = time.time()
+    started = time.time()
 
-    log("=" * 50)
+    log("=" * 48)
     log(VERSION)
-    log("BOLLINGER BANDS + RSI + EMA50")
+    log("SUPPORT + RESISTANCE + STOCHASTIC + CANDLESTICKS")
     log("MINIMUM PAYOUT: 92%")
-    log("=" * 50)
+    log("=" * 48)
 
     if not API_KEY or not TG_TOKEN or not TG_CHAT_ID:
         raise RuntimeError("Missing GitHub Secrets")
 
-    try:
-        symbols = get_symbols()
-    except Exception as error:
-        log(f"SYMBOL API ERROR: {error}")
-        raise
+    symbols = get_symbols()
 
     if not symbols:
         log("No Forex OTC pairs with verified payout >= 92%.")
@@ -460,26 +487,19 @@ def main():
         ]
 
         for future in as_completed(futures):
-            try:
-                result = future.result()
+            result = future.result()
 
-                if result:
-                    candidates.append(result)
-
-            except Exception as error:
-                log(f"WORKER ERROR: {error}")
-
-    elapsed = time.time() - start
+            if result:
+                candidates.append(result)
 
     log(f"PAIRS SCANNED: {len(symbols)}")
     log(f"VALID CANDIDATES: {len(candidates)}")
-    log(f"SCAN TIME: {elapsed:.1f} seconds")
+    log(f"SCAN DURATION: {time.time() - started:.1f}s")
 
     if not candidates:
-        log("No usable candle data. Cannot safely create a signal.")
+        log("No usable candle data. No signal can be generated.")
         return
 
-    # Highest score first, then highest payout.
     candidates.sort(
         key=lambda x: (
             x["score"],
@@ -492,9 +512,9 @@ def main():
     best = candidates[0]
 
     log(
-        f"SELECTED: {best['symbol']} | "
-        f"{best['direction']} | "
-        f"SCORE {best['score']}/3 | "
+        f"SELECTED: {best['symbol']} "
+        f"{best['direction']} "
+        f"SCORE {best['score']}/6 "
         f"PAYOUT {best['payout'] * 100:.1f}%"
     )
 
@@ -505,18 +525,13 @@ def main():
     ).total_seconds()
 
     if wait_seconds > 0:
-        log(f"Waiting {wait_seconds:.1f}s for signal time.")
+        log(f"Waiting {wait_seconds:.1f} seconds.")
         time.sleep(wait_seconds)
 
-    actual_send_time = utc_now()
+    actual_send = utc_now()
 
-    delay = (
-        actual_send_time - signal_time
-    ).total_seconds()
-
-    remaining = (
-        entry_time - actual_send_time
-    ).total_seconds()
+    delay = (actual_send - signal_time).total_seconds()
+    remaining = (entry_time - actual_send).total_seconds()
 
     if delay > MAX_SIGNAL_DELAY or remaining < 28:
         log("Signal timing missed. Skipping stale entry.")
@@ -532,7 +547,7 @@ def main():
     send_telegram(message)
 
     log("SIGNAL SENT SUCCESSFULLY.")
-    log(f"TOTAL RUNTIME: {time.time() - start:.1f}s")
+    log(f"TOTAL RUNTIME: {time.time() - started:.1f}s")
 
 
 if __name__ == "__main__":
