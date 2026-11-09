@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ==================================================
-# ROMARIO TRADER PRO 9.3
-# OTC ONLY | EMA50 + STOCHASTIC 14,3
+# ROMARIO TRADER PRO 9.4
+# OTC FOREX ONLY | EMA50 + STOCHASTIC 14,3
 # MANUAL RUN | TELEGRAM ALERT ONLY
 # ==================================================
 
@@ -28,11 +28,24 @@ OTC_OFFSET = 7200
 RETRIES = 2
 RETRY_DELAY = 2
 
+# ISO currency codes: keeps forex pairs and excludes BTCUSD, etc.
+CURRENCIES = {
+    "AED", "ARS", "AUD", "BDT", "BHD", "BRL", "CAD",
+    "CHF", "CLP", "CNY", "COP", "CZK", "DKK", "EGP",
+    "EUR", "GBP", "HKD", "HUF", "IDR", "ILS", "INR",
+    "IQD", "IRR", "ISK", "JOD", "JPY", "KES", "KRW",
+    "KWD", "LBP", "LKR", "MAD", "MXN", "MYR", "NGN",
+    "NOK", "NPR", "NZD", "OMR", "PEN", "PHP", "PKR",
+    "PLN", "QAR", "RON", "RUB", "SAR", "SEK", "SGD",
+    "THB", "TND", "TRY", "TWD", "UAH", "USD", "UYU",
+    "VND", "XAF", "XOF", "YER", "ZAR"
+}
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/9.3"
+    "User-Agent": "ROMARIO-TRADER-PRO/9.4"
 })
 
 
@@ -57,10 +70,6 @@ def log(message):
 # ==================================================
 
 def telegram_send(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials missing.")
-        return
-
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
@@ -80,7 +89,7 @@ def telegram_send(message):
 
 
 # ==================================================
-# API HELPERS
+# API HELPERS WITH RETRIES
 # ==================================================
 
 def extract_list(data, keys):
@@ -118,6 +127,7 @@ def api_get(endpoint, params=None):
 
         except requests.exceptions.HTTPError as exc:
             last_error = exc
+
             status = (
                 exc.response.status_code
                 if exc.response is not None
@@ -127,32 +137,23 @@ def api_get(endpoint, params=None):
             if status not in (429, 500, 502, 503, 504):
                 raise
 
-            if attempt < RETRIES:
-                delay = RETRY_DELAY * (attempt + 1)
-                log(
-                    f"API temporary error {status}. "
-                    f"Retry {attempt + 1}/{RETRIES} "
-                    f"in {delay}s."
-                )
-                time.sleep(delay)
-
         except requests.exceptions.RequestException as exc:
             last_error = exc
 
-            if attempt < RETRIES:
-                delay = RETRY_DELAY * (attempt + 1)
-                log(
-                    f"API connection error. "
-                    f"Retry {attempt + 1}/{RETRIES} "
-                    f"in {delay}s."
-                )
-                time.sleep(delay)
+        if attempt < RETRIES:
+            delay = RETRY_DELAY * (attempt + 1)
+            log(
+                f"Temporary API error. "
+                f"Retry {attempt + 1}/{RETRIES} "
+                f"in {delay}s."
+            )
+            time.sleep(delay)
 
     raise last_error
 
 
 # ==================================================
-# FIND ALL QUALIFYING OTC FOREX PAIRS
+# FIND QUALIFYING OTC FOREX PAIRS
 # ==================================================
 
 def get_pairs():
@@ -182,9 +183,16 @@ def get_pairs():
         if not name.lower().endswith("_otc"):
             continue
 
-        base = name[:-4]
+        base = name[:-4].upper()
 
-        if len(base) != 6 or not base.isalpha():
+        if len(base) != 6:
+            continue
+
+        # Both sides must be recognized currencies
+        if base[:3] not in CURRENCIES:
+            continue
+
+        if base[3:] not in CURRENCIES:
             continue
 
         if item.get("isOtc") is not True:
@@ -224,7 +232,7 @@ def get_pairs():
 
 
 # ==================================================
-# CANDLES
+# GET COMPLETED CANDLES
 # ==================================================
 
 def get_candles(symbol):
@@ -362,8 +370,8 @@ def calculate_stochastic(candles):
 
 
 # ==================================================
-# STRATEGY 9.3
-# RECENT CROSS + EMA50 TREND CONFIRMATION
+# STRATEGY 9.4
+# NO CROSSOVER REQUIRED
 # ==================================================
 
 def strategy_votes(candles):
@@ -379,16 +387,17 @@ def strategy_votes(candles):
         return result
 
     closes = [c["close"] for c in candles]
-
     ema50 = calculate_ema(closes, 50)
 
     k_values, d_values = calculate_stochastic(candles)
 
     current = len(candles) - 1
     previous = current - 1
+    older = current - 2
 
     close = closes[current]
     ema = ema50[current]
+    previous_ema = ema50[previous]
 
     k = k_values[current]
     d = d_values[current]
@@ -396,104 +405,93 @@ def strategy_votes(candles):
     previous_k = k_values[previous]
     previous_d = d_values[previous]
 
+    older_k = k_values[older]
+
     values = [
-        close, ema, k, d,
-        previous_k, previous_d
+        close, ema, previous_ema,
+        k, d, previous_k, previous_d, older_k
     ]
 
     if any(value is None for value in values):
         return result
 
-    # Current trend
-    uptrend = close > ema
-    downtrend = close < ema
+    candle = candles[current]
 
-    # Current momentum
-    bullish_momentum = (
-        k > previous_k and d > previous_d
+    # Trend direction
+    uptrend = (
+        close > ema
+        and ema > previous_ema
     )
 
-    bearish_momentum = (
-        k < previous_k and d < previous_d
+    downtrend = (
+        close < ema
+        and ema < previous_ema
     )
 
-    # Search for a crossover in the last 3 candles
-    recent_bullish_cross = False
-    recent_bearish_cross = False
-    cross_age = 99
+    # Stochastic direction
+    bullish_stochastic = (
+        k > d
+        and k > previous_k
+        and d >= previous_d
+        and k > older_k
+    )
 
-    start = max(1, current - 2)
+    bearish_stochastic = (
+        k < d
+        and k < previous_k
+        and d <= previous_d
+        and k < older_k
+    )
 
-    for i in range(start, current + 1):
-        pk = k_values[i - 1]
-        pd = d_values[i - 1]
-        ck = k_values[i]
-        cd = d_values[i]
+    # Last completed candle direction
+    bullish_candle = candle["close"] > candle["open"]
+    bearish_candle = candle["close"] < candle["open"]
 
-        if None in (pk, pd, ck, cd):
-            continue
+    # Avoid extreme stochastic readings
+    normal_buy_zone = 20 <= k <= 80
+    normal_sell_zone = 20 <= k <= 80
 
-        if pk <= pd and ck > cd:
-            recent_bullish_cross = True
-            cross_age = current - i
-
-        if pk >= pd and ck < cd:
-            recent_bearish_cross = True
-            cross_age = current - i
-
-    # CALL setup
+    # CALL
     if (
         uptrend
-        and recent_bullish_cross
-        and k < 40
-        and bullish_momentum
+        and bullish_stochastic
+        and bullish_candle
+        and normal_buy_zone
     ):
         result["CALL"] = 1
 
         result["score"] = (
-            2.0
-            + (40 - k) / 40
-            + (2 - cross_age) * 0.15
+            3
+            + min(abs(k - d) / 10, 1)
+            + min(abs(close - ema) / max(ema, 0.000001) * 100, 1)
         )
 
-        result["call_reasons"].append(
-            f"EMA50 bullish trend"
-        )
+        result["call_reasons"] = [
+            "EMA50 bullish trend",
+            f"Stochastic bullish: K {k:.1f} / D {d:.1f}",
+            "Last completed candle bullish"
+        ]
 
-        result["call_reasons"].append(
-            f"Stochastic bullish cross ({k:.1f})"
-        )
-
-        result["call_reasons"].append(
-            f"Bullish momentum | Cross age: {cross_age}"
-        )
-
-    # PUT setup
+    # PUT
     elif (
         downtrend
-        and recent_bearish_cross
-        and k > 60
-        and bearish_momentum
+        and bearish_stochastic
+        and bearish_candle
+        and normal_sell_zone
     ):
         result["PUT"] = 1
 
         result["score"] = (
-            2.0
-            + (k - 60) / 40
-            + (2 - cross_age) * 0.15
+            3
+            + min(abs(k - d) / 10, 1)
+            + min(abs(close - ema) / max(ema, 0.000001) * 100, 1)
         )
 
-        result["put_reasons"].append(
-            f"EMA50 bearish trend"
-        )
-
-        result["put_reasons"].append(
-            f"Stochastic bearish cross ({k:.1f})"
-        )
-
-        result["put_reasons"].append(
-            f"Bearish momentum | Cross age: {cross_age}"
-        )
+        result["put_reasons"] = [
+            "EMA50 bearish trend",
+            f"Stochastic bearish: K {k:.1f} / D {d:.1f}",
+            "Last completed candle bearish"
+        ]
 
     return result
 
@@ -509,7 +507,7 @@ def get_direction(votes):
 
 
 # ==================================================
-# WAIT UNTIL 15 SECONDS BEFORE ENTRY
+# ENTRY TIME
 # ==================================================
 
 def wait_for_entry():
@@ -558,12 +556,10 @@ def signal_message(pair, direction, votes, entry):
         else votes["put_reasons"]
     )
 
-    reason_text = "\n".join(reasons)
-
     sent_time = florida_time()
 
     return (
-        "🤖 <b>ROMARIO TRADER PRO 9.3</b>\n\n"
+        "🤖 <b>ROMARIO TRADER PRO 9.4</b>\n\n"
         f"{emoji} <b>{direction}</b>\n\n"
         f"💱 PAIR: <b>{pair['symbol']}</b>\n"
         f"💰 PAYOUT: <b>{pair['payout']:.1f}%</b>\n"
@@ -571,9 +567,11 @@ def signal_message(pair, direction, votes, entry):
         "⌛ EXPIRATION: <b>60 SECONDS</b>\n\n"
         f"🎯 ENTRY TIME: <b>{entry.strftime('%I:%M:%S %p')}</b>\n"
         f"⚡ SIGNAL SENT: <b>{sent_time.strftime('%I:%M:%S %p')}</b>\n\n"
-        f"📌 STRATEGY:\n{reason_text}\n\n"
-        f"🕒 FLORIDA TIME: "
-        f"{sent_time.strftime('%Y-%m-%d %I:%M:%S %p')}"
+        "📌 STRATEGY:\n"
+        + "\n".join(reasons)
+        + "\n\n"
+        + f"🕒 FLORIDA TIME: "
+        + sent_time.strftime("%Y-%m-%d %I:%M:%S %p")
     )
 
 
@@ -583,14 +581,15 @@ def signal_message(pair, direction, votes, entry):
 
 def no_signal_message(scanned, errors):
     return (
-        "🤖 <b>ROMARIO TRADER PRO 9.3</b>\n\n"
+        "🤖 <b>ROMARIO TRADER PRO 9.4</b>\n\n"
         "⚪ <b>NO VALID SIGNAL</b>\n"
         "No pair passed the strategy rules.\n\n"
         f"Pairs scanned: {scanned}\n"
         f"Minimum payout: {MIN_PAYOUT:.1f}%\n"
         "Market: OTC Forex only\n"
         "Strategy: EMA50 + Stochastic 14,3\n"
-        "Cross window: 3 candles\n"
+        "Candle confirmation: ON\n"
+        "Crossover required: NO\n"
         "Expiration: 60 seconds\n"
         f"Data errors: {errors}\n\n"
         f"🕒 FLORIDA TIME: "
@@ -609,16 +608,16 @@ def main():
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         raise RuntimeError("Missing Telegram credentials")
 
-    log("ROMARIO TRADER PRO 9.3 starting...")
+    log("ROMARIO TRADER PRO 9.4 starting...")
 
     pairs = get_pairs()
 
     if not pairs:
         telegram_send(no_signal_message(0, 0))
-        log("No eligible OTC pairs.")
+        log("No eligible OTC forex pairs.")
         return
 
-    log(f"Eligible OTC pairs found: {len(pairs)}")
+    log(f"Eligible OTC forex pairs found: {len(pairs)}")
 
     candidates = []
     errors = 0
@@ -668,7 +667,6 @@ def main():
         log("No valid signal.")
         return
 
-    # Select one strongest qualifying signal
     candidates.sort(
         key=lambda item: (
             item["votes"]["score"],
@@ -711,7 +709,7 @@ if __name__ == "__main__":
 
         try:
             telegram_send(
-                "⚠️ <b>ROMARIO TRADER PRO 9.3 ERROR</b>\n\n"
+                "⚠️ <b>ROMARIO TRADER PRO 9.4 ERROR</b>\n\n"
                 f"<code>{str(exc)[:800]}</code>\n\n"
                 f"🕒 {florida_time().strftime('%Y-%m-%d %I:%M:%S %p')}"
             )
