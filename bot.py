@@ -9,12 +9,12 @@ from zoneinfo import ZoneInfo
 import requests
 
 # =========================================================
-# ROMARIO TRADER PRO 9.5
-# OTCharts OTC | EMA50 + STOCHASTIC 14,3
-# M1 | 60-second expiration | Telegram alerts only
+# ROMARIO TRADER PRO 9.6
+# Pocket Option OTC | EMA50 + STOCHASTIC 14,3
+# M1 | 60 seconds | Telegram alerts only
 # =========================================================
 
-BOT_NAME = "ROMARIO TRADER PRO 9.5"
+BOT_NAME = "ROMARIO TRADER PRO 9.6"
 
 BASE_URL = "https://otcharts.com"
 SYMBOLS_ENDPOINT = "/v1/symbols"
@@ -24,14 +24,12 @@ TIMEFRAME = 60
 CANDLE_LIMIT = 300
 MIN_PAYOUT = 92.0
 EXPIRATION_SECONDS = 60
-
-# Entry alert: 15 seconds before the next M1 candle
 ENTRY_SECONDS_BEFORE = 15
 
-# OTCharts timestamp adjustment used by the previous version
+# Pocket Option candle clock is UTC+2
 OTC_OFFSET = 7200
 
-# Retry configuration: 6 attempts maximum
+# Retry settings
 RETRIES = 5
 RETRY_BASE_DELAY = 5
 RETRY_MAX_DELAY = 30
@@ -96,7 +94,7 @@ def telegram_send(message):
         result = response.json()
 
         if not result.get("ok"):
-            logging.error("Telegram rejected the message: %s", result)
+            logging.error("Telegram rejected message: %s", result)
             return False
 
         return True
@@ -107,7 +105,7 @@ def telegram_send(message):
 
 
 # =========================================================
-# OTCHARTS API WITH RETRIES
+# OTCHARTS API
 # =========================================================
 
 def api_get(endpoint, params=None):
@@ -132,7 +130,8 @@ def api_get(endpoint, params=None):
 
             if response.status_code in RETRY_STATUSES:
                 raise requests.HTTPError(
-                    f"HTTP {response.status_code}: {response.text[:250]}",
+                    f"HTTP {response.status_code}: "
+                    f"{response.text[:250]}",
                     response=response
                 )
 
@@ -164,6 +163,7 @@ def api_get(endpoint, params=None):
                 RETRIES,
                 delay
             )
+
             time.sleep(delay)
 
         except requests.RequestException as error:
@@ -182,13 +182,14 @@ def api_get(endpoint, params=None):
                 delay,
                 error
             )
+
             time.sleep(delay)
 
-    raise RuntimeError("OTCharts API failed after all retry attempts.")
+    raise RuntimeError("OTCharts API failed after retries.")
 
 
 # =========================================================
-# DATA EXTRACTION
+# DATA HELPERS
 # =========================================================
 
 def find_list(data, possible_keys):
@@ -245,6 +246,8 @@ def to_number(value, default=None):
 
 # =========================================================
 # SYMBOL DISCOVERY
+# IMPORTANT: KEEP ORIGINAL OTCHARTS SYMBOL CASE
+# Example: EURUSD_otc
 # =========================================================
 
 def get_symbols():
@@ -260,27 +263,40 @@ def get_symbols():
 
     if not symbols:
         raise RuntimeError(
-            "OTCharts returned no readable symbol list."
+            "OTCharts returned no readable symbols."
         )
 
     eligible = []
 
     for item in symbols:
+
         if isinstance(item, str):
-            symbol = item.strip().upper()
+            symbol = item.strip()
             payout = None
             is_open = True
             is_otc = True
 
         elif isinstance(item, dict):
+
+            # DO NOT use .upper() here.
+            # OTCharts requires the exact original symbol.
             symbol = str(
-                get_field(item, ("symbol", "name", "ticker"), "")
-            ).strip().upper()
+                get_field(
+                    item,
+                    ("symbol", "name", "ticker"),
+                    ""
+                )
+            ).strip()
 
             payout = to_number(
                 get_field(
                     item,
-                    ("payout", "payout_percent", "profit", "profit_percent")
+                    (
+                        "payout",
+                        "payout_percent",
+                        "profit",
+                        "profit_percent"
+                    )
                 )
             )
 
@@ -299,17 +315,19 @@ def get_symbols():
         else:
             continue
 
-        # OTC forex pairs only: six letters followed by _OTC
-        if not re.fullmatch(r"[A-Z]{6}_OTC", symbol):
+        # Six uppercase letters + lowercase _otc
+        if not re.fullmatch(r"[A-Z]{6}_otc", symbol):
             continue
 
-        if is_open is not True or is_otc is not True:
+        if is_open is not True:
+            continue
+
+        if is_otc is not True:
             continue
 
         if payout is None:
             continue
 
-        # Convert decimal payout to percentage if necessary
         if 0 < payout <= 1:
             payout *= 100
 
@@ -321,7 +339,6 @@ def get_symbols():
             "payout": payout
         })
 
-    # Remove duplicate symbols
     unique = {}
 
     for item in eligible:
@@ -331,15 +348,14 @@ def get_symbols():
 
 
 # =========================================================
-# CANDLE DATA
+# CANDLE PARSING
 # =========================================================
 
 def parse_timestamp(value):
     try:
         if isinstance(value, str):
             try:
-                number = float(value)
-                value = number
+                value = float(value)
             except ValueError:
                 dt = datetime.fromisoformat(
                     value.replace("Z", "+00:00")
@@ -363,9 +379,10 @@ def parse_timestamp(value):
 
 def parse_candle(item):
     if isinstance(item, dict):
+
         timestamp = get_field(
             item,
-            ("timestamp", "time", "t", "datetime", "date")
+            ("time", "timestamp", "t", "datetime", "date")
         )
 
         open_price = get_field(item, ("open", "o"))
@@ -374,6 +391,7 @@ def parse_candle(item):
         close_price = get_field(item, ("close", "c"))
 
     elif isinstance(item, (list, tuple)) and len(item) >= 5:
+
         timestamp = item[0]
         open_price = item[1]
         high_price = item[2]
@@ -407,7 +425,17 @@ def parse_candle(item):
     }
 
 
+# =========================================================
+# GET CANDLES
+# =========================================================
+
 def get_candles(symbol):
+
+    logging.info(
+        "Requesting candles using exact symbol: %s",
+        symbol
+    )
+
     data = api_get(
         CANDLES_ENDPOINT,
         {
@@ -431,7 +459,6 @@ def get_candles(symbol):
         if candle:
             candles.append(candle)
 
-    # Remove duplicate timestamps
     unique = {}
 
     for candle in candles:
@@ -442,17 +469,25 @@ def get_candles(symbol):
         key=lambda candle: candle["time"]
     )
 
-    # Keep completed candles only
     now = time.time()
 
+    # Keep completed M1 candles only
     completed = [
         candle for candle in candles
         if candle["time"] - OTC_OFFSET + TIMEFRAME <= now
     ]
 
+    logging.info(
+        "%s candles received for %s; %s completed.",
+        len(candles),
+        symbol,
+        len(completed)
+    )
+
     if len(completed) < 60:
         raise ValueError(
-            f"Not enough completed candles for {symbol}"
+            f"Not enough completed candles for {symbol}. "
+            f"Received {len(completed)}."
         )
 
     return completed
@@ -463,18 +498,23 @@ def get_candles(symbol):
 # =========================================================
 
 def calculate_ema(values, period):
+
     if len(values) < period:
         return []
 
     multiplier = 2 / (period + 1)
 
-    ema_values = [sum(values[:period]) / period]
+    ema_values = [
+        sum(values[:period]) / period
+    ]
 
     for value in values[period:]:
+
         ema = (
             value * multiplier
             + ema_values[-1] * (1 - multiplier)
         )
+
         ema_values.append(ema)
 
     return [None] * (period - 1) + ema_values
@@ -485,9 +525,11 @@ def calculate_ema(values, period):
 # =========================================================
 
 def calculate_stochastic(candles, period=14):
+
     k_values = []
 
     for index in range(len(candles)):
+
         if index < period - 1:
             k_values.append(None)
             continue
@@ -508,6 +550,7 @@ def calculate_stochastic(candles, period=14):
     d_values = []
 
     for index in range(len(k_values)):
+
         if index < 2:
             d_values.append(None)
             continue
@@ -523,16 +566,18 @@ def calculate_stochastic(candles, period=14):
 
 
 # =========================================================
-# SIGNAL STRATEGY 9.4
+# STRATEGY 9.4 — PRESERVED
 # =========================================================
 
 def analyze_pair(pair):
+
     symbol = pair["symbol"]
     payout = pair["payout"]
 
     candles = get_candles(symbol)
 
     closes = [c["close"] for c in candles]
+
     ema_values = calculate_ema(closes, 50)
 
     k_values, d_values = calculate_stochastic(candles)
@@ -570,7 +615,6 @@ def analyze_pair(pair):
     bullish_candle = candle["close"] > candle["open"]
     bearish_candle = candle["close"] < candle["open"]
 
-    # CALL conditions
     call_conditions = [
         candle["close"] > ema_now,
         ema_now > ema_previous,
@@ -582,7 +626,6 @@ def analyze_pair(pair):
         20 < k_now < 80
     ]
 
-    # PUT conditions
     put_conditions = [
         candle["close"] < ema_now,
         ema_now < ema_previous,
@@ -597,21 +640,23 @@ def analyze_pair(pair):
     call_score = sum(call_conditions)
     put_score = sum(put_conditions)
 
-    if call_score == len(call_conditions):
+    if call_score == 8:
+
         direction = "CALL"
         score = call_score
 
-    elif put_score == len(put_conditions):
+    elif put_score == 8:
+
         direction = "PUT"
         score = put_score
 
     else:
         return None
 
-    # Strength ranking; payout breaks ties
-    ema_distance = abs(
-        (candle["close"] - ema_now) / ema_now
-    ) if ema_now else 0
+    ema_distance = (
+        abs((candle["close"] - ema_now) / ema_now)
+        if ema_now else 0
+    )
 
     return {
         "symbol": symbol,
@@ -629,9 +674,11 @@ def analyze_pair(pair):
 # =========================================================
 
 def wait_for_entry():
+
     now = time.time()
 
     next_minute = (int(now // 60) + 1) * 60
+
     target = next_minute - ENTRY_SECONDS_BEFORE
 
     if target <= now:
@@ -650,10 +697,11 @@ def wait_for_entry():
 
 
 # =========================================================
-# ALERT FORMATTING
+# SIGNAL MESSAGE
 # =========================================================
 
 def send_signal(signal, entry_timestamp):
+
     entry_time = florida_time_string(entry_timestamp)
     current_time = florida_time_string()
 
@@ -669,13 +717,14 @@ def send_signal(signal, entry_timestamp):
         f"📈 STOCH K: {signal['stochastic_k']:.2f}\n"
         f"📉 STOCH D: {signal['stochastic_d']:.2f}\n\n"
         f"🕒 FLORIDA TIME: {current_time}\n"
-        f"⚠️ Alert only — verify the market before entering."
+        f"⚠️ Alert only — verify before entering."
     )
 
     telegram_send(message)
 
 
 def send_no_signal(pair_count):
+
     message = (
         f"🤖 <b>{BOT_NAME}</b>\n\n"
         f"⚪ <b>NO VALID SIGNAL</b>\n\n"
@@ -691,11 +740,11 @@ def send_no_signal(pair_count):
 
 
 def send_api_unavailable(error):
+
     message = (
         f"⚠️ <b>{BOT_NAME} API ERROR</b>\n\n"
-        f"OTCharts API is currently unavailable.\n"
-        f"The bot tried multiple times but could not retrieve market data.\n\n"
-        f"No market data received.\n"
+        f"OTCharts could not provide the required market data.\n\n"
+        f"No market data received or usable.\n"
         f"No signal generated.\n\n"
         f"Error: <code>{str(error)[:300]}</code>\n\n"
         f"🕒 FLORIDA TIME: {florida_time_string()}"
@@ -709,6 +758,7 @@ def send_api_unavailable(error):
 # =========================================================
 
 def main():
+
     logging.info("%s starting...", BOT_NAME)
 
     if not API_KEY:
@@ -721,7 +771,7 @@ def main():
         logging.error("Telegram secrets are missing.")
         return
 
-    # If symbol discovery fails, report API error
+    # Discover symbols
     try:
         pairs = get_symbols()
 
@@ -742,7 +792,9 @@ def main():
     signals = []
     candle_errors = 0
 
+    # Scan all eligible pairs
     for number, pair in enumerate(pairs, start=1):
+
         symbol = pair["symbol"]
 
         logging.info(
@@ -756,6 +808,7 @@ def main():
             signal = analyze_pair(pair)
 
             if signal:
+
                 signals.append(signal)
 
                 logging.info(
@@ -765,30 +818,38 @@ def main():
                     signal["score"],
                     signal["payout"]
                 )
+
             else:
-                logging.info("No valid setup: %s", symbol)
+                logging.info(
+                    "No valid setup: %s",
+                    symbol
+                )
 
         except Exception as error:
+
             candle_errors += 1
+
             logging.warning(
                 "Could not scan %s: %s",
                 symbol,
                 error
             )
 
-    # If every pair failed to return candle data,
-    # do not mislabel an API failure as NO VALID SIGNAL.
+    # If every pair failed, report a data/API problem
     if candle_errors == len(pairs):
+
         send_api_unavailable(
-            "Candle data could not be retrieved for any eligible pair."
+            "Candle data failed for every eligible pair. "
+            "Check the detailed GitHub logs."
         )
+
         return
 
     if not signals:
         send_no_signal(len(pairs))
         return
 
-    # Best setup first, then payout
+    # Best setup first, payout breaks ties
     signals.sort(
         key=lambda item: (
             item["score"],
@@ -814,9 +875,12 @@ def main():
 
 
 if __name__ == "__main__":
+
     try:
         main()
 
     except Exception as error:
+
         logging.exception("Unexpected bot error.")
+
         send_api_unavailable(error)
