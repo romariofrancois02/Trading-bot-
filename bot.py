@@ -6,14 +6,15 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-# ==================================================
-# ROMARIO TRADER PRO 9.9
-# OTCharts | OTC ONLY | M1 | TELEGRAM ALERTS
-# ==================================================
+# =====================================================
+# ROMARIO TRADER PRO 10.0
+# OTC ONLY | M30 | 60 SECOND EXPIRATION
+# =====================================================
 
 BASE_URL = "https://otcharts.com"
-TIMEFRAME = 60
-CANDLE_LIMIT = 120
+
+TIMEFRAME = 30
+CANDLE_LIMIT = 150
 MIN_PAYOUT = 92.0
 TOLERANCE = 10.0
 EXPIRATION = 60
@@ -34,12 +35,12 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/9.9"
+    "User-Agent": "ROMARIO-TRADER-PRO/10.0"
 })
 
-# --------------------------------------------------
-# STOCHASTIC PAIRS PROVIDED BY YOU
-# --------------------------------------------------
+# =====================================================
+# STOCHASTIC REFERENCE PAIRS
+# =====================================================
 
 CALL_PAIRS = [
     (50, 63), (73, 63), (27, 43),
@@ -57,13 +58,9 @@ PUT_PAIRS = [
 ]
 
 
-# --------------------------------------------------
+# =====================================================
 # TIME
-# --------------------------------------------------
-
-def florida_now():
-    return datetime.now(FLORIDA)
-
+# =====================================================
 
 def format_time(timestamp):
     return datetime.fromtimestamp(
@@ -71,17 +68,15 @@ def format_time(timestamp):
     ).strftime("%Y-%m-%d %I:%M:%S %p")
 
 
-# --------------------------------------------------
-# HTTP
-# --------------------------------------------------
+# =====================================================
+# API REQUEST
+# =====================================================
 
 def api_get(endpoint, params=None):
-    url = BASE_URL + endpoint
-
     for attempt in range(3):
         try:
             response = SESSION.get(
-                url,
+                BASE_URL + endpoint,
                 params=params,
                 timeout=20
             )
@@ -104,9 +99,9 @@ def api_get(endpoint, params=None):
     return None
 
 
-# --------------------------------------------------
-# SYMBOLS
-# --------------------------------------------------
+# =====================================================
+# GET OTC SYMBOLS
+# =====================================================
 
 def get_symbols():
     data = api_get(
@@ -128,11 +123,8 @@ def get_symbols():
         if not isinstance(item, dict):
             continue
 
-        symbol = str(
-            item.get("symbol", "")
-        )
+        symbol = str(item.get("symbol", ""))
 
-        # OTC ONLY. Never scan REAL pairs.
         if not symbol.lower().endswith("_otc"):
             continue
 
@@ -151,9 +143,7 @@ def get_symbols():
         if payout < MIN_PAYOUT:
             continue
 
-        is_open = item.get("open", True)
-
-        if is_open is False:
+        if item.get("open", True) is False:
             continue
 
         eligible.append({
@@ -164,9 +154,9 @@ def get_symbols():
     return eligible
 
 
-# --------------------------------------------------
-# CANDLES
-# --------------------------------------------------
+# =====================================================
+# GET 30 SECOND CANDLES
+# =====================================================
 
 def get_candles(symbol):
     data = api_get(
@@ -225,42 +215,50 @@ def get_candles(symbol):
     if len(candles) < 60:
         return []
 
-    # Exclude a candle that has not finished yet.
+    # Keep only completed candles.
     if "time" in candles[-1]:
         now = time.time()
-        last_close_time = candles[-1]["time"] + TIMEFRAME
 
-        if last_close_time > now:
-            candles = candles[:-1]
+        candles = [
+            candle for candle in candles
+            if candle["time"] + TIMEFRAME <= now
+        ]
     else:
-        # If timestamps are unavailable, avoid using
-        # the newest potentially unfinished candle.
+        # Without timestamps, exclude the newest candle
+        # to reduce the risk of using an unfinished candle.
         candles = candles[:-1]
 
     return candles
 
 
-# --------------------------------------------------
-# INDICATORS
-# --------------------------------------------------
+# =====================================================
+# EMA
+# =====================================================
 
-def ema(values, period):
+def calculate_ema(values, period):
     if len(values) < period:
         return []
 
     multiplier = 2 / (period + 1)
-    result = [sum(values[:period]) / period]
+
+    result = [
+        sum(values[:period]) / period
+    ]
 
     for value in values[period:]:
         result.append(
-            (value * multiplier) +
-            (result[-1] * (1 - multiplier))
+            value * multiplier
+            + result[-1] * (1 - multiplier)
         )
 
     return result
 
 
-def stochastic(candles, period=14, smooth=3):
+# =====================================================
+# STOCHASTIC 14,3,3
+# =====================================================
+
+def calculate_stochastic(candles, period=14, smooth=3):
     if len(candles) < period + smooth:
         return None, None
 
@@ -277,12 +275,9 @@ def stochastic(candles, period=14, smooth=3):
             raw_k.append(50.0)
         else:
             raw_k.append(
-                ((close - lowest) /
-                 (highest - lowest)) * 100
+                (close - lowest) /
+                (highest - lowest) * 100
             )
-
-    if len(raw_k) < smooth:
-        return None, None
 
     k_values = []
 
@@ -290,6 +285,9 @@ def stochastic(candles, period=14, smooth=3):
         k_values.append(
             sum(raw_k[i - smooth + 1:i + 1]) / smooth
         )
+
+    if len(k_values) < smooth:
+        return None, None
 
     d_values = []
 
@@ -304,37 +302,46 @@ def stochastic(candles, period=14, smooth=3):
     return k_values[-1], d_values[-1]
 
 
-# --------------------------------------------------
-# MATCH YOUR STOCHASTIC NUMBERS
-# --------------------------------------------------
+# =====================================================
+# STOCHASTIC PAIR MATCH
+# =====================================================
 
 def match_pair(k, d, direction):
-    pairs = CALL_PAIRS if direction == "CALL" else PUT_PAIRS
+    pairs = (
+        CALL_PAIRS
+        if direction == "CALL"
+        else PUT_PAIRS
+    )
 
-    best_distance = None
     best_pair = None
+    best_distance = None
 
     for target_k, target_d in pairs:
         distance_k = abs(k - target_k)
         distance_d = abs(d - target_d)
 
-        # BOTH numbers must be close.
-        if distance_k <= TOLERANCE and distance_d <= TOLERANCE:
+        if (
+            distance_k <= TOLERANCE
+            and distance_d <= TOLERANCE
+        ):
             total_distance = distance_k + distance_d
 
-            if best_distance is None or total_distance < best_distance:
+            if (
+                best_distance is None
+                or total_distance < best_distance
+            ):
                 best_distance = total_distance
                 best_pair = (target_k, target_d)
 
     if best_pair is None:
-        return False, None
+        return False, None, None
 
-    return True, best_pair
+    return True, best_pair, best_distance
 
 
-# --------------------------------------------------
-# SIGNAL CONFIRMATION
-# --------------------------------------------------
+# =====================================================
+# ANALYZE EACH PAIR
+# =====================================================
 
 def analyze_symbol(item):
     symbol = item["symbol"]
@@ -348,64 +355,60 @@ def analyze_symbol(item):
 
     closes = [c["close"] for c in candles]
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
+    ema9 = calculate_ema(closes, 9)
+    ema21 = calculate_ema(closes, 21)
+    ema50 = calculate_ema(closes, 50)
 
     if not ema9 or not ema21 or not ema50:
         return None
 
-    k, d = stochastic(candles)
+    k, d = calculate_stochastic(candles)
 
     if k is None or d is None:
         return None
 
     last = candles[-1]
-    previous = candles[-2]
 
-    # CALL confirmation
+    # CALL: bullish trend and bullish candle.
     call_trend = (
         ema9[-1] > ema21[-1] > ema50[-1]
+        and ema9[-1] > ema9[-2]
         and last["close"] > ema9[-1]
         and last["close"] > last["open"]
     )
 
-    # PUT confirmation
+    # PUT: bearish trend and bearish candle.
     put_trend = (
         ema9[-1] < ema21[-1] < ema50[-1]
+        and ema9[-1] < ema9[-2]
         and last["close"] < ema9[-1]
         and last["close"] < last["open"]
     )
 
-    call_match, call_reference = match_pair(
+    call_match, call_ref, call_distance = match_pair(
         k, d, "CALL"
     )
 
-    put_match, put_reference = match_pair(
+    put_match, put_ref, put_distance = match_pair(
         k, d, "PUT"
     )
 
-    # Direction is NEVER inverted.
     if call_match and call_trend:
         direction = "CALL"
-        reference = call_reference
+        reference = call_ref
+        distance = call_distance
 
     elif put_match and put_trend:
         direction = "PUT"
-        reference = put_reference
+        reference = put_ref
+        distance = put_distance
 
     else:
         logging.info(
-            "%s: no confirmation | K=%.2f D=%.2f",
+            "%s | K %.2f | D %.2f | no valid signal",
             symbol, k, d
         )
         return None
-
-    # Smaller distance to the reference pair is better.
-    distance = (
-        abs(k - reference[0]) +
-        abs(d - reference[1])
-    )
 
     return {
         "symbol": symbol,
@@ -418,22 +421,23 @@ def analyze_symbol(item):
     }
 
 
-# --------------------------------------------------
-# ENTRY TIMING
-# Send alert 15 seconds before candle opens.
-# --------------------------------------------------
+# =====================================================
+# ENTRY SCHEDULER - 30 SECOND CANDLES
+# =====================================================
 
 def wait_for_entry():
     now = time.time()
 
-    entry_open = (int(now // 60) + 1) * 60
+    entry_open = (
+        (int(now // TIMEFRAME) + 1) * TIMEFRAME
+    )
+
     send_at = entry_open - SIGNAL_LEAD_SECONDS
 
-    # If scanning finished too late, use the next
-    # available minute instead of sending a stale alert.
+    # If scanning took too long, use the following candle.
     if send_at <= now:
-        entry_open += 60
-        send_at += 60
+        entry_open += TIMEFRAME
+        send_at += TIMEFRAME
 
     delay = send_at - time.time()
 
@@ -444,7 +448,6 @@ def wait_for_entry():
         )
         time.sleep(delay)
 
-    # Never send an alert after its entry candle opened.
     if time.time() >= entry_open:
         logging.warning("Entry time passed. Signal skipped.")
         return None
@@ -452,15 +455,11 @@ def wait_for_entry():
     return entry_open
 
 
-# --------------------------------------------------
+# =====================================================
 # TELEGRAM
-# --------------------------------------------------
+# =====================================================
 
 def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        logging.error("Telegram secrets are missing.")
-        return False
-
     url = (
         f"https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
@@ -477,8 +476,8 @@ def send_telegram(message):
         )
 
         response.raise_for_status()
-        result = response.json()
 
+        result = response.json()
         return result.get("ok", False)
 
     except Exception as exc:
@@ -486,16 +485,23 @@ def send_telegram(message):
         return False
 
 
+# =====================================================
+# SIGNAL MESSAGE
+# =====================================================
+
 def build_message(signal, entry_open):
     direction = signal["direction"]
 
-    emoji = "🟢" if direction == "CALL" else "🔴"
+    emoji = (
+        "🟢" if direction == "CALL"
+        else "🔴"
+    )
 
     signal_time = format_time(time.time())
     entry_time = format_time(entry_open)
 
     return f"""
-🤖 ROMARIO TRADER PRO 9.9
+🤖 ROMARIO TRADER PRO 10.0
 
 {emoji} {direction}
 
@@ -508,22 +514,22 @@ def build_message(signal, entry_open):
 🎯 MATCHED PAIR: {signal['reference'][0]} / {signal['reference'][1]}
 📏 DISTANCE: {signal['distance']:.2f}
 
-⏱ TIMEFRAME: M1
+⏱ TIMEFRAME: 30 SECONDS
 ⌛ EXPIRATION: 60 SECONDS
 
 📨 SIGNAL TIME: {signal_time}
 🎯 ENTRY TIME: {entry_time}
 
-⚠️ Demo-test the signal before live trading.
+⚠️ TEST ON DEMO FIRST.
 """.strip()
 
 
-# --------------------------------------------------
+# =====================================================
 # MAIN
-# --------------------------------------------------
+# =====================================================
 
 def main():
-    logging.info("ROMARIO TRADER PRO 9.9 starting...")
+    logging.info("ROMARIO TRADER PRO 10.0 starting...")
 
     if not API_KEY:
         raise RuntimeError("OTCHARTS_API_KEY is missing")
@@ -539,11 +545,10 @@ def main():
     )
 
     if not symbols:
-        logging.warning("No eligible OTC symbols found.")
         send_telegram(
-            "🤖 ROMARIO TRADER PRO 9.9\n\n"
+            "🤖 ROMARIO TRADER PRO 10.0\n\n"
             "⚪ NO VALID SIGNAL\n"
-            "No eligible OTC pairs were returned."
+            "No eligible OTC pairs returned."
         )
         return
 
@@ -560,6 +565,7 @@ def main():
 
             if signal:
                 candidates.append(signal)
+
                 logging.info(
                     "Candidate: %s %s | K %.2f D %.2f",
                     signal["direction"],
@@ -575,18 +581,17 @@ def main():
             )
 
     if not candidates:
-        logging.info("No valid signal passed all filters.")
+        logging.info("No signal passed all filters.")
 
         send_telegram(
-            "🤖 ROMARIO TRADER PRO 9.9\n\n"
+            "🤖 ROMARIO TRADER PRO 10.0\n\n"
             "⚪ NO VALID SIGNAL\n"
-            "No pair passed your STOCHASTIC, EMA "
-            "and candle confirmation rules.\n\n"
+            "No pair passed the STOCHASTIC and EMA "
+            "confirmation rules.\n\n"
             "No signal was forced."
         )
         return
 
-    # One best confirmed candidate.
     candidates.sort(
         key=lambda x: (
             x["distance"],
@@ -597,7 +602,7 @@ def main():
     best = candidates[0]
 
     logging.info(
-        "Best candidate: %s %s",
+        "Best signal: %s %s",
         best["direction"],
         best["symbol"]
     )
@@ -605,15 +610,15 @@ def main():
     entry_open = wait_for_entry()
 
     if entry_open is None:
-        logging.warning("Signal skipped because entry time passed.")
+        logging.warning("Signal skipped.")
         return
 
     message = build_message(best, entry_open)
 
     if send_telegram(message):
-        logging.info("Telegram signal sent successfully.")
+        logging.info("Signal sent successfully.")
     else:
-        logging.error("Telegram signal could not be sent.")
+        logging.error("Signal sending failed.")
 
 
 if __name__ == "__main__":
