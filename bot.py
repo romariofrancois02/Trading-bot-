@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 10.4
-# Pocket Option OTC | 30s | Expiration 60s
+# ROMARIO TRADER PRO 10.5
+# Pocket Option OTC | M30s | Expiration 60s
 # Telegram alerts only
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 10.4"
+VERSION = "ROMARIO TRADER PRO 10.5"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -79,13 +79,13 @@ logging.basicConfig(
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTrader/10.4",
+    "User-Agent": "RomarioTrader/10.5",
     "Accept": "application/json"
 })
 
 
 # =====================================================
-# API
+# SECRETS AND API
 # =====================================================
 
 def validate_secrets():
@@ -186,7 +186,7 @@ def get_symbols():
 
 
 # =====================================================
-# CANDLE DATA
+# CANDLES
 # =====================================================
 
 def get_candles(symbol):
@@ -243,9 +243,7 @@ def get_candles(symbol):
                 c["low"], c["close"]
             ]
 
-            if not all(
-                math.isfinite(value) for value in values
-            ):
+            if not all(math.isfinite(v) for v in values):
                 continue
 
             if c["high"] < c["low"]:
@@ -270,10 +268,10 @@ def get_candles(symbol):
 
     candles = list(unique.values())
 
-    # Pocket Option timestamps use its UTC+2 clock.
+    # Assumes OTCharts candle timestamps use UTC+2.
     broker_now = time.time() + OTC_CLOCK_OFFSET
 
-    # Keep completed candles only.
+    # Remove unfinished candles.
     candles = [
         c for c in candles
         if c["time"] + TIMEFRAME <= broker_now - 1
@@ -295,7 +293,7 @@ def get_candles(symbol):
 
         if difference != TIMEFRAME:
             logging.warning(
-                "%s: invalid candle spacing %ss",
+                "%s: irregular candle spacing %ss",
                 symbol,
                 difference
             )
@@ -392,7 +390,7 @@ def stochastic(candles):
 
 
 # =====================================================
-# STOCHASTIC REFERENCE BONUS
+# REFERENCE PAIRS
 # =====================================================
 
 def reference_match(k, d, direction):
@@ -448,7 +446,6 @@ def candle_quality(candle, direction):
 
 def analyze(pair):
     symbol = pair["symbol"]
-
     candles = get_candles(symbol)
 
     if candles is None:
@@ -466,7 +463,6 @@ def analyze(pair):
 
     k = k_values[i]
     d = d_values[i]
-
     previous_k = k_values[i - 1]
 
     e9 = ema9[i]
@@ -474,7 +470,6 @@ def analyze(pair):
     e50 = ema50[i]
 
     previous_e9 = ema9[i - 1]
-
     previous_e21 = ema21[i - 1]
 
     required = [
@@ -490,15 +485,9 @@ def analyze(pair):
     candle = candles[i]
     close = candle["close"]
 
-    # ---------------------------------------------
-    # CALL
-    # ---------------------------------------------
+    # ---------------- CALL ----------------
 
-    call_trend = (
-        e9 > e21
-        and close > e21
-    )
-
+    call_trend = e9 > e21 and close > e21
     call_stoch = k > d
 
     if call_trend and call_stoch and k < 90:
@@ -512,12 +501,11 @@ def analyze(pair):
 
         count = sum(confirmations.values())
         matched = reference_match(k, d, "CALL")
-
         score = 2 + count + int(matched)
 
         logging.info(
-            "%s CALL | K=%.1f D=%.1f | confirms=%s/4 | score=%s/7 | ref=%s",
-            symbol, k, d, count, score, matched
+            "%s CALL | K=%.1f D=%.1f | confirms=%s/4 | score=%s/7",
+            symbol, k, d, count, score
         )
 
         if count >= MIN_CONFIRMATIONS:
@@ -532,15 +520,9 @@ def analyze(pair):
                 "reference": matched
             }
 
-    # ---------------------------------------------
-    # PUT
-    # ---------------------------------------------
+    # ---------------- PUT ----------------
 
-    put_trend = (
-        e9 < e21
-        and close < e21
-    )
-
+    put_trend = e9 < e21 and close < e21
     put_stoch = k < d
 
     if put_trend and put_stoch and k > 10:
@@ -554,12 +536,11 @@ def analyze(pair):
 
         count = sum(confirmations.values())
         matched = reference_match(k, d, "PUT")
-
         score = 2 + count + int(matched)
 
         logging.info(
-            "%s PUT | K=%.1f D=%.1f | confirms=%s/4 | score=%s/7 | ref=%s",
-            symbol, k, d, count, score, matched
+            "%s PUT | K=%.1f D=%.1f | confirms=%s/4 | score=%s/7",
+            symbol, k, d, count, score
         )
 
         if count >= MIN_CONFIRMATIONS:
@@ -638,7 +619,51 @@ def choose_best(candidates):
 
 
 # =====================================================
-# ENTRY TIMING
+# ENTRY TIME
+# ALWAYS AT FULL MINUTE (:00)
+# ALERT 15 SECONDS BEFORE ENTRY
+# =====================================================
+
+def prepare_entry(best):
+    now = time.time()
+
+    # Find the next full minute.
+    entry = (int(now) // 60 + 1) * 60
+
+    # Alert exactly 15 seconds before entry.
+    send_at = entry - ENTRY_LEAD
+
+    # If that alert time has already passed,
+    # use the following full minute.
+    if send_at <= now:
+        entry += 60
+        send_at = entry - ENTRY_LEAD
+
+    delay = send_at - time.time()
+
+    logging.info(
+        "ENTRY SCHEDULED | SIGNAL AT %s | ENTRY AT %s",
+        florida_time(send_at).strftime("%I:%M:%S %p"),
+        florida_time(entry).strftime("%I:%M:%S %p")
+    )
+
+    if delay > 0:
+        logging.info(
+            "Waiting %.1f seconds for signal time",
+            delay
+        )
+        time.sleep(delay)
+
+    # Do not send a late signal.
+    if time.time() >= entry - 1:
+        logging.warning("Entry window missed. Signal cancelled.")
+        return None, None
+
+    return best, entry
+
+
+# =====================================================
+# TIME
 # =====================================================
 
 def florida_time(epoch):
@@ -646,51 +671,6 @@ def florida_time(epoch):
         epoch,
         tz=timezone.utc
     ).astimezone(FLORIDA)
-
-
-def prepare_entry(pairs, best):
-    now = time.time()
-
-    next_boundary = (
-        int(now // TIMEFRAME) + 1
-    ) * TIMEFRAME
-
-    send_at = next_boundary - ENTRY_LEAD
-
-    # If the alert deadline has passed, wait for
-    # the next candle to close and scan fresh data.
-    if send_at <= now:
-        logging.info(
-            "Previous entry window missed. Waiting for fresh candle."
-        )
-
-        time.sleep(
-            max(0, next_boundary + 2 - time.time())
-        )
-
-        candidates, errors = scan_pairs(pairs)
-        best = choose_best(candidates)
-
-        if best is None:
-            return None, None
-
-        next_boundary += TIMEFRAME
-        send_at = next_boundary - ENTRY_LEAD
-
-    delay = send_at - time.time()
-
-    if delay > 0:
-        logging.info(
-            "Waiting %.1f seconds until alert time",
-            delay
-        )
-        time.sleep(delay)
-
-    if time.time() >= next_boundary:
-        logging.warning("Entry deadline missed; cancelling signal")
-        return None, None
-
-    return best, next_boundary
 
 
 # =====================================================
@@ -755,31 +735,26 @@ def main():
         return
 
     candidates, errors = scan_pairs(pairs)
-
     best = choose_best(candidates)
 
     if best is None:
         send_no_signal(len(pairs), errors)
         return
 
-    best, entry_epoch = prepare_entry(pairs, best)
+    best, entry_epoch = prepare_entry(best)
 
     if best is None:
-        logging.warning("Signal cancelled: no fresh entry")
+        logging.warning("Signal cancelled: entry window missed")
         send_no_signal(len(pairs), errors)
         return
 
-    signal_time = florida_time(time.time())
+    signal_epoch = time.time()
+
+    signal_time = florida_time(signal_epoch)
     entry_time = florida_time(entry_epoch)
 
-    icon = (
-        "🟢" if best["direction"] == "CALL"
-        else "🔴"
-    )
-
-    reference = (
-        "YES" if best["reference"] else "NO"
-    )
+    icon = "🟢" if best["direction"] == "CALL" else "🔴"
+    reference = "YES" if best["reference"] else "NO"
 
     message = (
         f"🤖 <b>{VERSION}</b>\n\n"
@@ -796,7 +771,7 @@ def main():
         f"📨 SIGNAL TIME: <b>{signal_time.strftime('%I:%M:%S %p')}</b>\n"
         f"🚀 ENTRY TIME: <b>{entry_time.strftime('%I:%M:%S %p')}</b>\n"
         "🌴 FLORIDA TIME\n\n"
-        "⚠️ Demo-test the signal. No result is guaranteed."
+        "⚠️ Demo-test first. No result is guaranteed."
     )
 
     send_telegram(message)
