@@ -1,6 +1,7 @@
 
 import os
 import re
+import json
 import time
 import logging
 import requests
@@ -9,19 +10,18 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 10.7
+# ROMARIO TRADER PRO 10.8
 # OTC | M30s | EXPIRATION 60s
-# BEST SIGNAL + HISTORICAL WIN RATE
+# BEST SIGNAL | 10s ENTRY | WIN/LOSS TRACKING
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 10.7"
+VERSION = "ROMARIO TRADER PRO 10.8"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 
 TIMEFRAME = 30
 EXPIRATION = 60
-
 CANDLE_LIMIT = 300
 MIN_CANDLES = 60
 
@@ -30,8 +30,12 @@ ADX_PERIOD = 14
 ADX_MIN = 15.0
 MIN_SCORE = 5
 
-MIN_HISTORY_TRADES = 10
+ENTRY_LEAD = 10
+SCAN_INTERVAL = 5
+MAX_SCAN_MINUTES = 300
+
 API_ATTEMPTS = 4
+STATE_FILE = "state.json"
 
 OTC_CLOCK_OFFSET = int(
     os.getenv("OTC_CLOCK_OFFSET", "7200")
@@ -56,11 +60,10 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/10.7"
+    "User-Agent": "ROMARIO-TRADER-PRO/10.8"
 })
 
 
@@ -68,21 +71,35 @@ session.headers.update({
 # TIME
 # =====================================================
 
-def florida_time(timestamp=None):
-    if timestamp is None:
-        timestamp = time.time()
-
+def display_time(timestamp):
     return datetime.fromtimestamp(
         timestamp,
         FLORIDA
-    ).strftime("%Y-%m-%d %I:%M:%S %p")
+    ).strftime("%I:%M:%S %p")
+
+
+def next_entry_window():
+    now = time.time()
+
+    boundary = (
+        int(now // TIMEFRAME) + 1
+    ) * TIMEFRAME
+
+    signal_time = boundary - ENTRY_LEAD
+
+    if signal_time <= now + 1:
+        boundary += TIMEFRAME
+        signal_time += TIMEFRAME
+
+    return signal_time, boundary
 
 
 # =====================================================
-# API WITH AUTOMATIC RETRIES
+# API WITH RETRIES
 # =====================================================
 
 def api_get(endpoint, params=None):
+
     url = BASE_URL + endpoint
 
     for attempt in range(API_ATTEMPTS):
@@ -106,16 +123,14 @@ def api_get(endpoint, params=None):
                     delay = float(retry_after)
                 except (TypeError, ValueError):
                     delay = min(
-                        3 * (2 ** attempt),
-                        30
+                        3 * (2 ** attempt), 30
                     )
 
                 logging.warning(
-                    "HTTP %s | Attempt %s/%s | Retry in %s sec",
+                    "HTTP %s | Attempt %s/%s",
                     response.status_code,
                     attempt + 1,
-                    API_ATTEMPTS,
-                    delay
+                    API_ATTEMPTS
                 )
 
                 if attempt < API_ATTEMPTS - 1:
@@ -126,18 +141,15 @@ def api_get(endpoint, params=None):
 
             data = response.json()
 
-            if isinstance(data, dict):
-                if data.get("error"):
-                    raise RuntimeError(
-                        str(data["error"])
-                    )
+            if isinstance(data, dict) and data.get("error"):
+                raise RuntimeError(str(data["error"]))
 
             return data
 
         except requests.exceptions.RequestException as error:
 
             logging.warning(
-                "API error | Attempt %s/%s | %s",
+                "API error %s/%s: %s",
                 attempt + 1,
                 API_ATTEMPTS,
                 error
@@ -150,13 +162,85 @@ def api_get(endpoint, params=None):
                 min(3 * (2 ** attempt), 30)
             )
 
-    raise RuntimeError(
-        "OTCharts unavailable after retries"
-    )
+    raise RuntimeError("OTCharts unavailable")
 
 
 # =====================================================
-# GENERAL HELPERS
+# TELEGRAM
+# =====================================================
+
+def telegram_send(message):
+
+    url = (
+        f"https://api.telegram.org/"
+        f"bot{TELEGRAM_TOKEN}/sendMessage"
+    )
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        },
+        timeout=25
+    )
+
+    response.raise_for_status()
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram message failed")
+
+
+# =====================================================
+# STATE FILE
+# =====================================================
+
+def load_state():
+
+    if not os.path.exists(STATE_FILE):
+        return {
+            "pending": None,
+            "last_result": None
+        }
+
+    try:
+        with open(STATE_FILE, "r") as file:
+            state = json.load(file)
+
+        if not isinstance(state, dict):
+            raise ValueError("Invalid state")
+
+        state.setdefault("pending", None)
+        state.setdefault("last_result", None)
+
+        return state
+
+    except Exception as error:
+        logging.warning(
+            "Could not read state file: %s",
+            error
+        )
+
+        return {
+            "pending": None,
+            "last_result": None
+        }
+
+
+def save_state(state):
+
+    temporary = STATE_FILE + ".tmp"
+
+    with open(temporary, "w") as file:
+        json.dump(state, file, indent=2)
+
+    os.replace(temporary, STATE_FILE)
+
+
+# =====================================================
+# DATA HELPERS
 # =====================================================
 
 def extract_list(data, keys):
@@ -175,10 +259,7 @@ def extract_list(data, keys):
         for value in data.values():
 
             if isinstance(value, dict):
-                result = extract_list(
-                    value,
-                    keys
-                )
+                result = extract_list(value, keys)
 
                 if result:
                     return result
@@ -186,34 +267,22 @@ def extract_list(data, keys):
     return []
 
 
-def telegram_send(message):
+def normalize_timestamp(value):
 
-    url = (
-        "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
+    try:
+        value = float(value)
 
-    response = requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
-        },
-        timeout=25
-    )
+        if value > 1000000000000:
+            value /= 1000
 
-    response.raise_for_status()
+        return value
 
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(
-            "Telegram message failed"
-        )
+    except (TypeError, ValueError):
+        return None
 
 
 # =====================================================
-# OTC SYMBOLS
+# SYMBOLS
 # =====================================================
 
 def get_symbols():
@@ -288,20 +357,6 @@ def get_symbols():
 # CANDLES
 # =====================================================
 
-def normalize_timestamp(value):
-
-    try:
-        value = float(value)
-
-        if value > 1000000000000:
-            value /= 1000
-
-        return value
-
-    except (TypeError, ValueError):
-        return None
-
-
 def get_candles(symbol):
 
     data = api_get(
@@ -328,14 +383,9 @@ def get_candles(symbol):
         gaps = data.get("gaps")
 
         if isinstance(gaps, dict):
-
-            missing = gaps.get(
-                "missingBars", 0
-            )
-
-            if missing not in (0, None):
+            if gaps.get("missingBars", 0) not in (0, None):
                 raise RuntimeError(
-                    f"{symbol}: missing candle bars"
+                    f"{symbol}: missing bars"
                 )
 
     rows = extract_list(
@@ -351,10 +401,7 @@ def get_candles(symbol):
             continue
 
         timestamp = normalize_timestamp(
-            row.get(
-                "time",
-                row.get("timestamp")
-            )
+            row.get("time", row.get("timestamp"))
         )
 
         if timestamp is None:
@@ -374,14 +421,12 @@ def get_candles(symbol):
                 continue
 
             if candle["high"] < max(
-                candle["open"],
-                candle["close"]
+                candle["open"], candle["close"]
             ):
                 continue
 
             if candle["low"] > min(
-                candle["open"],
-                candle["close"]
+                candle["open"], candle["close"]
             ):
                 continue
 
@@ -390,38 +435,29 @@ def get_candles(symbol):
         except (KeyError, TypeError, ValueError):
             continue
 
-    candles.sort(
-        key=lambda x: x["time"]
-    )
+    candles.sort(key=lambda x: x["time"])
 
-    # Remove unfinished candles.
     adjusted_now = (
         time.time() + OTC_CLOCK_OFFSET
     )
 
     candles = [
-        candle
-        for candle in candles
-        if candle["time"] + TIMEFRAME <= adjusted_now
+        c for c in candles
+        if c["time"] + TIMEFRAME <= adjusted_now
     ]
 
     if len(candles) < MIN_CANDLES:
         raise RuntimeError(
-            f"{symbol}: not enough completed candles"
+            f"{symbol}: insufficient completed candles"
         )
-
-    recent = candles[-10:]
 
     for previous, current in zip(
-        recent,
-        recent[1:]
+        candles[-10:], candles[-9:]
     ):
 
-        difference = (
-            current["time"] - previous["time"]
-        )
-
-        if abs(difference - TIMEFRAME) > 2:
+        if abs(
+            current["time"] - previous["time"] - TIMEFRAME
+        ) > 2:
             raise RuntimeError(
                 f"{symbol}: candle continuity error"
             )
@@ -440,9 +476,7 @@ def calculate_ema(values, period):
 
     multiplier = 2 / (period + 1)
 
-    ema = sum(
-        values[:period]
-    ) / period
+    ema = sum(values[:period]) / period
 
     result = (
         [None] * (period - 1)
@@ -477,27 +511,17 @@ def calculate_stochastic(candles):
 
         window = candles[i - 13:i + 1]
 
-        highest = max(
-            x["high"] for x in window
-        )
-
-        lowest = min(
-            x["low"] for x in window
-        )
+        highest = max(x["high"] for x in window)
+        lowest = min(x["low"] for x in window)
 
         if highest == lowest:
             raw.append(50.0)
-
         else:
-            value = (
-                100
-                * (
+            raw.append(
+                100 * (
                     candles[i]["close"] - lowest
-                )
-                / (highest - lowest)
+                ) / (highest - lowest)
             )
-
-            raw.append(value)
 
     k = [None] * len(candles)
 
@@ -537,60 +561,38 @@ def calculate_adx(candles, period=14):
         current = candles[i]
         previous = candles[i - 1]
 
-        up = (
-            current["high"] - previous["high"]
-        )
-
-        down = (
-            previous["low"] - current["low"]
-        )
+        up = current["high"] - previous["high"]
+        down = previous["low"] - current["low"]
 
         plus_dm[i] = (
-            up
-            if up > down and up > 0
-            else 0.0
+            up if up > down and up > 0 else 0.0
         )
 
         minus_dm[i] = (
-            down
-            if down > up and down > 0
-            else 0.0
+            down if down > up and down > 0 else 0.0
         )
 
         tr[i] = max(
             current["high"] - current["low"],
-            abs(
-                current["high"] - previous["close"]
-            ),
-            abs(
-                current["low"] - previous["close"]
-            )
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
         )
+
+    adx = [None] * length
+    plus_di = [None] * length
+    minus_di = [None] * length
+    dx = [None] * length
 
     smooth_tr = [None] * length
     smooth_plus = [None] * length
     smooth_minus = [None] * length
 
-    adx = [None] * length
-    plus_di = [None] * length
-    minus_di = [None] * length
-
-    dx = [None] * length
-
     if length <= period * 2:
         return adx, plus_di, minus_di
 
-    smooth_tr[period] = sum(
-        tr[1:period + 1]
-    )
-
-    smooth_plus[period] = sum(
-        plus_dm[1:period + 1]
-    )
-
-    smooth_minus[period] = sum(
-        minus_dm[1:period + 1]
-    )
+    smooth_tr[period] = sum(tr[1:period + 1])
+    smooth_plus[period] = sum(plus_dm[1:period + 1])
+    smooth_minus[period] = sum(minus_dm[1:period + 1])
 
     for i in range(period + 1, length):
 
@@ -625,18 +627,13 @@ def calculate_adx(candles, period=14):
             100 * smooth_minus[i] / smooth_tr[i]
         )
 
-        denominator = (
-            plus_di[i] + minus_di[i]
-        )
+        denominator = plus_di[i] + minus_di[i]
 
         if denominator:
-
             dx[i] = (
-                100
-                * abs(
+                100 * abs(
                     plus_di[i] - minus_di[i]
-                )
-                / denominator
+                ) / denominator
             )
 
     first = period * 2
@@ -653,19 +650,15 @@ def calculate_adx(candles, period=14):
     if len(initial) < period:
         return adx, plus_di, minus_di
 
-    adx[first] = (
-        sum(initial[-period:]) / period
-    )
+    adx[first] = sum(initial[-period:]) / period
 
     for i in range(first + 1, length):
 
-        if dx[i] is None:
-            continue
-
-        adx[i] = (
-            adx[i - 1] * (period - 1)
-            + dx[i]
-        ) / period
+        if dx[i] is not None:
+            adx[i] = (
+                adx[i - 1] * (period - 1)
+                + dx[i]
+            ) / period
 
     return adx, plus_di, minus_di
 
@@ -676,9 +669,7 @@ def calculate_adx(candles, period=14):
 
 def candle_quality(candle, direction):
 
-    candle_range = (
-        candle["high"] - candle["low"]
-    )
+    candle_range = candle["high"] - candle["low"]
 
     if candle_range <= 0:
         return False
@@ -695,7 +686,6 @@ def candle_quality(candle, direction):
     ) / candle_range
 
     if direction == "CALL":
-
         return (
             candle["close"] > candle["open"]
             and position >= 0.65
@@ -708,7 +698,7 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STOCHASTIC REFERENCE
+# STOCHASTIC REFERENCE BONUS
 # =====================================================
 
 CALL_PAIRS = [
@@ -730,27 +720,23 @@ PUT_PAIRS = [
 def reference_match(k, d, direction):
 
     pairs = (
-        CALL_PAIRS
-        if direction == "CALL"
+        CALL_PAIRS if direction == "CALL"
         else PUT_PAIRS
     )
 
     return any(
-        abs(k - ref_k) <= 10
-        and abs(d - ref_d) <= 10
-        for ref_k, ref_d in pairs
+        abs(k - a) <= 10 and abs(d - b) <= 10
+        for a, b in pairs
     )
 
 
 # =====================================================
-# BUILD INDICATORS
+# INDICATORS
 # =====================================================
 
 def build_indicators(candles):
 
-    closes = [
-        c["close"] for c in candles
-    ]
+    closes = [c["close"] for c in candles]
 
     ema9 = calculate_ema(closes, 9)
     ema21 = calculate_ema(closes, 21)
@@ -759,8 +745,7 @@ def build_indicators(candles):
     k, d = calculate_stochastic(candles)
 
     adx, plus_di, minus_di = calculate_adx(
-        candles,
-        ADX_PERIOD
+        candles, ADX_PERIOD
     )
 
     return {
@@ -776,7 +761,7 @@ def build_indicators(candles):
 
 
 # =====================================================
-# SIGNAL RULES AT A SPECIFIC CANDLE
+# SIGNAL AT CANDLE
 # =====================================================
 
 def signal_at(candles, ind, i, payout):
@@ -804,10 +789,9 @@ def signal_at(candles, ind, i, payout):
     if any(v is None for v in values):
         return None
 
+    candle = candles[i]
     direction = None
     score = 0
-
-    candle = candles[i]
 
     # CALL
     if (
@@ -840,9 +824,7 @@ def signal_at(candles, ind, i, payout):
             score += 1
 
         if reference_match(
-            ind["k"][i],
-            ind["d"][i],
-            "CALL"
+            ind["k"][i], ind["d"][i], "CALL"
         ):
             score += 1
 
@@ -877,9 +859,7 @@ def signal_at(candles, ind, i, payout):
             score += 1
 
         if reference_match(
-            ind["k"][i],
-            ind["d"][i],
-            "PUT"
+            ind["k"][i], ind["d"][i], "PUT"
         ):
             score += 1
 
@@ -889,135 +869,130 @@ def signal_at(candles, ind, i, payout):
     return {
         "direction": direction,
         "score": score,
+        "strength": round(score / 12 * 100),
         "payout": payout,
         "k": ind["k"][i],
         "d": ind["d"][i],
         "adx": ind["adx"][i],
         "plus_di": ind["plus_di"][i],
-        "minus_di": ind["minus_di"][i]
+        "minus_di": ind["minus_di"][i],
+        "candle_time": candles[i]["time"]
     }
 
 
 # =====================================================
-# HISTORICAL WIN RATE
-# =====================================================
-
-def historical_win_rate(candles, ind, payout):
-
-    wins = 0
-    losses = 0
-    ties = 0
-
-    # Signal candle i
-    # Entry: next candle open (i+1)
-    # Expiration: close of candle i+2
-
-    start = 50
-    end = len(candles) - 2
-
-    i = start
-
-    while i < end:
-
-        signal = signal_at(
-            candles,
-            ind,
-            i,
-            payout
-        )
-
-        if signal is None:
-            i += 1
-            continue
-
-        entry_price = candles[i + 1]["open"]
-        exit_price = candles[i + 2]["close"]
-
-        if signal["direction"] == "CALL":
-
-            if exit_price > entry_price:
-                wins += 1
-
-            elif exit_price < entry_price:
-                losses += 1
-
-            else:
-                ties += 1
-
-        else:
-
-            if exit_price < entry_price:
-                wins += 1
-
-            elif exit_price > entry_price:
-                losses += 1
-
-            else:
-                ties += 1
-
-        # Avoid overlapping historical trades.
-        i += 3
-
-    completed = wins + losses
-
-    if completed == 0:
-        rate = None
-    else:
-        rate = (
-            wins / completed
-        ) * 100
-
-    return {
-        "wins": wins,
-        "losses": losses,
-        "ties": ties,
-        "total": completed,
-        "rate": rate
-    }
-
-
-# =====================================================
-# ANALYZE ONE PAIR
+# ANALYZE PAIR
 # =====================================================
 
 def analyze_pair(pair):
 
-    symbol = pair["symbol"]
-    payout = pair["payout"]
-
-    candles = get_candles(symbol)
-
+    candles = get_candles(pair["symbol"])
     ind = build_indicators(candles)
 
-    latest_index = len(candles) - 1
+    i = len(candles) - 1
 
     signal = signal_at(
         candles,
         ind,
-        latest_index,
-        payout
+        i,
+        pair["payout"]
     )
 
     if signal is None:
         return None
 
-    history = historical_win_rate(
-        candles,
-        ind,
-        payout
-    )
-
-    signal.update({
-        "symbol": symbol,
-        "candle_time": candles[-1]["time"],
-        "history": history
-    })
+    signal["symbol"] = pair["symbol"]
 
     return signal
 
 
 # =====================================================
-# SCAN MARKET
+# VERIFY PREVIOUS SIGNAL RESULT
+# =====================================================
+
+def verify_pending_result(state):
+
+    pending = state.get("pending")
+
+    if not pending:
+        return
+
+    entry_time = float(pending["entry_time"])
+
+    # Wait until the 60-second expiration is complete.
+    if time.time() < entry_time + EXPIRATION + 5:
+        logging.info("Previous signal is still pending.")
+        return
+
+    try:
+        candles = get_candles(pending["symbol"])
+
+        entry_candle = min(
+            candles,
+            key=lambda c: abs(c["time"] - entry_time)
+        )
+
+        exit_target = entry_time + TIMEFRAME
+
+        exit_candle = min(
+            candles,
+            key=lambda c: abs(c["time"] - exit_target)
+        )
+
+        if abs(entry_candle["time"] - entry_time) > 3:
+            logging.warning("Cannot match entry candle yet.")
+            return
+
+        if abs(exit_candle["time"] - exit_target) > 3:
+            logging.warning("Cannot match expiration candle yet.")
+            return
+
+        entry_price = entry_candle["open"]
+        exit_price = exit_candle["close"]
+
+        if pending["direction"] == "CALL":
+
+            if exit_price > entry_price:
+                result = "WIN"
+            elif exit_price < entry_price:
+                result = "LOSS"
+            else:
+                result = "TIE"
+
+        else:
+
+            if exit_price < entry_price:
+                result = "WIN"
+            elif exit_price > entry_price:
+                result = "LOSS"
+            else:
+                result = "TIE"
+
+        state["last_result"] = {
+            "result": result,
+            "symbol": pending["symbol"],
+            "direction": pending["direction"],
+            "entry_price": entry_price,
+            "exit_price": exit_price
+        }
+
+        state["pending"] = None
+
+        logging.info(
+            "PREVIOUS SIGNAL RESULT: %s",
+            result
+        )
+
+    except Exception as error:
+
+        logging.warning(
+            "Could not verify previous result: %s",
+            error
+        )
+
+
+# =====================================================
+# SCAN ALL PAIRS
 # =====================================================
 
 def scan_market():
@@ -1034,11 +1009,9 @@ def scan_market():
 
     for number, pair in enumerate(pairs, 1):
 
-        symbol = pair["symbol"]
-
         logging.info(
             "Scanning %s (%s/%s)",
-            symbol,
+            pair["symbol"],
             number,
             len(pairs)
         )
@@ -1052,11 +1025,10 @@ def scan_market():
                 candidates.append(result)
 
                 logging.info(
-                    "VALID %s %s | SCORE %s | ADX %.2f",
-                    symbol,
+                    "VALID %s %s | SCORE %s",
+                    result["symbol"],
                     result["direction"],
-                    result["score"],
-                    result["adx"]
+                    result["score"]
                 )
 
         except Exception as error:
@@ -1065,7 +1037,7 @@ def scan_market():
 
             logging.warning(
                 "%s error: %s",
-                symbol,
+                pair["symbol"],
                 error
             )
 
@@ -1082,14 +1054,11 @@ def scan_market():
 
 
 # =====================================================
-# REFRESH TOP CANDIDATES
+# REFRESH BEST SIGNAL
 # =====================================================
 
 def refresh_best(candidates):
 
-    refreshed = []
-
-    # Recheck the three highest-ranked candidates.
     for candidate in candidates[:3]:
 
         pair = {
@@ -1099,10 +1068,10 @@ def refresh_best(candidates):
 
         try:
 
-            result = analyze_pair(pair)
+            refreshed = analyze_pair(pair)
 
-            if result:
-                refreshed.append(result)
+            if refreshed:
+                return refreshed
 
         except Exception as error:
 
@@ -1112,54 +1081,30 @@ def refresh_best(candidates):
                 error
             )
 
-    if not refreshed:
-        return None
-
-    refreshed.sort(
-        key=lambda x: (
-            x["score"],
-            x["adx"],
-            x["payout"]
-        ),
-        reverse=True
-    )
-
-    return refreshed[0]
+    return None
 
 
 # =====================================================
-# SIGNAL MESSAGE
+# TELEGRAM MESSAGE
 # =====================================================
 
-def format_win_rate(history):
+def build_signal_message(signal, signal_time, entry_time, previous_result):
 
-    if history["rate"] is None:
-        return (
-            "NOT ENOUGH DATA "
-            f"({history['total']} completed trades)"
+    if previous_result:
+
+        previous_text = (
+            f"📋 PREVIOUS SIGNAL: {previous_result['result']}\n"
+            f"PAIR: {previous_result['symbol']}\n"
+            f"DIRECTION: {previous_result['direction']}\n"
+            f"ENTRY PRICE: {previous_result['entry_price']}\n"
+            f"EXIT PRICE: {previous_result['exit_price']}"
         )
 
-    if history["total"] < MIN_HISTORY_TRADES:
+    else:
 
-        return (
-            "NOT ENOUGH DATA "
-            f"({history['total']} completed trades)"
+        previous_text = (
+            "📋 PREVIOUS SIGNAL: NO VERIFIED RESULT"
         )
-
-    return (
-        f"{history['rate']:.1f}% "
-        f"({history['wins']}W / "
-        f"{history['losses']}L)"
-    )
-
-
-def build_signal_message(signal):
-
-    now = time.time()
-
-    history = signal["history"]
-
-    win_rate = format_win_rate(history)
 
     return f"""
 🤖 {VERSION}
@@ -1179,27 +1124,18 @@ def build_signal_message(signal):
 ➕ DI+: {signal['plus_di']:.2f}
 ➖ DI-: {signal['minus_di']:.2f}
 
-⭐ STRATEGY SCORE: {signal['score']}
+⭐ STRATEGY SCORE: {signal['score']}/12
+📊 SETUP STRENGTH: {signal['strength']}%
 
-📉 HISTORICAL WIN RATE:
-{win_rate}
+{previous_text}
 
-📋 HISTORICAL RESULTS:
-Wins: {history['wins']}
-Losses: {history['losses']}
-Ties: {history['ties']}
+🕒 SIGNAL TIME: {display_time(signal_time)}
+🎯 ENTRY TIME: {display_time(entry_time)}
 
-🕒 SIGNAL TIME: {florida_time(now)}
-🎯 ENTRY: IMMEDIATE
-
-⚠️ Historical results are not a guarantee.
+⚠️ Setup strength is not a guaranteed win probability.
 Telegram alert only.
 """.strip()
 
-
-# =====================================================
-# NO SIGNAL MESSAGE
-# =====================================================
 
 def no_signal_message(total, errors):
 
@@ -1223,80 +1159,143 @@ No signal was forced.
 
 
 # =====================================================
-# MAIN
+# WAIT FOR A VALID ENTRY WINDOW
+# =====================================================
+
+def wait_for_entry_window():
+
+    signal_time, entry_time = next_entry_window()
+
+    delay = signal_time - time.time()
+
+    if delay > 0:
+        time.sleep(delay)
+
+    if time.time() > signal_time + 2:
+        return None, None
+
+    return signal_time, entry_time
+
+
+# =====================================================
+# MAIN SCAN LOOP
 # =====================================================
 
 def main():
 
-    logging.info(
-        "%s starting...",
-        VERSION
-    )
+    logging.info("%s starting...", VERSION)
 
     if not API_KEY:
-        raise RuntimeError(
-            "OTCHARTS_API_KEY is missing"
-        )
+        raise RuntimeError("OTCHARTS_API_KEY is missing")
 
     if not TELEGRAM_TOKEN:
-        raise RuntimeError(
-            "TELEGRAM_TOKEN is missing"
-        )
+        raise RuntimeError("TELEGRAM_TOKEN is missing")
 
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "TELEGRAM_CHAT_ID is missing"
-        )
+        raise RuntimeError("TELEGRAM_CHAT_ID is missing")
 
-    candidates, total, errors = scan_market()
+    state = load_state()
 
-    if not candidates:
+    # Check the previous signal first.
+    verify_pending_result(state)
+    save_state(state)
 
-        telegram_send(
-            no_signal_message(
-                total,
-                errors
+    start_time = time.time()
+
+    while (
+        time.time() - start_time
+        < MAX_SCAN_MINUTES * 60
+    ):
+
+        candidates, total, errors = scan_market()
+
+        if not candidates:
+
+            logging.info(
+                "No valid setup. Scanning again in %s seconds.",
+                SCAN_INTERVAL
             )
-        )
 
-        logging.info("No valid signal.")
-        return
+            time.sleep(SCAN_INTERVAL)
+            continue
 
-    best = refresh_best(candidates)
+        best = candidates[0]
 
-    if best is None:
+        # Wait for the next candle's 10-second entry window.
+        signal_time, entry_time = wait_for_entry_window()
 
-        telegram_send(
-            no_signal_message(
-                total,
-                errors
+        if signal_time is None:
+            logging.info("Entry window passed. Rescanning.")
+            continue
+
+        # Recheck the best candidate immediately before alert.
+        refreshed = refresh_best(candidates)
+
+        if refreshed is None:
+
+            logging.info(
+                "Setup no longer valid. Rescanning."
             )
+
+            continue
+
+        # Do not send if the selected pair changed direction
+        # or its data is no longer current.
+        if (
+            refreshed["symbol"] != best["symbol"]
+            or refreshed["direction"] != best["direction"]
+        ):
+
+            logging.info(
+                "Best setup changed. Rescanning."
+            )
+
+            continue
+
+        if time.time() > signal_time + 2:
+            logging.info("Signal window missed. Rescanning.")
+            continue
+
+        previous_result = state.get("last_result")
+
+        message = build_signal_message(
+            refreshed,
+            signal_time,
+            entry_time,
+            previous_result
         )
+
+        # Send Telegram alert.
+        telegram_send(message)
+
+        # Save pending trade for next workflow run.
+        state["pending"] = {
+            "symbol": refreshed["symbol"],
+            "direction": refreshed["direction"],
+            "entry_time": entry_time,
+            "signal_time": signal_time
+        }
+
+        # Clear result after attaching it to this signal.
+        state["last_result"] = None
+
+        save_state(state)
 
         logging.info(
-            "No candidate passed the refresh."
+            "SIGNAL SENT: %s %s | ENTRY %s",
+            refreshed["direction"],
+            refreshed["symbol"],
+            display_time(entry_time)
         )
 
         return
 
     logging.info(
-        "BEST SIGNAL: %s %s | SCORE %s | HISTORICAL RATE %s",
-        best["direction"],
-        best["symbol"],
-        best["score"],
-        best["history"]["rate"]
+        "No valid signal found within scan period."
     )
 
-    # Send immediately. No waiting.
-    telegram_send(
-        build_signal_message(best)
-    )
-
-    logging.info(
-        "SIGNAL SENT: %s %s",
-        best["direction"],
-        best["symbol"]
-    )
+    # Keep any previous result/pending signal saved.
+    save_state(state)
 
 
 if __name__ == "__main__":
@@ -1315,8 +1314,7 @@ if __name__ == "__main__":
 
             try:
                 telegram_send(
-                    f"🔴 {VERSION} ERROR\n"
-                    f"{str(error)[:800]}"
+                    f"🔴 {VERSION} ERROR\n{str(error)[:800]}"
                 )
 
             except Exception:
