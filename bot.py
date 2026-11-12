@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 10.5
+# ROMARIO TRADER PRO 10.6
 # Pocket Option OTC | M30s | Expiration 60s
-# Telegram alerts only
+# Two-stage Telegram alerts
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 10.5"
+VERSION = "ROMARIO TRADER PRO 10.6"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -26,7 +26,10 @@ CANDLE_LIMIT = 150
 MIN_CANDLES = 60
 MIN_PAYOUT = 92.0
 
-ENTRY_LEAD = 15
+WARNING_LEAD = 20
+FINAL_LEAD = 5
+RECHECK_BUFFER = 4
+
 OTC_CLOCK_OFFSET = 7200
 
 MIN_CONFIRMATIONS = 3
@@ -79,9 +82,59 @@ logging.basicConfig(
 session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTrader/10.5",
+    "User-Agent": "RomarioTrader/10.6",
     "Accept": "application/json"
 })
+
+
+# =====================================================
+# TIME
+# =====================================================
+
+def florida_time(epoch):
+    return datetime.fromtimestamp(
+        epoch,
+        tz=timezone.utc
+    ).astimezone(FLORIDA)
+
+
+def wait_until(target):
+    while True:
+        remaining = target - time.time()
+
+        if remaining <= 0:
+            return
+
+        time.sleep(min(remaining, 0.25))
+
+
+def prepare_schedule():
+    """
+    Select a future full-minute entry.
+    Warning: entry - 20 seconds.
+    Final signal: entry - 5 seconds.
+    """
+
+    now = time.time()
+
+    entry = (int(now // 60) + 1) * 60
+
+    # Ensure the warning time has not passed.
+    while entry - WARNING_LEAD <= now + 1:
+        entry += 60
+
+    warning_at = entry - WARNING_LEAD
+    final_at = entry - FINAL_LEAD
+    recheck_at = final_at - RECHECK_BUFFER
+
+    logging.info(
+        "SCHEDULE | WARNING=%s | FINAL=%s | ENTRY=%s",
+        florida_time(warning_at).strftime("%I:%M:%S %p"),
+        florida_time(final_at).strftime("%I:%M:%S %p"),
+        florida_time(entry).strftime("%I:%M:%S %p")
+    )
+
+    return warning_at, recheck_at, final_at, entry
 
 
 # =====================================================
@@ -118,6 +171,38 @@ def api_get(path, params=None):
         )
 
     return response.json()
+
+
+# =====================================================
+# TELEGRAM
+# =====================================================
+
+def send_telegram(message):
+    url = (
+        f"https://api.telegram.org/bot"
+        f"{TG_TOKEN}/sendMessage"
+    )
+
+    response = requests.post(
+        url,
+        json={
+            "chat_id": TG_CHAT_ID,
+            "text": message,
+            "parse_mode": "HTML"
+        },
+        timeout=10
+    )
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Telegram HTTP {response.status_code}: "
+            f"{response.text[:300]}"
+        )
+
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError("Telegram rejected message")
 
 
 # =====================================================
@@ -263,12 +348,13 @@ def get_candles(symbol):
     candles.sort(key=lambda x: x["time"])
 
     unique = {}
+
     for candle in candles:
         unique[candle["time"]] = candle
 
     candles = list(unique.values())
 
-    # Assumes OTCharts candle timestamps use UTC+2.
+    # Assumes OTCharts timestamps use UTC+2.
     broker_now = time.time() + OTC_CLOCK_OFFSET
 
     # Remove unfinished candles.
@@ -285,7 +371,6 @@ def get_candles(symbol):
         )
         return None
 
-    # Check recent candle continuity.
     recent = candles[-10:]
 
     for previous, current in zip(recent, recent[1:]):
@@ -619,90 +704,52 @@ def choose_best(candidates):
 
 
 # =====================================================
-# ENTRY TIME
-# ALWAYS AT FULL MINUTE (:00)
-# ALERT 15 SECONDS BEFORE ENTRY
+# TWO-STAGE ALERT SYSTEM
 # =====================================================
 
-def prepare_entry(best):
-    now = time.time()
+def send_pair_warning(best, entry_epoch):
+    entry_time = florida_time(entry_epoch)
 
-    # Find the next full minute.
-    entry = (int(now) // 60 + 1) * 60
+    message = (
+        f"🤖 <b>{VERSION}</b>\n\n"
+        "🟡 <b>PAIR WARNING</b>\n\n"
+        f"💱 PAIR: <b>{best['symbol']}</b>\n"
+        f"💰 PAYOUT: <b>{best['payout']:.1f}%</b>\n"
+        f"⏱ TIMEFRAME: <b>30 SECONDS</b>\n"
+        f"⌛ EXPIRATION: <b>60 SECONDS</b>\n\n"
+        f"🚀 PLANNED ENTRY: <b>{entry_time.strftime('%I:%M:%S %p')}</b>\n"
+        "📨 FINAL CALL/PUT: <b>5 SECONDS BEFORE ENTRY</b>\n\n"
+        "⚠️ WAIT FOR THE FINAL SIGNAL."
+    )
 
-    # Alert exactly 15 seconds before entry.
-    send_at = entry - ENTRY_LEAD
-
-    # If that alert time has already passed,
-    # use the following full minute.
-    if send_at <= now:
-        entry += 60
-        send_at = entry - ENTRY_LEAD
-
-    delay = send_at - time.time()
+    send_telegram(message)
 
     logging.info(
-        "ENTRY SCHEDULED | SIGNAL AT %s | ENTRY AT %s",
-        florida_time(send_at).strftime("%I:%M:%S %p"),
-        florida_time(entry).strftime("%I:%M:%S %p")
+        "PAIR WARNING SENT | %s | ENTRY=%s",
+        best["symbol"],
+        entry_time.strftime("%I:%M:%S %p")
     )
 
-    if delay > 0:
-        logging.info(
-            "Waiting %.1f seconds for signal time",
-            delay
-        )
-        time.sleep(delay)
 
-    # Do not send a late signal.
-    if time.time() >= entry - 1:
-        logging.warning("Entry window missed. Signal cancelled.")
-        return None, None
+def send_cancelled(best, reason, entry_epoch):
+    entry_time = florida_time(entry_epoch)
 
-    return best, entry
-
-
-# =====================================================
-# TIME
-# =====================================================
-
-def florida_time(epoch):
-    return datetime.fromtimestamp(
-        epoch,
-        tz=timezone.utc
-    ).astimezone(FLORIDA)
-
-
-# =====================================================
-# TELEGRAM
-# =====================================================
-
-def send_telegram(message):
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TG_TOKEN}/sendMessage"
+    message = (
+        f"🤖 <b>{VERSION}</b>\n\n"
+        "⚪ <b>SIGNAL CANCELLED</b>\n\n"
+        f"💱 PAIR: <b>{best['symbol']}</b>\n"
+        f"🚀 PLANNED ENTRY: <b>{entry_time.strftime('%I:%M:%S %p')}</b>\n\n"
+        f"Reason: {reason}\n"
+        "No trade signal was issued."
     )
 
-    response = requests.post(
-        url,
-        json={
-            "chat_id": TG_CHAT_ID,
-            "text": message,
-            "parse_mode": "HTML"
-        },
-        timeout=20
+    send_telegram(message)
+
+    logging.warning(
+        "SIGNAL CANCELLED | %s | %s",
+        best["symbol"],
+        reason
     )
-
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"Telegram HTTP {response.status_code}: "
-            f"{response.text[:300]}"
-        )
-
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError("Telegram rejected message")
 
 
 def send_no_signal(pair_count, errors):
@@ -719,35 +766,7 @@ def send_no_signal(pair_count, errors):
     )
 
 
-# =====================================================
-# MAIN
-# =====================================================
-
-def main():
-    logging.info("%s STARTING", VERSION)
-
-    validate_secrets()
-
-    pairs = get_symbols()
-
-    if not pairs:
-        send_no_signal(0, 0)
-        return
-
-    candidates, errors = scan_pairs(pairs)
-    best = choose_best(candidates)
-
-    if best is None:
-        send_no_signal(len(pairs), errors)
-        return
-
-    best, entry_epoch = prepare_entry(best)
-
-    if best is None:
-        logging.warning("Signal cancelled: entry window missed")
-        send_no_signal(len(pairs), errors)
-        return
-
+def send_final_signal(best, entry_epoch):
     signal_epoch = time.time()
 
     signal_time = florida_time(signal_epoch)
@@ -777,12 +796,108 @@ def main():
     send_telegram(message)
 
     logging.info(
-        "SIGNAL SENT | %s | %s | SCORE=%s/7 | ENTRY=%s",
+        "FINAL SIGNAL SENT | %s | %s | SCORE=%s/7 | ENTRY=%s",
         best["direction"],
         best["symbol"],
         best["score"],
         entry_time.strftime("%I:%M:%S %p")
     )
+
+
+def run_two_stage_alert(best):
+    warning_at, recheck_at, final_at, entry = prepare_schedule()
+
+    # Stage 1: wait until 20 seconds before entry.
+    wait_until(warning_at)
+
+    if time.time() >= final_at:
+        logging.warning("Warning window missed. Cancelled.")
+        return False
+
+    send_pair_warning(best, entry)
+
+    # Stage 2: recheck the selected pair shortly before final alert.
+    wait_until(recheck_at)
+
+    pair = {
+        "symbol": best["symbol"],
+        "payout": best["payout"]
+    }
+
+    try:
+        fresh = analyze(pair)
+    except Exception:
+        logging.exception("Final pair verification failed")
+        fresh = None
+
+    if fresh is None:
+        send_cancelled(
+            best,
+            "The pair no longer passes the strategy rules.",
+            entry
+        )
+        return False
+
+    if fresh["direction"] != best["direction"]:
+        send_cancelled(
+            best,
+            "The direction changed during final verification.",
+            entry
+        )
+        return False
+
+    # Wait for exactly five seconds before entry.
+    wait_until(final_at)
+
+    # Do not send a late signal.
+    if time.time() >= entry - 1:
+        send_cancelled(
+            best,
+            "Final verification took too long. Entry window missed.",
+            entry
+        )
+        return False
+
+    send_final_signal(fresh, entry)
+    return True
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+    logging.info("%s STARTING", VERSION)
+
+    validate_secrets()
+
+    pairs = get_symbols()
+
+    if not pairs:
+        send_no_signal(0, 0)
+        return
+
+    candidates, errors = scan_pairs(pairs)
+    best = choose_best(candidates)
+
+    if best is None:
+        send_no_signal(len(pairs), errors)
+        return
+
+    logging.info(
+        "BEST CANDIDATE | %s | %s | SCORE=%s/7 | CONFIRMATIONS=%s/4",
+        best["symbol"],
+        best["direction"],
+        best["score"],
+        best["confirmations"]
+    )
+
+    success = run_two_stage_alert(best)
+
+    if success:
+        logging.info("TWO-STAGE SIGNAL COMPLETED")
+    else:
+        logging.warning("NO FINAL SIGNAL SENT")
 
 
 if __name__ == "__main__":
