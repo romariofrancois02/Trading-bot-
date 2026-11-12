@@ -9,25 +9,29 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 10.6
+# ROMARIO TRADER PRO 10.7
 # OTC | M30s | EXPIRATION 60s
-# IMMEDIATE BEST SIGNAL
+# BEST SIGNAL + HISTORICAL WIN RATE
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 10.6"
+VERSION = "ROMARIO TRADER PRO 10.7"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 
 TIMEFRAME = 30
 EXPIRATION = 60
-CANDLE_LIMIT = 150
+
+CANDLE_LIMIT = 300
 MIN_CANDLES = 60
 
 MIN_PAYOUT = 92.0
 ADX_PERIOD = 14
 ADX_MIN = 15.0
 MIN_SCORE = 5
+
+MIN_HISTORY_TRADES = 10
+API_ATTEMPTS = 4
 
 OTC_CLOCK_OFFSET = int(
     os.getenv("OTC_CLOCK_OFFSET", "7200")
@@ -52,10 +56,11 @@ logging.basicConfig(
 )
 
 session = requests.Session()
+
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-PRO/10.6"
+    "User-Agent": "ROMARIO-TRADER-PRO/10.7"
 })
 
 
@@ -68,43 +73,113 @@ def florida_time(timestamp=None):
         timestamp = time.time()
 
     return datetime.fromtimestamp(
-        timestamp, FLORIDA
+        timestamp,
+        FLORIDA
     ).strftime("%Y-%m-%d %I:%M:%S %p")
 
 
 # =====================================================
-# API
+# API WITH AUTOMATIC RETRIES
 # =====================================================
 
 def api_get(endpoint, params=None):
-    response = session.get(
-        BASE_URL + endpoint,
-        params=params,
-        timeout=25
+    url = BASE_URL + endpoint
+
+    for attempt in range(API_ATTEMPTS):
+
+        try:
+            response = session.get(
+                url,
+                params=params,
+                timeout=30
+            )
+
+            if response.status_code in (
+                429, 502, 503, 504
+            ):
+
+                retry_after = response.headers.get(
+                    "Retry-After"
+                )
+
+                try:
+                    delay = float(retry_after)
+                except (TypeError, ValueError):
+                    delay = min(
+                        3 * (2 ** attempt),
+                        30
+                    )
+
+                logging.warning(
+                    "HTTP %s | Attempt %s/%s | Retry in %s sec",
+                    response.status_code,
+                    attempt + 1,
+                    API_ATTEMPTS,
+                    delay
+                )
+
+                if attempt < API_ATTEMPTS - 1:
+                    time.sleep(delay)
+                    continue
+
+            response.raise_for_status()
+
+            data = response.json()
+
+            if isinstance(data, dict):
+                if data.get("error"):
+                    raise RuntimeError(
+                        str(data["error"])
+                    )
+
+            return data
+
+        except requests.exceptions.RequestException as error:
+
+            logging.warning(
+                "API error | Attempt %s/%s | %s",
+                attempt + 1,
+                API_ATTEMPTS,
+                error
+            )
+
+            if attempt == API_ATTEMPTS - 1:
+                raise
+
+            time.sleep(
+                min(3 * (2 ** attempt), 30)
+            )
+
+    raise RuntimeError(
+        "OTCharts unavailable after retries"
     )
 
-    response.raise_for_status()
-    data = response.json()
 
-    if isinstance(data, dict) and data.get("error"):
-        raise RuntimeError(str(data["error"]))
-
-    return data
-
+# =====================================================
+# GENERAL HELPERS
+# =====================================================
 
 def extract_list(data, keys):
+
     if isinstance(data, list):
         return data
 
     if isinstance(data, dict):
+
         for key in keys:
             value = data.get(key)
+
             if isinstance(value, list):
                 return value
 
         for value in data.values():
+
             if isinstance(value, dict):
-                result = extract_list(value, keys)
+                result = extract_list(
+                    value,
+                    keys
+                )
+
                 if result:
                     return result
 
@@ -112,8 +187,9 @@ def extract_list(data, keys):
 
 
 def telegram_send(message):
+
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
@@ -123,7 +199,7 @@ def telegram_send(message):
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message
         },
-        timeout=20
+        timeout=25
     )
 
     response.raise_for_status()
@@ -131,7 +207,9 @@ def telegram_send(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram message failed")
+        raise RuntimeError(
+            "Telegram message failed"
+        )
 
 
 # =====================================================
@@ -139,6 +217,7 @@ def telegram_send(message):
 # =====================================================
 
 def get_symbols():
+
     data = api_get(
         "/v1/symbols",
         {"venue": VENUE}
@@ -152,6 +231,7 @@ def get_symbols():
     eligible = []
 
     for item in rows:
+
         if not isinstance(item, dict):
             continue
 
@@ -209,6 +289,7 @@ def get_symbols():
 # =====================================================
 
 def normalize_timestamp(value):
+
     try:
         value = float(value)
 
@@ -222,6 +303,7 @@ def normalize_timestamp(value):
 
 
 def get_candles(symbol):
+
     data = api_get(
         "/v1/candles",
         {
@@ -233,6 +315,7 @@ def get_candles(symbol):
     )
 
     if isinstance(data, dict):
+
         interval = data.get("interval")
 
         if interval and str(interval).lower() not in (
@@ -245,7 +328,12 @@ def get_candles(symbol):
         gaps = data.get("gaps")
 
         if isinstance(gaps, dict):
-            if gaps.get("missingBars", 0) not in (0, None):
+
+            missing = gaps.get(
+                "missingBars", 0
+            )
+
+            if missing not in (0, None):
                 raise RuntimeError(
                     f"{symbol}: missing candle bars"
                 )
@@ -258,17 +346,22 @@ def get_candles(symbol):
     candles = []
 
     for row in rows:
+
         if not isinstance(row, dict):
             continue
 
         timestamp = normalize_timestamp(
-            row.get("time", row.get("timestamp"))
+            row.get(
+                "time",
+                row.get("timestamp")
+            )
         )
 
         if timestamp is None:
             continue
 
         try:
+
             candle = {
                 "time": timestamp,
                 "open": float(row["open"]),
@@ -280,19 +373,36 @@ def get_candles(symbol):
             if candle["high"] < candle["low"]:
                 continue
 
+            if candle["high"] < max(
+                candle["open"],
+                candle["close"]
+            ):
+                continue
+
+            if candle["low"] > min(
+                candle["open"],
+                candle["close"]
+            ):
+                continue
+
             candles.append(candle)
 
         except (KeyError, TypeError, ValueError):
             continue
 
-    candles.sort(key=lambda x: x["time"])
+    candles.sort(
+        key=lambda x: x["time"]
+    )
 
-    # Kenbe sèlman candle ki fini.
-    adjusted_now = time.time() + OTC_CLOCK_OFFSET
+    # Remove unfinished candles.
+    adjusted_now = (
+        time.time() + OTC_CLOCK_OFFSET
+    )
 
     candles = [
-        c for c in candles
-        if c["time"] + TIMEFRAME <= adjusted_now
+        candle
+        for candle in candles
+        if candle["time"] + TIMEFRAME <= adjusted_now
     ]
 
     if len(candles) < MIN_CANDLES:
@@ -300,14 +410,18 @@ def get_candles(symbol):
             f"{symbol}: not enough completed candles"
         )
 
-    # Verifye dènye candle yo.
     recent = candles[-10:]
 
-    for previous, current in zip(recent, recent[1:]):
-        if abs(
-            (current["time"] - previous["time"])
-            - TIMEFRAME
-        ) > 2:
+    for previous, current in zip(
+        recent,
+        recent[1:]
+    ):
+
+        difference = (
+            current["time"] - previous["time"]
+        )
+
+        if abs(difference - TIMEFRAME) > 2:
             raise RuntimeError(
                 f"{symbol}: candle continuity error"
             )
@@ -320,19 +434,28 @@ def get_candles(symbol):
 # =====================================================
 
 def calculate_ema(values, period):
+
     if len(values) < period:
         return []
 
     multiplier = 2 / (period + 1)
 
-    ema = sum(values[:period]) / period
-    result = [None] * (period - 1) + [ema]
+    ema = sum(
+        values[:period]
+    ) / period
+
+    result = (
+        [None] * (period - 1)
+        + [ema]
+    )
 
     for value in values[period:]:
+
         ema = (
             value * multiplier
             + ema * (1 - multiplier)
         )
+
         result.append(ema)
 
     return result
@@ -343,30 +466,43 @@ def calculate_ema(values, period):
 # =====================================================
 
 def calculate_stochastic(candles):
+
     raw = []
 
     for i in range(len(candles)):
+
         if i < 13:
             raw.append(None)
             continue
 
         window = candles[i - 13:i + 1]
 
-        highest = max(x["high"] for x in window)
-        lowest = min(x["low"] for x in window)
+        highest = max(
+            x["high"] for x in window
+        )
+
+        lowest = min(
+            x["low"] for x in window
+        )
 
         if highest == lowest:
             raw.append(50.0)
+
         else:
-            raw.append(
-                100 * (
+            value = (
+                100
+                * (
                     candles[i]["close"] - lowest
-                ) / (highest - lowest)
+                )
+                / (highest - lowest)
             )
+
+            raw.append(value)
 
     k = [None] * len(candles)
 
     for i in range(15, len(candles)):
+
         values = raw[i - 2:i + 1]
 
         if all(v is not None for v in values):
@@ -375,6 +511,7 @@ def calculate_stochastic(candles):
     d = [None] * len(candles)
 
     for i in range(17, len(candles)):
+
         values = k[i - 2:i + 1]
 
         if all(v is not None for v in values):
@@ -388,6 +525,7 @@ def calculate_stochastic(candles):
 # =====================================================
 
 def calculate_adx(candles, period=14):
+
     length = len(candles)
 
     tr = [None] * length
@@ -395,42 +533,67 @@ def calculate_adx(candles, period=14):
     minus_dm = [None] * length
 
     for i in range(1, length):
+
         current = candles[i]
         previous = candles[i - 1]
 
-        up = current["high"] - previous["high"]
-        down = previous["low"] - current["low"]
+        up = (
+            current["high"] - previous["high"]
+        )
+
+        down = (
+            previous["low"] - current["low"]
+        )
 
         plus_dm[i] = (
-            up if up > down and up > 0 else 0.0
+            up
+            if up > down and up > 0
+            else 0.0
         )
 
         minus_dm[i] = (
-            down if down > up and down > 0 else 0.0
+            down
+            if down > up and down > 0
+            else 0.0
         )
 
         tr[i] = max(
             current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
+            abs(
+                current["high"] - previous["close"]
+            ),
+            abs(
+                current["low"] - previous["close"]
+            )
         )
 
     smooth_tr = [None] * length
     smooth_plus = [None] * length
     smooth_minus = [None] * length
 
-    if length <= period * 2:
-        return (
-            [None] * length,
-            [None] * length,
-            [None] * length
-        )
+    adx = [None] * length
+    plus_di = [None] * length
+    minus_di = [None] * length
 
-    smooth_tr[period] = sum(tr[1:period + 1])
-    smooth_plus[period] = sum(plus_dm[1:period + 1])
-    smooth_minus[period] = sum(minus_dm[1:period + 1])
+    dx = [None] * length
+
+    if length <= period * 2:
+        return adx, plus_di, minus_di
+
+    smooth_tr[period] = sum(
+        tr[1:period + 1]
+    )
+
+    smooth_plus[period] = sum(
+        plus_dm[1:period + 1]
+    )
+
+    smooth_minus[period] = sum(
+        minus_dm[1:period + 1]
+    )
 
     for i in range(period + 1, length):
+
         smooth_tr[i] = (
             smooth_tr[i - 1]
             - smooth_tr[i - 1] / period
@@ -449,12 +612,8 @@ def calculate_adx(candles, period=14):
             + minus_dm[i]
         )
 
-    plus_di = [None] * length
-    minus_di = [None] * length
-    dx = [None] * length
-    adx = [None] * length
-
     for i in range(period, length):
+
         if not smooth_tr[i]:
             continue
 
@@ -466,11 +625,17 @@ def calculate_adx(candles, period=14):
             100 * smooth_minus[i] / smooth_tr[i]
         )
 
-        denominator = plus_di[i] + minus_di[i]
+        denominator = (
+            plus_di[i] + minus_di[i]
+        )
 
         if denominator:
+
             dx[i] = (
-                100 * abs(plus_di[i] - minus_di[i])
+                100
+                * abs(
+                    plus_di[i] - minus_di[i]
+                )
                 / denominator
             )
 
@@ -488,13 +653,19 @@ def calculate_adx(candles, period=14):
     if len(initial) < period:
         return adx, plus_di, minus_di
 
-    adx[first] = sum(initial[-period:]) / period
+    adx[first] = (
+        sum(initial[-period:]) / period
+    )
 
     for i in range(first + 1, length):
-        if dx[i] is not None:
-            adx[i] = (
-                adx[i - 1] * (period - 1) + dx[i]
-            ) / period
+
+        if dx[i] is None:
+            continue
+
+        adx[i] = (
+            adx[i - 1] * (period - 1)
+            + dx[i]
+        ) / period
 
     return adx, plus_di, minus_di
 
@@ -504,7 +675,10 @@ def calculate_adx(candles, period=14):
 # =====================================================
 
 def candle_quality(candle, direction):
-    candle_range = candle["high"] - candle["low"]
+
+    candle_range = (
+        candle["high"] - candle["low"]
+    )
 
     if candle_range <= 0:
         return False
@@ -521,6 +695,7 @@ def candle_quality(candle, direction):
     ) / candle_range
 
     if direction == "CALL":
+
         return (
             candle["close"] > candle["open"]
             and position >= 0.65
@@ -533,7 +708,7 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STOCHASTIC REFERENCE BONUS
+# STOCHASTIC REFERENCE
 # =====================================================
 
 CALL_PAIRS = [
@@ -553,8 +728,10 @@ PUT_PAIRS = [
 
 
 def reference_match(k, d, direction):
+
     pairs = (
-        CALL_PAIRS if direction == "CALL"
+        CALL_PAIRS
+        if direction == "CALL"
         else PUT_PAIRS
     )
 
@@ -566,14 +743,14 @@ def reference_match(k, d, direction):
 
 
 # =====================================================
-# ANALYZE ONE PAIR
+# BUILD INDICATORS
 # =====================================================
 
-def analyze_pair(pair):
-    symbol = pair["symbol"]
-    candles = get_candles(symbol)
+def build_indicators(candles):
 
-    closes = [c["close"] for c in candles]
+    closes = [
+        c["close"] for c in candles
+    ]
 
     ema9 = calculate_ema(closes, 9)
     ema21 = calculate_ema(closes, 21)
@@ -582,17 +759,46 @@ def analyze_pair(pair):
     k, d = calculate_stochastic(candles)
 
     adx, plus_di, minus_di = calculate_adx(
-        candles, ADX_PERIOD
+        candles,
+        ADX_PERIOD
     )
 
-    i = len(candles) - 1
+    return {
+        "ema9": ema9,
+        "ema21": ema21,
+        "ema50": ema50,
+        "k": k,
+        "d": d,
+        "adx": adx,
+        "plus_di": plus_di,
+        "minus_di": minus_di
+    }
+
+
+# =====================================================
+# SIGNAL RULES AT A SPECIFIC CANDLE
+# =====================================================
+
+def signal_at(candles, ind, i, payout):
+
     p = i - 1
 
+    if p < 1:
+        return None
+
     values = [
-        ema9[i], ema21[i], ema50[i],
-        ema9[p], ema21[p],
-        k[i], d[i], k[p], d[p],
-        adx[i], plus_di[i], minus_di[i]
+        ind["ema9"][i],
+        ind["ema21"][i],
+        ind["ema50"][i],
+        ind["ema9"][p],
+        ind["ema21"][p],
+        ind["k"][i],
+        ind["d"][i],
+        ind["k"][p],
+        ind["d"][p],
+        ind["adx"][i],
+        ind["plus_di"][i],
+        ind["minus_di"][i]
     ]
 
     if any(v is None for v in values):
@@ -601,92 +807,221 @@ def analyze_pair(pair):
     direction = None
     score = 0
 
+    candle = candles[i]
+
     # CALL
     if (
-        ema9[i] > ema21[i]
-        and closes[i] > ema21[i]
-        and k[i] > d[i]
-        and adx[i] >= ADX_MIN
-        and plus_di[i] > minus_di[i]
+        ind["ema9"][i] > ind["ema21"][i]
+        and candle["close"] > ind["ema21"][i]
+        and ind["k"][i] > ind["d"][i]
+        and ind["adx"][i] >= ADX_MIN
+        and ind["plus_di"][i] > ind["minus_di"][i]
     ):
+
         direction = "CALL"
         score = 5
 
-        if ema9[i] > ema9[p]:
+        if ind["ema9"][i] > ind["ema9"][p]:
             score += 1
 
-        if ema21[i] > ema21[p]:
+        if ind["ema21"][i] > ind["ema21"][p]:
             score += 1
 
-        if k[i] > k[p]:
+        if ind["k"][i] > ind["k"][p]:
             score += 1
 
-        if ema9[i] > ema50[i]:
+        if ind["ema9"][i] > ind["ema50"][i]:
             score += 1
 
-        if adx[i] > adx[p]:
+        if ind["adx"][i] > ind["adx"][p]:
             score += 1
 
-        if candle_quality(candles[i], "CALL"):
+        if candle_quality(candle, "CALL"):
             score += 1
 
-        if reference_match(k[i], d[i], "CALL"):
+        if reference_match(
+            ind["k"][i],
+            ind["d"][i],
+            "CALL"
+        ):
             score += 1
 
     # PUT
     elif (
-        ema9[i] < ema21[i]
-        and closes[i] < ema21[i]
-        and k[i] < d[i]
-        and adx[i] >= ADX_MIN
-        and minus_di[i] > plus_di[i]
+        ind["ema9"][i] < ind["ema21"][i]
+        and candle["close"] < ind["ema21"][i]
+        and ind["k"][i] < ind["d"][i]
+        and ind["adx"][i] >= ADX_MIN
+        and ind["minus_di"][i] > ind["plus_di"][i]
     ):
+
         direction = "PUT"
         score = 5
 
-        if ema9[i] < ema9[p]:
+        if ind["ema9"][i] < ind["ema9"][p]:
             score += 1
 
-        if ema21[i] < ema21[p]:
+        if ind["ema21"][i] < ind["ema21"][p]:
             score += 1
 
-        if k[i] < k[p]:
+        if ind["k"][i] < ind["k"][p]:
             score += 1
 
-        if ema9[i] < ema50[i]:
+        if ind["ema9"][i] < ind["ema50"][i]:
             score += 1
 
-        if adx[i] > adx[p]:
+        if ind["adx"][i] > ind["adx"][p]:
             score += 1
 
-        if candle_quality(candles[i], "PUT"):
+        if candle_quality(candle, "PUT"):
             score += 1
 
-        if reference_match(k[i], d[i], "PUT"):
+        if reference_match(
+            ind["k"][i],
+            ind["d"][i],
+            "PUT"
+        ):
             score += 1
 
     if direction is None or score < MIN_SCORE:
         return None
 
     return {
-        "symbol": symbol,
         "direction": direction,
-        "payout": pair["payout"],
         "score": score,
-        "k": k[i],
-        "d": d[i],
-        "adx": adx[i],
-        "plus_di": plus_di[i],
-        "minus_di": minus_di[i],
-        "candle_time": candles[i]["time"]
+        "payout": payout,
+        "k": ind["k"][i],
+        "d": ind["d"][i],
+        "adx": ind["adx"][i],
+        "plus_di": ind["plus_di"][i],
+        "minus_di": ind["minus_di"][i]
     }
 
 
 # =====================================================
-# SCAN ALL PAIRS
+# HISTORICAL WIN RATE
+# =====================================================
+
+def historical_win_rate(candles, ind, payout):
+
+    wins = 0
+    losses = 0
+    ties = 0
+
+    # Signal candle i
+    # Entry: next candle open (i+1)
+    # Expiration: close of candle i+2
+
+    start = 50
+    end = len(candles) - 2
+
+    i = start
+
+    while i < end:
+
+        signal = signal_at(
+            candles,
+            ind,
+            i,
+            payout
+        )
+
+        if signal is None:
+            i += 1
+            continue
+
+        entry_price = candles[i + 1]["open"]
+        exit_price = candles[i + 2]["close"]
+
+        if signal["direction"] == "CALL":
+
+            if exit_price > entry_price:
+                wins += 1
+
+            elif exit_price < entry_price:
+                losses += 1
+
+            else:
+                ties += 1
+
+        else:
+
+            if exit_price < entry_price:
+                wins += 1
+
+            elif exit_price > entry_price:
+                losses += 1
+
+            else:
+                ties += 1
+
+        # Avoid overlapping historical trades.
+        i += 3
+
+    completed = wins + losses
+
+    if completed == 0:
+        rate = None
+    else:
+        rate = (
+            wins / completed
+        ) * 100
+
+    return {
+        "wins": wins,
+        "losses": losses,
+        "ties": ties,
+        "total": completed,
+        "rate": rate
+    }
+
+
+# =====================================================
+# ANALYZE ONE PAIR
+# =====================================================
+
+def analyze_pair(pair):
+
+    symbol = pair["symbol"]
+    payout = pair["payout"]
+
+    candles = get_candles(symbol)
+
+    ind = build_indicators(candles)
+
+    latest_index = len(candles) - 1
+
+    signal = signal_at(
+        candles,
+        ind,
+        latest_index,
+        payout
+    )
+
+    if signal is None:
+        return None
+
+    history = historical_win_rate(
+        candles,
+        ind,
+        payout
+    )
+
+    signal.update({
+        "symbol": symbol,
+        "candle_time": candles[-1]["time"],
+        "history": history
+    })
+
+    return signal
+
+
+# =====================================================
+# SCAN MARKET
 # =====================================================
 
 def scan_market():
+
     pairs = get_symbols()
 
     logging.info(
@@ -698,17 +1033,22 @@ def scan_market():
     errors = 0
 
     for number, pair in enumerate(pairs, 1):
+
         symbol = pair["symbol"]
 
         logging.info(
             "Scanning %s (%s/%s)",
-            symbol, number, len(pairs)
+            symbol,
+            number,
+            len(pairs)
         )
 
         try:
+
             result = analyze_pair(pair)
 
             if result:
+
                 candidates.append(result)
 
                 logging.info(
@@ -720,11 +1060,13 @@ def scan_market():
                 )
 
         except Exception as error:
+
             errors += 1
 
             logging.warning(
                 "%s error: %s",
-                symbol, error
+                symbol,
+                error
             )
 
     candidates.sort(
@@ -740,11 +1082,84 @@ def scan_market():
 
 
 # =====================================================
-# MESSAGE
+# REFRESH TOP CANDIDATES
 # =====================================================
 
+def refresh_best(candidates):
+
+    refreshed = []
+
+    # Recheck the three highest-ranked candidates.
+    for candidate in candidates[:3]:
+
+        pair = {
+            "symbol": candidate["symbol"],
+            "payout": candidate["payout"]
+        }
+
+        try:
+
+            result = analyze_pair(pair)
+
+            if result:
+                refreshed.append(result)
+
+        except Exception as error:
+
+            logging.warning(
+                "Refresh failed for %s: %s",
+                pair["symbol"],
+                error
+            )
+
+    if not refreshed:
+        return None
+
+    refreshed.sort(
+        key=lambda x: (
+            x["score"],
+            x["adx"],
+            x["payout"]
+        ),
+        reverse=True
+    )
+
+    return refreshed[0]
+
+
+# =====================================================
+# SIGNAL MESSAGE
+# =====================================================
+
+def format_win_rate(history):
+
+    if history["rate"] is None:
+        return (
+            "NOT ENOUGH DATA "
+            f"({history['total']} completed trades)"
+        )
+
+    if history["total"] < MIN_HISTORY_TRADES:
+
+        return (
+            "NOT ENOUGH DATA "
+            f"({history['total']} completed trades)"
+        )
+
+    return (
+        f"{history['rate']:.1f}% "
+        f"({history['wins']}W / "
+        f"{history['losses']}L)"
+    )
+
+
 def build_signal_message(signal):
+
     now = time.time()
+
+    history = signal["history"]
+
+    win_rate = format_win_rate(history)
 
     return f"""
 🤖 {VERSION}
@@ -764,17 +1179,30 @@ def build_signal_message(signal):
 ➕ DI+: {signal['plus_di']:.2f}
 ➖ DI-: {signal['minus_di']:.2f}
 
-⭐ SCORE: {signal['score']}
+⭐ STRATEGY SCORE: {signal['score']}
+
+📉 HISTORICAL WIN RATE:
+{win_rate}
+
+📋 HISTORICAL RESULTS:
+Wins: {history['wins']}
+Losses: {history['losses']}
+Ties: {history['ties']}
 
 🕒 SIGNAL TIME: {florida_time(now)}
-🎯 ENTRY TIME: IMMEDIATE
+🎯 ENTRY: IMMEDIATE
 
-⚠️ Check the live chart before entering.
+⚠️ Historical results are not a guarantee.
 Telegram alert only.
 """.strip()
 
 
+# =====================================================
+# NO SIGNAL MESSAGE
+# =====================================================
+
 def no_signal_message(total, errors):
+
     return f"""
 🤖 {VERSION}
 
@@ -799,64 +1227,67 @@ No signal was forced.
 # =====================================================
 
 def main():
-    logging.info("%s starting...", VERSION)
+
+    logging.info(
+        "%s starting...",
+        VERSION
+    )
 
     if not API_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY is missing")
+        raise RuntimeError(
+            "OTCHARTS_API_KEY is missing"
+        )
 
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("TELEGRAM_TOKEN is missing")
+        raise RuntimeError(
+            "TELEGRAM_TOKEN is missing"
+        )
 
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError("TELEGRAM_CHAT_ID is missing")
+        raise RuntimeError(
+            "TELEGRAM_CHAT_ID is missing"
+        )
 
     candidates, total, errors = scan_market()
 
     if not candidates:
+
         telegram_send(
-            no_signal_message(total, errors)
+            no_signal_message(
+                total,
+                errors
+            )
         )
 
         logging.info("No valid signal.")
         return
 
-    # Verifye pi bon kandida yo ankò ak done ki pi resan.
-    best = None
-
-    for candidate in candidates:
-        pair = {
-            "symbol": candidate["symbol"],
-            "payout": candidate["payout"]
-        }
-
-        try:
-            refreshed = analyze_pair(pair)
-
-            if refreshed:
-                best = refreshed
-                break
-
-        except Exception as error:
-            logging.warning(
-                "Refresh failed for %s: %s",
-                candidate["symbol"],
-                error
-            )
+    best = refresh_best(candidates)
 
     if best is None:
+
         telegram_send(
-            no_signal_message(total, errors)
+            no_signal_message(
+                total,
+                errors
+            )
         )
+
+        logging.info(
+            "No candidate passed the refresh."
+        )
+
         return
 
     logging.info(
-        "BEST SIGNAL: %s %s | SCORE %s",
+        "BEST SIGNAL: %s %s | SCORE %s | HISTORICAL RATE %s",
         best["direction"],
         best["symbol"],
-        best["score"]
+        best["score"],
+        best["history"]["rate"]
     )
 
-    # Pa gen WAIT. Voye pi bon signal la touswit.
+    # Send immediately. No waiting.
     telegram_send(
         build_signal_message(best)
     )
@@ -869,20 +1300,25 @@ def main():
 
 
 if __name__ == "__main__":
+
     try:
         main()
 
     except Exception as error:
+
         logging.exception(
             "BOT FAILED: %s",
             error
         )
 
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
+
             try:
                 telegram_send(
-                    f"🔴 {VERSION} ERROR\n{str(error)[:800]}"
+                    f"🔴 {VERSION} ERROR\n"
+                    f"{str(error)[:800]}"
                 )
+
             except Exception:
                 logging.exception(
                     "Telegram error notification failed"
