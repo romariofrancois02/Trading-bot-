@@ -6,15 +6,15 @@ import logging
 import requests
 
 from zoneinfo import ZoneInfo
-from datetime import datetime
+from datetime import datetime, timezone
 
 # =====================================================
-# ROMARIO TRADER PRO 11.1
+# ROMARIO TRADER PRO 11.2
 # OTC | M1 | EXPIRATION 60 SECONDS
 # TELEGRAM ALERTS ONLY
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.1"
+VERSION = "ROMARIO TRADER PRO 11.2"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -27,13 +27,13 @@ MIN_CANDLES = 80
 MIN_PAYOUT = 92.0
 
 ADX_PERIOD = 14
-ADX_MIN = 16
-MIN_DI_GAP = 3
+ADX_MIN = 18
+MIN_DI_GAP = 5
 
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
 
-MIN_SCORE = 2
+MIN_SCORE = 5
 
 ENTRY_LEAD = 10
 SCAN_INTERVAL = 3
@@ -42,8 +42,11 @@ MAX_SCAN_MINUTES = 300
 API_ATTEMPTS = 4
 STATE_FILE = "state.json"
 
-OTC_CLOCK_OFFSET = int(
-    os.getenv("OTC_CLOCK_OFFSET", "7200")
+# Unix timestamps are used consistently.
+# Keep this at 0 unless OTCharts confirms its timestamps
+# are shifted from standard Unix UTC timestamps.
+OTCHARTS_TIMESTAMP_OFFSET = int(
+    os.getenv("OTCHARTS_TIMESTAMP_OFFSET", "0")
 )
 
 FLORIDA = ZoneInfo("America/New_York")
@@ -69,16 +72,13 @@ session.headers.update({
 # TIME
 # =====================================================
 
-def otc_now():
-    return time.time() + OTC_CLOCK_OFFSET
+def utc_now():
+    return time.time()
 
 
-def florida_time(timestamp=None, otc_timestamp=False):
+def florida_time(timestamp=None):
     if timestamp is None:
-        timestamp = time.time()
-
-    if otc_timestamp:
-        timestamp -= OTC_CLOCK_OFFSET
+        timestamp = utc_now()
 
     return datetime.fromtimestamp(
         timestamp, FLORIDA
@@ -86,7 +86,7 @@ def florida_time(timestamp=None, otc_timestamp=False):
 
 
 def next_entry_time():
-    now = otc_now()
+    now = utc_now()
     entry = (int(now // TIMEFRAME) + 1) * TIMEFRAME
 
     if entry - now < ENTRY_LEAD:
@@ -181,6 +181,7 @@ def get_symbols():
                 or row.get("return")
                 or 0
             )
+
         else:
             continue
 
@@ -196,6 +197,10 @@ def get_symbols():
             payout = float(
                 str(payout).replace("%", "")
             )
+
+            if 0 < payout <= 1:
+                payout *= 100
+
         except (ValueError, TypeError):
             payout = 0
 
@@ -209,15 +214,33 @@ def get_symbols():
 
 
 def parse_timestamp(value):
+    if value is None:
+        return None
+
     try:
+        if isinstance(value, str):
+            try:
+                value = float(value)
+            except ValueError:
+                parsed = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(
+                        tzinfo=timezone.utc
+                    )
+
+                value = parsed.timestamp()
+
         value = float(value)
 
         if value > 100000000000:
             value /= 1000
 
-        return int(value)
+        return int(value) - OTCHARTS_TIMESTAMP_OFFSET
 
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, OverflowError):
         return None
 
 
@@ -268,6 +291,16 @@ def get_candles(symbol):
             if candle["high"] < candle["low"]:
                 continue
 
+            if candle["high"] < max(
+                candle["open"], candle["close"]
+            ):
+                continue
+
+            if candle["low"] > min(
+                candle["open"], candle["close"]
+            ):
+                continue
+
             candles.append(candle)
 
         except (ValueError, TypeError):
@@ -283,9 +316,10 @@ def get_candles(symbol):
         key=lambda x: x["time"]
     )
 
+    # Only use completed candles.
     candles = [
         c for c in candles
-        if c["time"] + TIMEFRAME <= otc_now()
+        if c["time"] + TIMEFRAME <= utc_now()
     ]
 
     continuous = []
@@ -293,8 +327,13 @@ def get_candles(symbol):
     for candle in candles:
         if not continuous:
             continuous.append(candle)
-        elif candle["time"] - continuous[-1]["time"] == TIMEFRAME:
+
+        elif (
+            candle["time"] - continuous[-1]["time"]
+            == TIMEFRAME
+        ):
             continuous.append(candle)
+
         else:
             continuous = [candle]
 
@@ -329,7 +368,7 @@ def ema_previous(values, period):
 
 
 # =====================================================
-# RSI
+# RSI - WILDER SMOOTHING
 # =====================================================
 
 def calculate_rsi(values, period=7):
@@ -363,8 +402,14 @@ def calculate_rsi(values, period=7):
             avg_loss * (period - 1) + losses[i]
         ) / period
 
+    if avg_loss == 0 and avg_gain == 0:
+        return 50.0
+
     if avg_loss == 0:
         return 100.0
+
+    if avg_gain == 0:
+        return 0.0
 
     rs = avg_gain / avg_loss
 
@@ -382,25 +427,29 @@ def stochastic(candles, period=14):
     k_values = []
 
     for index in range(len(candles) - 3, len(candles)):
-        section = candles[index - period + 1:index + 1]
+        section = candles[
+            index - period + 1:index + 1
+        ]
 
         highest = max(c["high"] for c in section)
         lowest = min(c["low"] for c in section)
 
         if highest == lowest:
             k = 50.0
+
         else:
             k = (
                 (candles[index]["close"] - lowest)
                 / (highest - lowest)
             ) * 100
 
-        k_values.append(k)
+        k_values.append(max(0.0, min(100.0, k)))
 
     k = k_values[-1]
     d = sum(k_values[-3:]) / 3
+    old_k = k_values[-2]
 
-    return k, d, k_values[-2]
+    return k, d, old_k
 
 
 # =====================================================
@@ -499,18 +548,18 @@ def candle_quality(candle, direction):
         return (
             candle["close"] > candle["open"]
             and body_ratio >= 0.30
-            and close_position >= 0.55
+            and close_position >= 0.60
         )
 
     return (
         candle["close"] < candle["open"]
         and body_ratio >= 0.30
-        and close_position <= 0.45
+        and close_position <= 0.40
     )
 
 
 # =====================================================
-# STRATEGY
+# STRATEGY 11.2
 # =====================================================
 
 def signal_at(candles):
@@ -541,7 +590,8 @@ def signal_at(candles):
     if None in (
         ema9, ema21, ema50,
         old_ema9, old_ema21,
-        rsi, k, d, old_k, adx
+        rsi, k, d, old_k, adx,
+        plus_di, minus_di
     ):
         return None
 
@@ -563,22 +613,48 @@ def signal_at(candles):
     if not call_trend and not put_trend:
         return None
 
+    # ---------------------------------------------
+    # CALL
+    # ---------------------------------------------
+
     if call_trend:
+
+        # Mandatory momentum confirmation.
+        if not (k > d and k > old_k):
+            return None
+
+        # Avoid entering when momentum is already
+        # excessively overbought.
+        if not (20 <= k <= 85):
+            return None
+
+        if not (50 <= rsi <= 68):
+            return None
+
+        if adx < ADX_MIN:
+            return None
+
+        if plus_di <= minus_di:
+            return None
+
+        if plus_di - minus_di < MIN_DI_GAP:
+            return None
+
+        if not candle_quality(last, "CALL"):
+            return None
+
         score = 0
 
         if k > d and k > old_k:
             score += 1
 
-        if 50 <= rsi <= 72:
+        if 50 <= rsi <= 68:
             score += 1
 
-        if adx >= ADX_MIN and plus_di > minus_di:
+        if adx >= ADX_MIN:
             score += 1
 
-        if (
-            plus_di - minus_di >= MIN_DI_GAP
-            and adx >= ADX_MIN
-        ):
+        if plus_di - minus_di >= MIN_DI_GAP:
             score += 1
 
         if candle_quality(last, "CALL"):
@@ -592,22 +668,48 @@ def signal_at(candles):
 
         direction = "CALL"
 
+    # ---------------------------------------------
+    # PUT
+    # ---------------------------------------------
+
     else:
+
+        # Mandatory momentum confirmation.
+        if not (k < d and k < old_k):
+            return None
+
+        # Avoid entering when price is already
+        # excessively oversold.
+        if not (15 <= k <= 80):
+            return None
+
+        if not (35 <= rsi <= 55):
+            return None
+
+        if adx < ADX_MIN:
+            return None
+
+        if minus_di <= plus_di:
+            return None
+
+        if minus_di - plus_di < MIN_DI_GAP:
+            return None
+
+        if not candle_quality(last, "PUT"):
+            return None
+
         score = 0
 
         if k < d and k < old_k:
             score += 1
 
-        if 28 <= rsi <= 50:
+        if 35 <= rsi <= 55:
             score += 1
 
-        if adx >= ADX_MIN and minus_di > plus_di:
+        if adx >= ADX_MIN:
             score += 1
 
-        if (
-            minus_di - plus_di >= MIN_DI_GAP
-            and adx >= ADX_MIN
-        ):
+        if minus_di - plus_di >= MIN_DI_GAP:
             score += 1
 
         if candle_quality(last, "PUT"):
@@ -681,7 +783,10 @@ def load_state():
             state = json.load(f)
 
         state.setdefault("pending", None)
-        state.setdefault("last_result", "NO PREVIOUS RESULT")
+        state.setdefault(
+            "last_result",
+            "NO PREVIOUS RESULT"
+        )
 
         return state
 
@@ -711,7 +816,7 @@ def verify_pending_result(state):
     entry_time = int(pending["entry_timestamp"])
     expiry_time = entry_time + EXPIRATION
 
-    if otc_now() < expiry_time + 5:
+    if utc_now() < expiry_time + 5:
         return False
 
     candles = get_candles(pending["symbol"])
@@ -720,7 +825,10 @@ def verify_pending_result(state):
         return False
 
     entry_candle = next(
-        (c for c in candles if c["time"] == entry_time),
+        (
+            c for c in candles
+            if c["time"] == entry_time
+        ),
         None
     )
 
@@ -752,7 +860,10 @@ def verify_pending_result(state):
 
     save_state(state)
 
-    logging.info("Previous result: %s", state["last_result"])
+    logging.info(
+        "Previous candle-based result: %s",
+        state["last_result"]
+    )
 
     return True
 
@@ -778,7 +889,7 @@ def build_message(symbol, payout, signal, entry_time, state):
         f"DI-: {signal['minus_di']:.2f}\n\n"
         f"⭐ SIGNAL QUALITY: {signal['score']}/6\n\n"
         f"🕒 SIGNAL TIME: {florida_time()}\n"
-        f"🎯 ENTRY TIME: {florida_time(entry_time, True)}"
+        f"🎯 ENTRY TIME: {florida_time(entry_time)}"
     )
 
 
@@ -841,9 +952,19 @@ def main():
 
     state = load_state()
 
+    # Verify the previous signal before scanning again.
+    pending_start = time.time()
+
     while state.get("pending"):
         if verify_pending_result(state):
             break
+
+        if time.time() - pending_start > 180:
+            logging.error(
+                "Could not verify previous result within 180 seconds. "
+                "Pending signal retained."
+            )
+            return
 
         logging.info("Checking previous signal result...")
         time.sleep(10)
@@ -851,14 +972,20 @@ def main():
     symbols = get_symbols()
 
     if not symbols:
-        logging.error("Could not retrieve eligible OTC pairs.")
+        logging.error(
+            "Could not retrieve eligible OTC pairs."
+        )
         return
 
-    logging.info("Eligible OTC pairs: %s", len(symbols))
+    logging.info(
+        "Eligible OTC pairs: %s",
+        len(symbols)
+    )
 
     start = time.time()
 
     while time.time() - start < MAX_SCAN_MINUTES * 60:
+
         candidate = scan_market(symbols)
 
         if not candidate:
@@ -872,13 +999,14 @@ def main():
             "Candidate %s %s | Entry %s",
             candidate["symbol"],
             candidate["signal"]["direction"],
-            florida_time(entry_time, True)
+            florida_time(entry_time)
         )
 
-        while otc_now() < signal_time:
-            remaining = signal_time - otc_now()
+        while utc_now() < signal_time:
+            remaining = signal_time - utc_now()
             time.sleep(min(max(remaining, 0.2), 2))
 
+        # Refresh the signal before sending.
         candles = get_candles(candidate["symbol"])
 
         if len(candles) < MIN_CANDLES:
@@ -895,7 +1023,10 @@ def main():
         ):
             continue
 
-        if otc_now() > signal_time + 2:
+        if fresh_signal["score"] < MIN_SCORE:
+            continue
+
+        if utc_now() > signal_time + 2:
             continue
 
         message = build_message(
@@ -927,7 +1058,9 @@ def main():
 
         return
 
-    logging.warning("Scan time limit reached without a valid setup.")
+    logging.warning(
+        "Scan time limit reached without a valid setup."
+    )
 
 
 if __name__ == "__main__":
