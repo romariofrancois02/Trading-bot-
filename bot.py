@@ -9,13 +9,13 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 11.4
+# ROMARIO TRADER PRO 11.5
 # Pocket Option OTC | M1 | 60s expiration
 # All pairs >= 92% payout
 # Telegram alerts only | Manual GitHub Actions
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.4"
+VERSION = "ROMARIO TRADER PRO 11.5"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -31,25 +31,21 @@ MIN_PAYOUT = 92.0
 MAX_SYMBOLS = 0
 
 ADX_PERIOD = 14
-ADX_MIN = 18
-MIN_DI_GAP = 3
+ADX_MIN = 25
+MIN_DI_GAP = 6
 
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
 
-# More flexible score, but trend alignment remains mandatory.
-MIN_SCORE = 4
+MIN_SCORE = 3
 
 ENTRY_LEAD = 10
 
-# Scan all eligible pairs every 2 minutes.
 SCAN_INTERVAL = 120
-
-# Maximum duration of one manual run: 5 hours.
 MAX_SCAN_MINUTES = 300
 
-API_ATTEMPTS = 2
-API_TIMEOUT = 15
+API_ATTEMPTS = 3
+API_TIMEOUT = 20
 
 STATE_FILE = "state.json"
 
@@ -122,7 +118,9 @@ def api_get(endpoint, params=None):
                     response.status_code
                 )
 
-                time.sleep(3 + attempt * 3)
+                if attempt + 1 < API_ATTEMPTS:
+                    time.sleep(3 + attempt * 3)
+
                 continue
 
             response.raise_for_status()
@@ -172,8 +170,11 @@ def get_symbols():
         {"venue": VENUE}
     )
 
-    if not data:
-        return []
+    if data is None:
+        logging.error(
+            "Symbols API unavailable. Cannot scan market."
+        )
+        return None
 
     rows = extract_list(
         data,
@@ -242,7 +243,6 @@ def get_symbols():
         reverse=True
     )
 
-    # No 5-pair restriction.
     if MAX_SYMBOLS > 0:
         symbols = symbols[:MAX_SYMBOLS]
 
@@ -307,7 +307,7 @@ def get_candles(symbol):
         }
     )
 
-    if not data:
+    if data is None:
         return []
 
     rows = extract_list(
@@ -636,7 +636,7 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STRATEGY 11.4
+# STRATEGY 11.5
 # =====================================================
 
 def signal_at(candles):
@@ -677,7 +677,6 @@ def signal_at(candles):
     last = candles[-1]
     close = last["close"]
 
-    # Trend alignment remains mandatory.
     call_trend = (
         ema9 > ema21
         and ema21 > ema50
@@ -693,29 +692,32 @@ def signal_at(candles):
     if not call_trend and not put_trend:
         return None
 
+    adx_ok = adx >= ADX_MIN
+
+    if not adx_ok:
+        return None
+
     # ---------------- CALL ----------------
 
     if call_trend:
 
-        # DI direction must agree with CALL.
         if plus_di <= minus_di:
             return None
-
-        score = 0
-
-        stoch_ok = (
-            k > d
-            and k > old_k
-            and 15 <= k <= 90
-        )
-
-        rsi_ok = 45 <= rsi <= 72
-
-        adx_ok = adx >= ADX_MIN
 
         di_ok = (
             plus_di - minus_di >= MIN_DI_GAP
         )
+
+        if not di_ok:
+            return None
+
+        stoch_ok = (
+            k > d
+            and k > old_k
+            and 25 <= k <= 75
+        )
+
+        rsi_ok = 48 <= rsi <= 65
 
         candle_ok = candle_quality(last, "CALL")
 
@@ -724,12 +726,17 @@ def signal_at(candles):
             and ema21 > old_ema21
         )
 
-        score += int(stoch_ok)
-        score += int(rsi_ok)
-        score += int(adx_ok)
-        score += int(di_ok)
-        score += int(candle_ok)
-        score += int(ema_slope_ok)
+        if not (stoch_ok or rsi_ok):
+            return None
+
+        score = (
+            int(stoch_ok)
+            + int(rsi_ok)
+            + int(adx_ok)
+            + int(di_ok)
+            + int(candle_ok)
+            + int(ema_slope_ok)
+        )
 
         if score < MIN_SCORE:
             return None
@@ -740,25 +747,23 @@ def signal_at(candles):
 
     else:
 
-        # DI direction must agree with PUT.
         if minus_di <= plus_di:
             return None
-
-        score = 0
-
-        stoch_ok = (
-            k < d
-            and k < old_k
-            and 10 <= k <= 85
-        )
-
-        rsi_ok = 28 <= rsi <= 55
-
-        adx_ok = adx >= ADX_MIN
 
         di_ok = (
             minus_di - plus_di >= MIN_DI_GAP
         )
+
+        if not di_ok:
+            return None
+
+        stoch_ok = (
+            k < d
+            and k < old_k
+            and 30 <= k <= 75
+        )
+
+        rsi_ok = 38 <= rsi <= 52
 
         candle_ok = candle_quality(last, "PUT")
 
@@ -767,12 +772,17 @@ def signal_at(candles):
             and ema21 < old_ema21
         )
 
-        score += int(stoch_ok)
-        score += int(rsi_ok)
-        score += int(adx_ok)
-        score += int(di_ok)
-        score += int(candle_ok)
-        score += int(ema_slope_ok)
+        if not (stoch_ok or rsi_ok):
+            return None
+
+        score = (
+            int(stoch_ok)
+            + int(rsi_ok)
+            + int(adx_ok)
+            + int(di_ok)
+            + int(candle_ok)
+            + int(ema_slope_ok)
+        )
 
         if score < MIN_SCORE:
             return None
@@ -1064,10 +1074,18 @@ def main():
 
     symbols = get_symbols()
 
+    if symbols is None:
+        logging.error(
+            "OTCharts symbols endpoint failed. "
+            "No market scan was possible."
+        )
+        return
+
     if not symbols:
         logging.error(
-            "No eligible OTC pairs found. "
-            "Check API response and payout fields."
+            "API returned no eligible OTC pairs "
+            "with payout >= %.1f%%.",
+            MIN_PAYOUT
         )
         return
 
@@ -1205,10 +1223,15 @@ def main():
 
             time.sleep(10)
 
-        return
+        logging.info(
+            "Result verified. Continuing market scan..."
+        )
+
+        time.sleep(5)
+        continue
 
     logging.warning(
-        "Scan time limit reached without a valid setup."
+        "Scan time limit reached."
     )
 
 
