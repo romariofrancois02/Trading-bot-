@@ -3,7 +3,6 @@ import os
 import re
 import json
 import time
-import math
 import logging
 import requests
 
@@ -11,12 +10,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 11.6
+# ROMARIO TRADER PRO 11.7
 # Pocket Option Forex OTC | M1 | 60s expiration
 # Telegram alerts only | Manual GitHub Actions
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.6"
+VERSION = "ROMARIO TRADER PRO 11.7"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -27,32 +26,25 @@ CANDLE_LIMIT = 300
 MIN_CANDLES = 80
 
 MIN_PAYOUT = 92.0
-
-# 0 = scan all eligible Forex OTC pairs
 MAX_SYMBOLS = 0
 
+# Strong trend filters
 ADX_PERIOD = 14
 ADX_MIN = 25
 MIN_DI_GAP = 6
 
+# Fast indicators
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
-ATR_PERIOD = 14
 
 # Six confirmation conditions
-MIN_SCORE = 4
-MAX_EXTENSION_ATR = 1.5
+MIN_SCORE = 5
 
-# Send signal 10 seconds before entry
+# Entry timing
 ENTRY_LEAD = 10
 
 SCAN_INTERVAL = 120
 MAX_SCAN_MINUTES = 300
-
-# Keep a safety margin under the Lite daily request allowance.
-# The scanner calculates a slower interval automatically
-# if the number of eligible pairs is high.
-REQUEST_BUDGET_PER_RUN = 5000
 
 API_ATTEMPTS = 3
 API_TIMEOUT = 20
@@ -60,8 +52,6 @@ API_TIMEOUT = 20
 STATE_FILE = "state.json"
 RECENT_SYMBOL_LIMIT = 2
 
-# OTCharts documents Pocket Option OTC candle times as UTC+2.
-# Subtract 7200 seconds to align candle times with UTC.
 OTCHARTS_TIMESTAMP_OFFSET = int(
     os.getenv("OTCHARTS_TIMESTAMP_OFFSET", "7200")
 )
@@ -113,23 +103,6 @@ def next_entry_time():
         entry += TIMEFRAME
 
     return entry
-
-
-def calculate_scan_interval(symbol_count):
-    if symbol_count <= 0:
-        return SCAN_INTERVAL
-
-    total_seconds = MAX_SCAN_MINUTES * 60
-
-    required_interval = math.ceil(
-        symbol_count * total_seconds
-        / REQUEST_BUDGET_PER_RUN
-    )
-
-    return max(
-        SCAN_INTERVAL,
-        required_interval
-    )
 
 
 # =====================================================
@@ -205,12 +178,9 @@ def is_forex_otc_symbol(symbol):
 
     symbol = str(symbol).strip().upper()
 
-    # Pocket Option equity symbols use #, e.g. #AAPL_otc.
     if symbol.startswith("#"):
         return False
 
-    # Accept only six-letter Forex pairs ending in _OTC.
-    # Examples: EURUSD_otc, USDPKR_otc, EURTRY_otc.
     return bool(
         re.fullmatch(r"[A-Z]{6}_OTC", symbol)
     )
@@ -227,9 +197,7 @@ def get_symbols():
     )
 
     if data is None:
-        logging.error(
-            "Symbols API unavailable."
-        )
+        logging.error("Symbols API unavailable.")
         return None
 
     rows = extract_list(
@@ -258,7 +226,6 @@ def get_symbols():
         if not is_forex_otc_symbol(symbol):
             continue
 
-        # Use the official OTC and market-open fields.
         if row.get("isOtc") is not True:
             continue
 
@@ -463,7 +430,7 @@ def get_candles(symbol):
         if candle["time"] + TIMEFRAME <= utc_now()
     ]
 
-    # Remove gaps. Do not treat separated candles as consecutive.
+    # Remove gaps.
     continuous = []
 
     for candle in candles:
@@ -607,45 +574,6 @@ def stochastic(candles, period=14):
     old_k = k_values[-2]
 
     return k, d, old_k
-
-
-# =====================================================
-# ATR
-# =====================================================
-
-def calculate_atr(candles, period=14):
-    if len(candles) < period + 1:
-        return None
-
-    true_ranges = []
-
-    for i in range(1, len(candles)):
-        current = candles[i]
-        previous = candles[i - 1]
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(
-                current["high"] - previous["close"]
-            ),
-            abs(
-                current["low"] - previous["close"]
-            )
-        )
-
-        true_ranges.append(tr)
-
-    if len(true_ranges) < period:
-        return None
-
-    atr = sum(true_ranges[:period]) / period
-
-    for value in true_ranges[period:]:
-        atr = (
-            atr * (period - 1) + value
-        ) / period
-
-    return atr
 
 
 # =====================================================
@@ -794,17 +722,15 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STRATEGY 11.6
-# Direction: +1 CALL / -1 PUT
+# STRATEGY 11.7
+# User's requested analyze_candles strategy
 # =====================================================
 
-def signal_at(candles):
+def analyze_candles(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
-    closes = [
-        c["close"] for c in candles
-    ]
+    closes = [c["close"] for c in candles]
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
@@ -813,44 +739,24 @@ def signal_at(candles):
     old_ema9 = ema_previous(closes, 9)
     old_ema21 = ema_previous(closes, 21)
 
-    rsi = calculate_rsi(
-        closes,
-        RSI_PERIOD
-    )
-
-    k, d, old_k = stochastic(
-        candles,
-        STOCH_PERIOD
-    )
-
-    adx, plus_di, minus_di = adx_values(
-        candles,
-        ADX_PERIOD
-    )
-
-    atr = calculate_atr(
-        candles,
-        ATR_PERIOD
-    )
+    rsi = calculate_rsi(closes, RSI_PERIOD)
+    k, d, old_k = stochastic(candles, STOCH_PERIOD)
+    adx, plus_di, minus_di = adx_values(candles, ADX_PERIOD)
 
     values = (
         ema9, ema21, ema50,
         old_ema9, old_ema21,
         rsi, k, d, old_k,
-        adx, plus_di, minus_di, atr
+        adx, plus_di, minus_di
     )
 
     if any(value is None for value in values):
         return None
 
-    if atr <= 0:
-        return None
-
     last = candles[-1]
     close = last["close"]
 
-    # ---------------- TREND ----------------
-
+    # Mandatory trend alignment
     call_trend = (
         ema9 > ema21
         and ema21 > ema50
@@ -866,34 +772,17 @@ def signal_at(candles):
     if not call_trend and not put_trend:
         return None
 
-    # ADX strength is mandatory.
-    if adx < ADX_MIN:
-        return None
-
-    # Overextension filter.
-    extension_atr = abs(
-        close - ema9
-    ) / atr
-
-    if extension_atr > MAX_EXTENSION_ATR:
-        return None
-
     # ---------------- CALL ----------------
 
     if call_trend:
 
-        direction = "CALL"
-        direction_mark = "+1"
-
-        if plus_di <= minus_di:
+        if plus_di <= minus_di or k <= d:
             return None
 
-        di_ok = (
-            plus_di - minus_di >= MIN_DI_GAP
-        )
-
-        if not di_ok:
+        if not (25 <= k <= 75) or not (48 <= rsi <= 66):
             return None
+
+        score = 0
 
         stoch_ok = (
             k > d
@@ -902,12 +791,19 @@ def signal_at(candles):
         )
 
         rsi_ok = (
-            48 <= rsi <= 65
+            48 <= rsi <= 66
+        )
+
+        adx_ok = (
+            adx >= ADX_MIN
+        )
+
+        di_ok = (
+            plus_di - minus_di >= MIN_DI_GAP
         )
 
         candle_ok = candle_quality(
-            last,
-            "CALL"
+            last, "CALL"
         )
 
         ema_slope_ok = (
@@ -915,28 +811,29 @@ def signal_at(candles):
             and ema21 > old_ema21
         )
 
-        trend_ok = True
+        score += int(stoch_ok)
+        score += int(rsi_ok)
+        score += int(adx_ok)
+        score += int(di_ok)
+        score += int(candle_ok)
+        score += int(ema_slope_ok)
 
-        # Require at least one momentum confirmation.
-        if not (stoch_ok or rsi_ok):
+        if score < MIN_SCORE:
             return None
+
+        direction = "CALL"
 
     # ---------------- PUT ----------------
 
     else:
 
-        direction = "PUT"
-        direction_mark = "-1"
-
-        if minus_di <= plus_di:
+        if minus_di <= plus_di or k >= d:
             return None
 
-        di_ok = (
-            minus_di - plus_di >= MIN_DI_GAP
-        )
-
-        if not di_ok:
+        if not (30 <= k <= 75) or not (38 <= rsi <= 52):
             return None
+
+        score = 0
 
         stoch_ok = (
             k < d
@@ -948,9 +845,16 @@ def signal_at(candles):
             38 <= rsi <= 52
         )
 
+        adx_ok = (
+            adx >= ADX_MIN
+        )
+
+        di_ok = (
+            minus_di - plus_di >= MIN_DI_GAP
+        )
+
         candle_ok = candle_quality(
-            last,
-            "PUT"
+            last, "PUT"
         )
 
         ema_slope_ok = (
@@ -958,27 +862,20 @@ def signal_at(candles):
             and ema21 < old_ema21
         )
 
-        trend_ok = True
+        score += int(stoch_ok)
+        score += int(rsi_ok)
+        score += int(adx_ok)
+        score += int(di_ok)
+        score += int(candle_ok)
+        score += int(ema_slope_ok)
 
-        if not (stoch_ok or rsi_ok):
+        if score < MIN_SCORE:
             return None
 
-    # Six confirmation conditions.
-    score = (
-        int(trend_ok)
-        + int(di_ok)
-        + int(stoch_ok)
-        + int(rsi_ok)
-        + int(candle_ok)
-        + int(ema_slope_ok)
-    )
-
-    if score < MIN_SCORE:
-        return None
+        direction = "PUT"
 
     return {
         "direction": direction,
-        "direction_mark": direction_mark,
         "score": score,
         "rsi": rsi,
         "k": k,
@@ -989,8 +886,6 @@ def signal_at(candles):
         "ema9": ema9,
         "ema21": ema21,
         "ema50": ema50,
-        "atr": atr,
-        "extension_atr": extension_atr,
         "close": close,
         "candle_time": last["time"]
     }
@@ -1191,9 +1086,7 @@ def build_message(
 
     return (
         f"🤖 {VERSION}\n\n"
-        f"{emoji} {direction}\n"
-        f"🧭 DIRECTION: "
-        f"{signal['direction_mark']}\n\n"
+        f"{emoji} {direction}\n\n"
         f"💱 PAIR: {symbol}\n"
         f"💰 PAYOUT: {payout:.1f}%\n\n"
         f"📊 STOCH K: {signal['k']:.2f}\n"
@@ -1202,8 +1095,6 @@ def build_message(
         f"📈 ADX: {signal['adx']:.2f}\n"
         f"DI+: {signal['plus_di']:.2f}\n"
         f"DI-: {signal['minus_di']:.2f}\n\n"
-        f"📏 EMA EXTENSION: "
-        f"{signal['extension_atr']:.2f} ATR\n"
         f"⭐ SIGNAL QUALITY: "
         f"{signal['score']}/6\n\n"
         f"🕒 SIGNAL TIME: {florida_time()}\n"
@@ -1250,7 +1141,7 @@ def scan_market(symbols, recent_symbols):
 
         checked += 1
 
-        signal = signal_at(candles)
+        signal = analyze_candles(candles)
 
         if not signal:
             continue
@@ -1258,12 +1149,9 @@ def scan_market(symbols, recent_symbols):
         valid_setups += 1
 
         logging.info(
-            "Setup found: %s %s | "
-            "Direction %s | Score %s/6 | "
-            "Payout %.1f%%",
+            "Setup found: %s %s | Score %s/6 | Payout %.1f%%",
             symbol,
             signal["direction"],
-            signal["direction_mark"],
             signal["score"],
             item["payout"]
         )
@@ -1278,8 +1166,7 @@ def scan_market(symbols, recent_symbols):
         })
 
     logging.info(
-        "Scan completed | Checked: %s/%s | "
-        "Valid setups: %s",
+        "Scan completed | Checked: %s/%s | Valid setups: %s",
         checked,
         len(symbols),
         valid_setups
@@ -1310,12 +1197,10 @@ def scan_market(symbols, recent_symbols):
     best = candidates[0]
 
     logging.info(
-        "Best candidate: %s | Score %s/6 | "
-        "Payout %.1f%% | Recent: %s",
+        "Best candidate: %s | Score %s/6 | Payout %.1f%%",
         best["symbol"],
         best["signal"]["score"],
-        best["payout"],
-        best["recent"]
+        best["payout"]
     )
 
     return best
@@ -1377,19 +1262,14 @@ def main():
 
     if not symbols:
         logging.error(
-            "No open Forex OTC pairs found "
-            "with payout >= %.1f%%.",
+            "No open Forex OTC pairs found with payout >= %.1f%%.",
             MIN_PAYOUT
         )
         logging.error(
-            "Check API response, book access, "
-            "payout and isOtc/open fields."
+            "Check API response, book access, payout "
+            "and isOtc/open fields."
         )
         return
-
-    effective_interval = calculate_scan_interval(
-        len(symbols)
-    )
 
     logging.info(
         "Forex OTC pairs selected: %s",
@@ -1398,7 +1278,7 @@ def main():
 
     logging.info(
         "Scan interval: %s seconds",
-        effective_interval
+        SCAN_INTERVAL
     )
 
     logging.info(
@@ -1420,12 +1300,11 @@ def main():
 
         if not candidate:
             logging.info(
-                "No valid setup. "
-                "Next scan in %s seconds.",
-                effective_interval
+                "No valid setup. Next scan in %s seconds.",
+                SCAN_INTERVAL
             )
 
-            time.sleep(effective_interval)
+            time.sleep(SCAN_INTERVAL)
             continue
 
         entry_time = next_entry_time()
@@ -1443,8 +1322,7 @@ def main():
             continue
 
         logging.info(
-            "Selected: %s %s | Score %s/6 | "
-            "Entry: %s",
+            "Selected: %s %s | Score %s/6 | Entry: %s",
             candidate["symbol"],
             candidate["signal"]["direction"],
             candidate["signal"]["score"],
@@ -1475,7 +1353,7 @@ def main():
             )
             continue
 
-        fresh_signal = signal_at(candles)
+        fresh_signal = analyze_candles(candles)
 
         if not fresh_signal:
             logging.info(
@@ -1541,7 +1419,7 @@ def main():
             "payout": candidate["payout"]
         }
 
-        # Remember last two pairs to reduce repetition.
+        # Remember last two pairs.
         recent = state.get(
             "recent_symbols",
             []
@@ -1559,10 +1437,9 @@ def main():
         save_state(state)
 
         logging.info(
-            "Signal sent: %s %s | Direction %s",
+            "Signal sent: %s %s",
             candidate["symbol"],
-            fresh_signal["direction"],
-            fresh_signal["direction_mark"]
+            fresh_signal["direction"]
         )
 
         # Wait for the 60-second trade to finish.
@@ -1577,8 +1454,7 @@ def main():
                 > 180
             ):
                 logging.error(
-                    "Result still unverified. "
-                    "Pending state saved."
+                    "Result still unverified. Pending state saved."
                 )
                 return
 
