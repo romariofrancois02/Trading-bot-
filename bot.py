@@ -844,7 +844,7 @@ def analyze_candles(candles):
             return None
 
         if not (
-            22 <= k <= 80
+            22 <= k <= 70
         ) or not (
             34 <= rsi <= 55
         ):
