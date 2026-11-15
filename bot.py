@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 11.9
-# Pocket Option Forex OTC | M1 | Expiration 60s
+# ROMARIO TRADER PRO 12.0
+# Pocket Option OTC | M1 | Expiration 60 seconds
 # Telegram alerts only
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.9"
+VERSION = "ROMARIO TRADER PRO 12.0"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -26,21 +26,35 @@ CANDLE_LIMIT = 300
 MIN_CANDLES = 80
 
 MIN_PAYOUT = 92.0
-MAX_SYMBOLS = 0
 
-# Trend filters
+# Only these 13 classic Forex OTC pairs are allowed.
+ALLOWED_OTC_PAIRS = {
+    "EURUSD_OTC",
+    "GBPUSD_OTC",
+    "USDJPY_OTC",
+    "AUDUSD_OTC",
+    "USDCAD_OTC",
+    "USDCHF_OTC",
+    "NZDUSD_OTC",
+    "EURGBP_OTC",
+    "EURJPY_OTC",
+    "GBPJPY_OTC",
+    "AUDCHF_OTC",
+    "EURCHF_OTC",
+    "AUDNZD_OTC",
+}
+
+# Strategy filters
 ADX_PERIOD = 14
 ADX_MIN = 19
 MIN_DI_GAP = 3
 
-# Fast indicators
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
 
-# Six confirmation conditions
 MIN_SCORE = 5
 
-# Signal timing
+# Timing
 ENTRY_LEAD = 10
 SCAN_INTERVAL = 45
 MAX_SCAN_MINUTES = 300
@@ -51,6 +65,7 @@ API_TIMEOUT = 20
 STATE_FILE = "state.json"
 RECENT_SYMBOL_LIMIT = 2
 
+# Preserved from previous version; verify against actual OTCharts timestamps.
 OTCHARTS_TIMESTAMP_OFFSET = int(
     os.getenv("OTCHARTS_TIMESTAMP_OFFSET", "7200")
 )
@@ -101,7 +116,7 @@ def next_entry_time():
 
 
 # =====================================================
-# API REQUEST
+# API
 # =====================================================
 
 def api_get(endpoint, params=None):
@@ -164,26 +179,17 @@ def extract_list(data, keys):
 
 
 # =====================================================
-# FOREX OTC SYMBOL FILTER
+# STRICT OTC WHITELIST
 # =====================================================
 
 def is_forex_otc_symbol(symbol):
     if not symbol:
         return False
 
-    symbol = str(symbol).strip().upper()
+    normalized = str(symbol).strip().upper()
 
-    if symbol.startswith("#"):
-        return False
+    return normalized in ALLOWED_OTC_PAIRS
 
-    return bool(
-        re.fullmatch(r"[A-Z]{6}_OTC", symbol)
-    )
-
-
-# =====================================================
-# GET SYMBOLS
-# =====================================================
 
 def get_symbols():
     data = api_get(
@@ -207,18 +213,21 @@ def get_symbols():
         if not isinstance(row, dict):
             continue
 
-        symbol = (
+        original_symbol = (
             row.get("symbol")
             or row.get("name")
             or row.get("ticker")
         )
 
-        if not symbol:
+        if not original_symbol:
             continue
 
-        symbol = str(symbol).strip()
+        # Preserve the original symbol for candle API requests.
+        original_symbol = str(original_symbol).strip()
+        normalized = original_symbol.upper()
 
-        if not is_forex_otc_symbol(symbol):
+        # Reject every symbol outside the 13 approved pairs.
+        if not is_forex_otc_symbol(normalized):
             continue
 
         if row.get("isOtc") is not True:
@@ -246,15 +255,13 @@ def get_symbols():
         if payout < MIN_PAYOUT:
             continue
 
-        symbol_key = symbol.upper()
-
-        if symbol_key in seen:
+        if normalized in seen:
             continue
 
-        seen.add(symbol_key)
+        seen.add(normalized)
 
         symbols.append({
-            "symbol": symbol,
+            "symbol": original_symbol,
             "payout": payout
         })
 
@@ -263,13 +270,17 @@ def get_symbols():
         reverse=True
     )
 
-    if MAX_SYMBOLS > 0:
-        symbols = symbols[:MAX_SYMBOLS]
-
     logging.info(
-        "Eligible Forex OTC pairs: %s",
+        "Approved OTC pairs available: %s/13",
         len(symbols)
     )
+
+    for item in symbols:
+        logging.info(
+            "APPROVED: %s | PAYOUT: %.1f%%",
+            item["symbol"],
+            item["payout"]
+        )
 
     return symbols
 
@@ -415,7 +426,7 @@ def get_candles(symbol):
         key=lambda item: item["time"]
     )
 
-    # Completed candles only.
+    # Use completed candles only.
     candles = [
         candle for candle in candles
         if candle["time"] + TIMEFRAME <= time.time()
@@ -537,11 +548,11 @@ def stochastic(candles, period=14):
         ]
 
         highest = max(
-            c["high"] for c in section
+            candle["high"] for candle in section
         )
 
         lowest = min(
-            c["low"] for c in section
+            candle["low"] for candle in section
         )
 
         if highest == lowest:
@@ -550,8 +561,7 @@ def stochastic(candles, period=14):
         else:
             value = (
                 (
-                    candles[index]["close"]
-                    - lowest
+                    candles[index]["close"] - lowest
                 )
                 / (highest - lowest)
             ) * 100
@@ -714,7 +724,7 @@ def candle_quality(candle, direction):
 
 # =====================================================
 # STRATEGY ANALYSIS
-# Exactly SIX score conditions:
+# Six score conditions:
 # 1 Stochastic
 # 2 RSI
 # 3 ADX
@@ -767,7 +777,6 @@ def analyze_candles(candles):
     last = candles[-1]
     close = last["close"]
 
-    # Trend direction
     call_trend = (
         ema9 > ema21
         and ema21 > ema50
@@ -871,7 +880,6 @@ def analyze_candles(candles):
             and ema21 < old_ema21
         )
 
-    # Six conditions only.
     score = sum([
         int(stoch_ok),
         int(rsi_ok),
@@ -1076,7 +1084,7 @@ def verify_pending_result(state):
 
 
 # =====================================================
-# MESSAGE FORMAT
+# TELEGRAM MESSAGE
 # =====================================================
 
 def build_message(
@@ -1112,7 +1120,7 @@ def build_message(
 
 
 # =====================================================
-# SCAN ALL ELIGIBLE PAIRS
+# SCAN APPROVED PAIRS ONLY
 # =====================================================
 
 def scan_market(symbols, recent_symbols):
@@ -1132,7 +1140,7 @@ def scan_market(symbols, recent_symbols):
         symbol = item["symbol"]
 
         logging.info(
-            "Scanning %s (%s/%s)",
+            "Scanning approved pair %s (%s/%s)",
             symbol,
             index,
             len(symbols)
@@ -1205,7 +1213,7 @@ def scan_market(symbols, recent_symbols):
     best = candidates[0]
 
     logging.info(
-        "Selected candidate: %s | Score %s/6 | Payout %.1f%%",
+        "Selected: %s | Score %s/6 | Payout %.1f%%",
         best["symbol"],
         best["signal"]["score"],
         best["payout"]
@@ -1238,7 +1246,7 @@ def main():
 
     state = load_state()
 
-    # Verify any previous pending result.
+    # Verify previous pending result first.
     if state.get("pending"):
         start_wait = time.time()
 
@@ -1269,28 +1277,26 @@ def main():
 
     if not symbols:
         logging.error(
-            "No Forex OTC pairs found with payout >= %.1f%%.",
+            "No approved Forex OTC pairs found "
+            "with payout >= %.1f%%.",
             MIN_PAYOUT
-        )
-        logging.error(
-            "Check OTCharts response and symbol fields."
         )
         return
 
     logging.info(
-        "Forex OTC pairs selected: %s",
+        "Approved pairs loaded: %s/13",
         len(symbols)
     )
 
     logging.info(
-        "ADX minimum: %s | DI gap: %s | Minimum score: %s/6",
+        "ADX_MIN=%s | MIN_DI_GAP=%s | MIN_SCORE=%s/6",
         ADX_MIN,
         MIN_DI_GAP,
         MIN_SCORE
     )
 
     logging.info(
-        "Scan interval: %s seconds",
+        "SCAN_INTERVAL=%s seconds",
         SCAN_INTERVAL
     )
 
@@ -1333,7 +1339,7 @@ def main():
             florida_time(entry_time)
         )
 
-        # Wait for 10 seconds before entry.
+        # Wait until 10 seconds before entry.
         while time.time() < signal_time:
             remaining = signal_time - time.time()
 
@@ -1344,7 +1350,7 @@ def main():
                 )
             )
 
-        # Recheck the selected pair before sending.
+        # Recheck the same pair before sending.
         candles = get_candles(
             candidate["symbol"]
         )
@@ -1443,7 +1449,7 @@ def main():
             fresh_signal["direction"]
         )
 
-        # Wait for the trade result.
+        # Wait for the 60-second trade to finish.
         result_wait_start = time.time()
 
         while state.get("pending"):
