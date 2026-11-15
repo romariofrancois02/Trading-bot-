@@ -10,12 +10,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 11.7
+# ROMARIO TRADER PRO 11.8
 # Pocket Option Forex OTC | M1 | 60s expiration
 # Telegram alerts only | Manual GitHub Actions
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.7"
+VERSION = "ROMARIO TRADER PRO 11.8"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -28,10 +28,10 @@ MIN_CANDLES = 80
 MIN_PAYOUT = 92.0
 MAX_SYMBOLS = 0
 
-# Strong trend filters
+# Trend filters
 ADX_PERIOD = 14
-ADX_MIN = 25
-MIN_DI_GAP = 6
+ADX_MIN = 21
+MIN_DI_GAP = 4
 
 # Fast indicators
 RSI_PERIOD = 7
@@ -40,7 +40,7 @@ STOCH_PERIOD = 14
 # Six confirmation conditions
 MIN_SCORE = 5
 
-# Entry timing
+# Signal timing
 ENTRY_LEAD = 10
 
 SCAN_INTERVAL = 120
@@ -52,6 +52,7 @@ API_TIMEOUT = 20
 STATE_FILE = "state.json"
 RECENT_SYMBOL_LIMIT = 2
 
+# Retain the timestamp adjustment from your previous version.
 OTCHARTS_TIMESTAMP_OFFSET = int(
     os.getenv("OTCHARTS_TIMESTAMP_OFFSET", "7200")
 )
@@ -178,9 +179,11 @@ def is_forex_otc_symbol(symbol):
 
     symbol = str(symbol).strip().upper()
 
+    # Exclude equity symbols such as #AAPL_otc.
     if symbol.startswith("#"):
         return False
 
+    # Six-letter Forex pairs ending in _OTC.
     return bool(
         re.fullmatch(r"[A-Z]{6}_OTC", symbol)
     )
@@ -430,7 +433,7 @@ def get_candles(symbol):
         if candle["time"] + TIMEFRAME <= utc_now()
     ]
 
-    # Remove gaps.
+    # Remove gaps. Do not treat separated candles as consecutive.
     continuous = []
 
     for candle in candles:
@@ -722,8 +725,8 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STRATEGY 11.7
-# User's requested analyze_candles strategy
+# STRATEGY 11.8
+# Updated ADX, DI, Stochastic and RSI thresholds
 # =====================================================
 
 def analyze_candles(candles):
@@ -740,8 +743,16 @@ def analyze_candles(candles):
     old_ema21 = ema_previous(closes, 21)
 
     rsi = calculate_rsi(closes, RSI_PERIOD)
-    k, d, old_k = stochastic(candles, STOCH_PERIOD)
-    adx, plus_di, minus_di = adx_values(candles, ADX_PERIOD)
+
+    k, d, old_k = stochastic(
+        candles,
+        STOCH_PERIOD
+    )
+
+    adx, plus_di, minus_di = adx_values(
+        candles,
+        ADX_PERIOD
+    )
 
     values = (
         ema9, ema21, ema50,
@@ -772,38 +783,50 @@ def analyze_candles(candles):
     if not call_trend and not put_trend:
         return None
 
+    # ADX minimum strength
+    if adx < ADX_MIN:
+        return None
+
     # ---------------- CALL ----------------
 
     if call_trend:
 
-        if plus_di <= minus_di or k <= d:
+        # Direction must favor buyers.
+        if plus_di <= minus_di:
             return None
 
-        if not (25 <= k <= 75) or not (48 <= rsi <= 66):
+        # Minimum DI difference.
+        di_ok = (
+            plus_di - minus_di >= MIN_DI_GAP
+        )
+
+        if not di_ok:
             return None
 
-        score = 0
+        # Allow Stochastic between 20 and 80.
+        # Allow RSI between 45 and 68.
+        if not (20 <= k <= 80) or not (45 <= rsi <= 68):
+            return None
+
+        direction = "CALL"
 
         stoch_ok = (
             k > d
             and k > old_k
-            and 25 <= k <= 75
+            and 20 <= k <= 80
         )
 
         rsi_ok = (
-            48 <= rsi <= 66
+            45 <= rsi <= 68
         )
 
         adx_ok = (
             adx >= ADX_MIN
         )
 
-        di_ok = (
-            plus_di - minus_di >= MIN_DI_GAP
-        )
-
         candle_ok = candle_quality(
-            last, "CALL"
+            last,
+            "CALL"
         )
 
         ema_slope_ok = (
@@ -811,50 +834,46 @@ def analyze_candles(candles):
             and ema21 > old_ema21
         )
 
-        score += int(stoch_ok)
-        score += int(rsi_ok)
-        score += int(adx_ok)
-        score += int(di_ok)
-        score += int(candle_ok)
-        score += int(ema_slope_ok)
-
-        if score < MIN_SCORE:
-            return None
-
-        direction = "CALL"
-
     # ---------------- PUT ----------------
 
     else:
 
-        if minus_di <= plus_di or k >= d:
+        # Direction must favor sellers.
+        if minus_di <= plus_di:
             return None
 
-        if not (30 <= k <= 75) or not (38 <= rsi <= 52):
+        # Minimum DI difference.
+        di_ok = (
+            minus_di - plus_di >= MIN_DI_GAP
+        )
+
+        if not di_ok:
             return None
 
-        score = 0
+        # Allow Stochastic between 22 and 80.
+        # Allow RSI between 34 and 55.
+        if not (22 <= k <= 80) or not (34 <= rsi <= 55):
+            return None
+
+        direction = "PUT"
 
         stoch_ok = (
             k < d
             and k < old_k
-            and 30 <= k <= 75
+            and 22 <= k <= 80
         )
 
         rsi_ok = (
-            38 <= rsi <= 52
+            34 <= rsi <= 55
         )
 
         adx_ok = (
             adx >= ADX_MIN
         )
 
-        di_ok = (
-            minus_di - plus_di >= MIN_DI_GAP
-        )
-
         candle_ok = candle_quality(
-            last, "PUT"
+            last,
+            "PUT"
         )
 
         ema_slope_ok = (
@@ -862,17 +881,20 @@ def analyze_candles(candles):
             and ema21 < old_ema21
         )
 
-        score += int(stoch_ok)
-        score += int(rsi_ok)
-        score += int(adx_ok)
-        score += int(di_ok)
-        score += int(candle_ok)
-        score += int(ema_slope_ok)
+    # Six confirmation conditions.
+    score = (
+        int(True)             # Trend alignment
+        + int(di_ok)
+        + int(stoch_ok)
+        + int(rsi_ok)
+        + int(adx_ok)
+        + int(candle_ok)
+        + int(ema_slope_ok)
+    )
 
-        if score < MIN_SCORE:
-            return None
-
-        direction = "PUT"
+    # Keep the requested minimum score.
+    if score < MIN_SCORE:
+        return None
 
     return {
         "direction": direction,
@@ -1096,7 +1118,7 @@ def build_message(
         f"DI+: {signal['plus_di']:.2f}\n"
         f"DI-: {signal['minus_di']:.2f}\n\n"
         f"⭐ SIGNAL QUALITY: "
-        f"{signal['score']}/6\n\n"
+        f"{signal['score']}/7\n\n"
         f"🕒 SIGNAL TIME: {florida_time()}\n"
         f"🎯 ENTRY TIME: {florida_time(entry_time)}"
     )
@@ -1149,7 +1171,7 @@ def scan_market(symbols, recent_symbols):
         valid_setups += 1
 
         logging.info(
-            "Setup found: %s %s | Score %s/6 | Payout %.1f%%",
+            "Setup found: %s %s | Score %s/7 | Payout %.1f%%",
             symbol,
             signal["direction"],
             signal["score"],
@@ -1197,7 +1219,7 @@ def scan_market(symbols, recent_symbols):
     best = candidates[0]
 
     logging.info(
-        "Best candidate: %s | Score %s/6 | Payout %.1f%%",
+        "Best candidate: %s | Score %s/7 | Payout %.1f%%",
         best["symbol"],
         best["signal"]["score"],
         best["payout"]
@@ -1322,7 +1344,7 @@ def main():
             continue
 
         logging.info(
-            "Selected: %s %s | Score %s/6 | Entry: %s",
+            "Selected: %s %s | Score %s/7 | Entry: %s",
             candidate["symbol"],
             candidate["signal"]["direction"],
             candidate["signal"]["score"],
