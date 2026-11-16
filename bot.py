@@ -4,18 +4,18 @@ import json
 import time
 import logging
 import requests
+import re
 
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 11.5
-# Pocket Option OTC | M1 | 60s expiration
-# All pairs >= 92% payout
-# Telegram alerts only | Manual GitHub Actions
+# ROMARIO TRADER PRO 11.6
+# OTC Forex | M1 | 60s expiration
+# ONE TRADE PER MANUAL RUN
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 11.5"
+VERSION = "ROMARIO TRADER PRO 11.6"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -26,9 +26,7 @@ CANDLE_LIMIT = 300
 MIN_CANDLES = 80
 
 MIN_PAYOUT = 92.0
-
-# 0 = scan ALL eligible pairs
-MAX_SYMBOLS = 0
+MAX_SYMBOLS = 0  # 0 = tout pè ki kalifye
 
 ADX_PERIOD = 14
 ADX_MIN = 25
@@ -36,17 +34,14 @@ MIN_DI_GAP = 6
 
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
-
 MIN_SCORE = 3
 
 ENTRY_LEAD = 10
-
 SCAN_INTERVAL = 120
 MAX_SCAN_MINUTES = 300
 
 API_ATTEMPTS = 3
 API_TIMEOUT = 20
-
 STATE_FILE = "state.json"
 
 OTCHARTS_TIMESTAMP_OFFSET = int(
@@ -58,6 +53,16 @@ FLORIDA = ZoneInfo("America/New_York")
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Kòd lajan yo aksepte. Sa pèmèt pè prensipal ak ekzotik.
+CURRENCIES = set("""
+USD EUR GBP JPY CHF AUD CAD NZD
+CNY HKD SGD INR PKR TRY ZAR MXN BRL
+THB IDR MYR PHP VND KRW AED SAR NGN
+EGP DZD KES CLP COP PEN TWD PLN HUF
+CZK SEK NOK DKK RUB UAH BDT LKR QAR
+KWD BHD OMR ILS ARS
+""".split())
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,10 +122,8 @@ def api_get(endpoint, params=None):
                     "API temporary status: %s",
                     response.status_code
                 )
-
                 if attempt + 1 < API_ATTEMPTS:
                     time.sleep(3 + attempt * 3)
-
                 continue
 
             response.raise_for_status()
@@ -129,10 +132,8 @@ def api_get(endpoint, params=None):
         except Exception as exc:
             logging.warning(
                 "API attempt %s failed: %s",
-                attempt + 1,
-                exc
+                attempt + 1, exc
             )
-
             if attempt + 1 < API_ATTEMPTS:
                 time.sleep(2 + attempt * 2)
 
@@ -146,14 +147,12 @@ def extract_list(data, keys):
     if isinstance(data, dict):
         for key in keys:
             value = data.get(key)
-
             if isinstance(value, list):
                 return value
 
         for value in data.values():
             if isinstance(value, (dict, list)):
                 result = extract_list(value, keys)
-
                 if result:
                     return result
 
@@ -161,7 +160,87 @@ def extract_list(data, keys):
 
 
 # =====================================================
-# GET ALL OTC PAIRS >= MIN PAYOUT
+# STRICT OTC FOREX FILTER
+# =====================================================
+
+def normalize_forex_symbol(raw_symbol):
+    """
+    Aksepte sèlman pè Forex 6 lèt ak mak OTC.
+    Egzanp: EURUSD_otc, EURUSD-OTC, EURUSD OTC.
+    Rejte aksyon, endis ak kripto.
+    """
+
+    if not raw_symbol:
+        return None
+
+    symbol = str(raw_symbol).strip().upper()
+
+    # Egzije mak OTC la.
+    if not re.search(r"[_\-\s]?OTC$", symbol):
+        return None
+
+    base = re.sub(r"[_\-\s]?OTC$", "", symbol).strip()
+
+    # Yon pè Forex dwe gen egzakteman 6 lèt.
+    if not re.fullmatch(r"[A-Z]{6}", base):
+        return None
+
+    first = base[:3]
+    second = base[3:]
+
+    if first not in CURRENCIES:
+        return None
+
+    if second not in CURRENCIES:
+        return None
+
+    if first == second:
+        return None
+
+    return base + "_otc"
+
+
+# =====================================================
+# PAYOUT PARSER
+# =====================================================
+
+def parse_payout(row):
+    if not isinstance(row, dict):
+        return None
+
+    # Chèche sèlman valè payout ki disponib.
+    fields = (
+        "payout",
+        "payout_percent",
+        "return"
+    )
+
+    for field in fields:
+        if field not in row:
+            continue
+
+        raw = row.get(field)
+
+        if raw is None or raw == "":
+            continue
+
+        try:
+            value = float(str(raw).replace("%", "").strip())
+
+            if 0 < value <= 1:
+                value *= 100
+
+            if 0 < value <= 100:
+                return value
+
+        except (ValueError, TypeError):
+            continue
+
+    return None
+
+
+# =====================================================
+# GET ALL QUALIFIED OTC FOREX PAIRS
 # =====================================================
 
 def get_symbols():
@@ -171,9 +250,7 @@ def get_symbols():
     )
 
     if data is None:
-        logging.error(
-            "Symbols API unavailable. Cannot scan market."
-        )
+        logging.error("Symbols API unavailable.")
         return None
 
     rows = extract_list(
@@ -186,43 +263,27 @@ def get_symbols():
 
     for row in rows:
         if isinstance(row, str):
-            symbol = row
-            payout = 0
+            raw_symbol = row
+            payout = None
 
         elif isinstance(row, dict):
-            symbol = (
+            raw_symbol = (
                 row.get("symbol")
                 or row.get("name")
                 or row.get("ticker")
             )
-
-            payout = (
-                row.get("payout")
-                or row.get("payout_percent")
-                or row.get("return")
-                or 0
-            )
+            payout = parse_payout(row)
 
         else:
             continue
 
+        symbol = normalize_forex_symbol(raw_symbol)
+
         if not symbol:
             continue
 
-        symbol = str(symbol).strip()
-
-        if "otc" not in symbol.lower():
-            continue
-
-        try:
-            payout = float(
-                str(payout).replace("%", "")
-            )
-
-            if 0 < payout <= 1:
-                payout *= 100
-
-        except (ValueError, TypeError):
+        # San payout verifye, pa mete pè a nan lis la.
+        if payout is None:
             continue
 
         if payout < MIN_PAYOUT:
@@ -247,21 +308,54 @@ def get_symbols():
         symbols = symbols[:MAX_SYMBOLS]
 
     logging.info(
-        "Eligible OTC pairs with payout >= %.1f%%: %s",
+        "Qualified OTC Forex pairs >= %.1f%%: %s",
         MIN_PAYOUT,
         len(symbols)
     )
 
-    logging.info(
-        "Pairs selected for scanning: %s",
-        len(symbols)
-    )
+    for item in symbols:
+        logging.info(
+            "Eligible: %s | Payout %.1f%%",
+            item["symbol"],
+            item["payout"]
+        )
 
     return symbols
 
 
+def refresh_pair_payout(target_symbol):
+    """
+    Rekipere lis mache a ankò anvan Telegram.
+    Si payout la pa konfime oswa li anba 92%, anile siyal la.
+    """
+
+    fresh_symbols = get_symbols()
+
+    if fresh_symbols is None:
+        logging.error("Cannot refresh payout. Signal blocked.")
+        return None
+
+    for item in fresh_symbols:
+        if item["symbol"].lower() == target_symbol.lower():
+            if item["payout"] >= MIN_PAYOUT:
+                logging.info(
+                    "Fresh payout confirmed: %s = %.1f%%",
+                    target_symbol,
+                    item["payout"]
+                )
+                return item["payout"]
+
+    logging.warning(
+        "Signal cancelled: %s no longer qualifies for %.1f%% payout.",
+        target_symbol,
+        MIN_PAYOUT
+    )
+
+    return None
+
+
 # =====================================================
-# CANDLE DATA
+# CANDLES
 # =====================================================
 
 def parse_timestamp(value):
@@ -272,17 +366,14 @@ def parse_timestamp(value):
         if isinstance(value, str):
             try:
                 value = float(value)
-
             except ValueError:
                 parsed = datetime.fromisoformat(
                     value.replace("Z", "+00:00")
                 )
-
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(
                         tzinfo=timezone.utc
                     )
-
                 value = parsed.timestamp()
 
         value = float(value)
@@ -370,23 +461,23 @@ def get_candles(symbol):
         except (ValueError, TypeError):
             continue
 
-    unique = {}
-
-    for candle in candles:
-        unique[candle["time"]] = candle
+    unique = {
+        candle["time"]: candle
+        for candle in candles
+    }
 
     candles = sorted(
         unique.values(),
         key=lambda item: item["time"]
     )
 
-    # Completed candles only.
+    # Bouji ki fini sèlman.
     candles = [
         candle for candle in candles
         if candle["time"] + TIMEFRAME <= utc_now()
     ]
 
-    # Keep the most recent continuous sequence.
+    # Retire gwo twou nan seri bouji yo.
     continuous = []
 
     for candle in candles:
@@ -470,7 +561,6 @@ def calculate_rsi(values, period=7):
         return 0.0
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
@@ -494,7 +584,6 @@ def stochastic(candles, period=14):
 
         if highest == lowest:
             value = 50.0
-
         else:
             value = (
                 (candles[index]["close"] - lowest)
@@ -636,7 +725,7 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# STRATEGY 11.5
+# STRATEGY 11.5 - PRESERVED
 # =====================================================
 
 def signal_at(candles):
@@ -655,13 +744,11 @@ def signal_at(candles):
     rsi = calculate_rsi(closes, RSI_PERIOD)
 
     k, d, old_k = stochastic(
-        candles,
-        STOCH_PERIOD
+        candles, STOCH_PERIOD
     )
 
     adx, plus_di, minus_di = adx_values(
-        candles,
-        ADX_PERIOD
+        candles, ADX_PERIOD
     )
 
     values = (
@@ -697,16 +784,11 @@ def signal_at(candles):
     if not adx_ok:
         return None
 
-    # ---------------- CALL ----------------
-
     if call_trend:
-
         if plus_di <= minus_di:
             return None
 
-        di_ok = (
-            plus_di - minus_di >= MIN_DI_GAP
-        )
+        di_ok = plus_di - minus_di >= MIN_DI_GAP
 
         if not di_ok:
             return None
@@ -718,7 +800,6 @@ def signal_at(candles):
         )
 
         rsi_ok = 48 <= rsi <= 65
-
         candle_ok = candle_quality(last, "CALL")
 
         ema_slope_ok = (
@@ -743,16 +824,11 @@ def signal_at(candles):
 
         direction = "CALL"
 
-    # ---------------- PUT ----------------
-
     else:
-
         if minus_di <= plus_di:
             return None
 
-        di_ok = (
-            minus_di - plus_di >= MIN_DI_GAP
-        )
+        di_ok = minus_di - plus_di >= MIN_DI_GAP
 
         if not di_ok:
             return None
@@ -764,7 +840,6 @@ def signal_at(candles):
         )
 
         rsi_ok = 38 <= rsi <= 52
-
         candle_ok = candle_quality(last, "PUT")
 
         ema_slope_ok = (
@@ -827,7 +902,6 @@ def send_telegram(message):
         )
 
         response.raise_for_status()
-
         return bool(response.json().get("ok"))
 
     except Exception as exc:
@@ -902,9 +976,7 @@ def verify_pending_result(state):
     )
 
     if not entry_candle:
-        logging.warning(
-            "Entry candle not found. Result remains unverified."
-        )
+        logging.warning("Entry candle not found.")
         return False
 
     entry_price = entry_candle["open"]
@@ -914,14 +986,10 @@ def verify_pending_result(state):
         result = "TIE"
 
     elif pending["direction"] == "CALL":
-        result = (
-            "WIN" if exit_price > entry_price else "LOSS"
-        )
+        result = "WIN" if exit_price > entry_price else "LOSS"
 
     else:
-        result = (
-            "WIN" if exit_price < entry_price else "LOSS"
-        )
+        result = "WIN" if exit_price < entry_price else "LOSS"
 
     state["last_result"] = (
         f"{result} | {pending['symbol']} | "
@@ -929,7 +997,6 @@ def verify_pending_result(state):
     )
 
     state["pending"] = None
-
     save_state(state)
 
     logging.info(
@@ -966,7 +1033,7 @@ def build_message(symbol, payout, signal, entry_time):
 
 
 # =====================================================
-# SCANNER - ALL ELIGIBLE PAIRS
+# SCAN ALL QUALIFIED PAIRS
 # =====================================================
 
 def scan_market(symbols):
@@ -979,9 +1046,7 @@ def scan_market(symbols):
 
         logging.info(
             "Scanning %s (%s/%s)",
-            symbol,
-            index,
-            len(symbols)
+            symbol, index, len(symbols)
         )
 
         candles = get_candles(symbol)
@@ -989,13 +1054,11 @@ def scan_market(symbols):
         if len(candles) < MIN_CANDLES:
             logging.info(
                 "%s skipped: only %s candles",
-                symbol,
-                len(candles)
+                symbol, len(candles)
             )
             continue
 
         checked += 1
-
         signal = signal_at(candles)
 
         if not signal:
@@ -1004,7 +1067,7 @@ def scan_market(symbols):
         valid_setups += 1
 
         logging.info(
-            "Setup found: %s %s | Score %s/6 | Payout %.1f%%",
+            "Setup: %s %s | Score %s/6 | Payout %.1f%%",
             symbol,
             signal["direction"],
             signal["score"],
@@ -1028,17 +1091,15 @@ def scan_market(symbols):
             best = candidate
 
     logging.info(
-        "Scan completed | Checked: %s/%s | Valid setups: %s",
-        checked,
-        len(symbols),
-        valid_setups
+        "Scan completed | Checked: %s/%s | Setups: %s",
+        checked, len(symbols), valid_setups
     )
 
     return best
 
 
 # =====================================================
-# MAIN
+# MAIN - ONE TRADE ONLY
 # =====================================================
 
 def main():
@@ -1054,7 +1115,7 @@ def main():
 
     state = load_state()
 
-    # Finish previous result before scanning again.
+    # Si yon ansyen trade poko verifye, pa voye yon lòt.
     if state.get("pending"):
         start_wait = time.time()
 
@@ -1064,33 +1125,29 @@ def main():
 
             if time.time() - start_wait > 180:
                 logging.error(
-                    "Previous result could not be verified. "
-                    "No new signal will be sent."
+                    "Previous result unverified. Run stopped."
                 )
                 return
 
             logging.info("Waiting for previous result...")
             time.sleep(10)
 
+    # Chaje lis pè ki satisfè filtè yo.
     symbols = get_symbols()
 
     if symbols is None:
-        logging.error(
-            "OTCharts symbols endpoint failed. "
-            "No market scan was possible."
-        )
+        logging.error("Cannot load symbols. Run stopped.")
         return
 
     if not symbols:
         logging.error(
-            "API returned no eligible OTC pairs "
-            "with payout >= %.1f%%.",
+            "No Forex OTC pair has confirmed payout >= %.1f%%.",
             MIN_PAYOUT
         )
         return
 
     logging.info(
-        "All eligible OTC pairs will be scanned: %s",
+        "Scanning all eligible Forex OTC pairs: %s",
         len(symbols)
     )
 
@@ -1102,10 +1159,9 @@ def main():
 
         if not candidate:
             logging.info(
-                "No valid setup. Next full-market scan in %s seconds.",
+                "No valid setup. Rescanning in %s seconds.",
                 SCAN_INTERVAL
             )
-
             time.sleep(SCAN_INTERVAL)
             continue
 
@@ -1113,14 +1169,12 @@ def main():
         signal_time = entry_time - ENTRY_LEAD
 
         if utc_now() > signal_time + 2:
-            logging.info(
-                "Candidate arrived too late. Rescanning."
-            )
+            logging.info("Candidate arrived too late. Rescanning.")
             time.sleep(5)
             continue
 
         logging.info(
-            "Best candidate: %s %s | Score %s/6 | Entry: %s",
+            "Best candidate: %s %s | Score %s/6 | Entry %s",
             candidate["symbol"],
             candidate["signal"]["direction"],
             candidate["signal"]["score"],
@@ -1131,7 +1185,18 @@ def main():
             remaining = signal_time - utc_now()
             time.sleep(min(max(remaining, 0.2), 2))
 
-        # Refresh data immediately before sending.
+        # Verify payout again immediately before the signal.
+        fresh_payout = refresh_pair_payout(
+            candidate["symbol"]
+        )
+
+        if fresh_payout is None:
+            logging.warning(
+                "Payout verification failed. Rescanning."
+            )
+            continue
+
+        # Refresh candles before sending.
         candles = get_candles(candidate["symbol"])
 
         if len(candles) < MIN_CANDLES:
@@ -1143,30 +1208,22 @@ def main():
         fresh_signal = signal_at(candles)
 
         if not fresh_signal:
-            logging.info(
-                "Setup no longer valid. Signal cancelled."
-            )
+            logging.info("Setup no longer valid. Cancelled.")
             continue
 
         if (
             fresh_signal["direction"]
             != candidate["signal"]["direction"]
         ):
-            logging.info(
-                "Direction changed. Signal cancelled."
-            )
+            logging.info("Direction changed. Cancelled.")
             continue
 
         if fresh_signal["score"] < MIN_SCORE:
-            logging.info(
-                "Score no longer qualifies."
-            )
+            logging.info("Score no longer qualifies.")
             continue
 
         if utc_now() > signal_time + 2:
-            logging.info(
-                "Signal confirmation arrived too late."
-            )
+            logging.info("Confirmation arrived too late.")
             continue
 
         signal_key = (
@@ -1181,7 +1238,7 @@ def main():
 
         message = build_message(
             candidate["symbol"],
-            candidate["payout"],
+            fresh_payout,
             fresh_signal,
             entry_time
         )
@@ -1196,18 +1253,19 @@ def main():
             "symbol": candidate["symbol"],
             "direction": fresh_signal["direction"],
             "entry_timestamp": int(entry_time),
-            "payout": candidate["payout"]
+            "payout": fresh_payout
         }
 
         save_state(state)
 
         logging.info(
-            "Signal sent: %s %s",
+            "ONE SIGNAL SENT: %s %s | %.1f%%",
             candidate["symbol"],
-            fresh_signal["direction"]
+            fresh_signal["direction"],
+            fresh_payout
         )
 
-        # Wait for the 60-second trade to finish.
+        # Verify this trade, then END the run.
         result_wait_start = time.time()
 
         while state.get("pending"):
@@ -1216,22 +1274,22 @@ def main():
 
             if time.time() - result_wait_start > 180:
                 logging.error(
-                    "Result still unverified. "
-                    "Pending state saved."
+                    "Result unverified. Pending state saved. "
+                    "Run will stop without another signal."
                 )
                 return
 
             time.sleep(10)
 
         logging.info(
-            "Result verified. Continuing market scan..."
+            "One-trade run completed. Result: %s",
+            state.get("last_result")
         )
 
-        time.sleep(5)
-        continue
+        return
 
     logging.warning(
-        "Scan time limit reached."
+        "No qualifying signal found before scan time limit."
     )
 
 
