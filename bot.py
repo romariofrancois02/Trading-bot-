@@ -4,15 +4,14 @@ import json
 import time
 import logging
 import requests
+
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =========================================================
 # ROMARIO TRADER PRO 11.8
 # Pocket Option OTC | M1 | 60s expiration
-# OTCharts Lite | All eligible Forex pairs discovery
-# One live stream | Maximum 5 live instruments
-# Telegram alerts only
+# OTCharts Lite | Telegram alerts only
 # =========================================================
 
 VERSION = "ROMARIO TRADER PRO 11.8"
@@ -26,6 +25,7 @@ MIN_CANDLES = 80
 
 MIN_PAYOUT = 92.0
 MAX_LIVE_SYMBOLS = 5
+MAX_HISTORY_REQUESTS_PER_RUN = 100
 
 ADX_PERIOD = 14
 ADX_MIN = 25
@@ -39,10 +39,9 @@ ENTRY_LEAD_SECONDS = 10
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
 
-API_TIMEOUT = 25
-MAX_HISTORY_REQUESTS_PER_RUN = 100
-
+API_TIMEOUT = 30
 STATE_FILE = "state.json"
+
 TIMEZONE = ZoneInfo("America/New_York")
 
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
@@ -55,6 +54,7 @@ logging.basicConfig(
 )
 
 session = requests.Session()
+
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "User-Agent": "RomarioTraderPro/11.8",
@@ -74,36 +74,106 @@ def log(message):
     logging.info(message)
 
 
+# =========================================================
+# API REQUEST WITH AUTOMATIC RETRIES
+# =========================================================
+
 def api_get(path, params=None, stream=False):
+
     url = BASE_URL + path
 
-    response = session.get(
-        url,
-        params=params,
-        timeout=(10, None if stream else API_TIMEOUT),
-        stream=stream
-    )
+    attempts = 5 if not stream else 1
 
-    if response.status_code == 429:
-        raise RuntimeError(
-            "OTCharts quota limite oswa stream limit rive."
-        )
+    for attempt in range(1, attempts + 1):
 
-    if response.status_code in (401, 402, 403):
-        raise RuntimeError(
-            f"OTCharts access error {response.status_code}: "
-            f"{response.text[:300]}"
-        )
+        response = None
 
-    response.raise_for_status()
+        try:
 
-    if stream:
-        return response
+            response = session.get(
+                url,
+                params=params,
+                timeout=(15, None if stream else API_TIMEOUT),
+                stream=stream
+            )
 
-    return response.json()
+            if response.status_code == 429:
+                raise RuntimeError(
+                    "OTCharts API rate limit reached (429)."
+                )
 
+            if response.status_code in (401, 402, 403):
+                raise RuntimeError(
+                    f"OTCharts access error "
+                    f"{response.status_code}: "
+                    f"{response.text[:300]}"
+                )
+
+            if response.status_code in (500, 502, 503, 504):
+
+                if attempt < attempts:
+
+                    wait = min(
+                        3 * (2 ** (attempt - 1)),
+                        30
+                    )
+
+                    log(
+                        f"OTCharts temporary server error "
+                        f"{response.status_code}. "
+                        f"Retry {attempt}/{attempts} "
+                        f"in {wait} seconds..."
+                    )
+
+                    response.close()
+                    time.sleep(wait)
+                    continue
+
+                response.raise_for_status()
+
+            response.raise_for_status()
+
+            if stream:
+                return response
+
+            return response.json()
+
+        except (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError
+        ) as exc:
+
+            if attempt >= attempts:
+                raise RuntimeError(
+                    f"OTCharts connection failed after "
+                    f"{attempts} attempts: {exc}"
+                )
+
+            wait = min(
+                3 * (2 ** (attempt - 1)),
+                30
+            )
+
+            log(
+                f"Connection problem. "
+                f"Retry {attempt}/{attempts} "
+                f"in {wait} seconds..."
+            )
+
+            if response is not None:
+                response.close()
+
+            time.sleep(wait)
+
+    raise RuntimeError("OTCharts request failed.")
+
+
+# =========================================================
+# TELEGRAM
+# =========================================================
 
 def send_telegram(message):
+
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram credentials missing.")
         return False
@@ -114,6 +184,7 @@ def send_telegram(message):
     )
 
     try:
+
         response = requests.post(
             url,
             json={
@@ -124,37 +195,27 @@ def send_telegram(message):
         )
 
         response.raise_for_status()
+
         return True
 
     except Exception as exc:
+
         log(f"Telegram error: {exc}")
         return False
 
 
-def load_state():
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as file:
-            return json.load(file)
-    except Exception:
-        return {}
-
-
-def save_state(state):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as file:
-            json.dump(state, file, indent=2)
-    except Exception as exc:
-        log(f"State save error: {exc}")
-
-
 # =========================================================
-# OTCHARTS ACCOUNT AND PLAN CHECK
+# ACCOUNT AND PLAN CHECK
 # =========================================================
 
 def check_account():
+
     usage = api_get("/v1/usage")
 
-    plan = str(usage.get("planName", usage.get("plan", "")))
+    plan = str(
+        usage.get("planName", usage.get("plan", "Unknown"))
+    )
+
     requests_data = usage.get("requests", {})
     streams_data = usage.get("streams", {})
 
@@ -162,6 +223,7 @@ def check_account():
     quota = int(requests_data.get("quota", 0))
 
     stream_limit = int(streams_data.get("limit", 0))
+
     instruments_limit = int(
         streams_data.get("instrumentsPerStream") or 0
     )
@@ -175,29 +237,34 @@ def check_account():
 
     if stream_limit < 1 or instruments_limit < 1:
         raise RuntimeError(
-            "Kont sa a pa gen live stream disponib."
+            "Kont OTCharts sa a pa gen live stream disponib."
         )
 
     venues = api_get("/v1/venues").get("venues", [])
 
     otc = next(
-        (item for item in venues if item.get("id") == VENUE),
+        (
+            item for item in venues
+            if item.get("id") == VENUE
+        ),
         None
     )
 
     if not otc or otc.get("open") is not True:
         raise RuntimeError(
-            "Plan OTCharts la pa ouvri liv OTC Pocket Option."
+            "OTCharts pa konfime aksè OTC pou plan sa a."
         )
 
-    if TIMEFRAME not in otc.get("timeframes", []):
+    timeframes = otc.get("timeframes", [])
+
+    if TIMEFRAME not in timeframes:
         raise RuntimeError(
-            "OTCharts pa konfime timeframe M1 pou liv OTC sa a."
+            "M1 timeframe pa disponib pou liv OTC sa a."
         )
 
     if remaining < 20:
         raise RuntimeError(
-            "Pa gen ase demann ki rete pou fè analiz la san danje."
+            "Pa gen ase demann API ki rete."
         )
 
     return {
@@ -208,7 +275,7 @@ def check_account():
 
 
 # =========================================================
-# FOREX SYMBOL FILTER
+# FOREX PAIR FILTER
 # =========================================================
 
 CURRENCIES = {
@@ -223,6 +290,7 @@ CURRENCIES = {
 
 
 def is_forex_pair(symbol):
+
     if not isinstance(symbol, str):
         return False
 
@@ -237,19 +305,30 @@ def is_forex_pair(symbol):
     base = pair[:3].upper()
     quote = pair[3:].upper()
 
-    return base in CURRENCIES and quote in CURRENCIES
+    return (
+        base in CURRENCIES
+        and quote in CURRENCIES
+        and base != quote
+    )
 
+
+# =========================================================
+# GET ALL ELIGIBLE OTC PAIRS
+# =========================================================
 
 def get_eligible_symbols():
+
     data = api_get(
         "/v1/symbols",
         params={"venue": VENUE}
     )
 
     symbols = data.get("symbols", [])
+
     eligible = []
 
     for item in symbols:
+
         symbol = item.get("symbol")
         payout = item.get("payout")
 
@@ -277,7 +356,10 @@ def get_eligible_symbols():
         })
 
     eligible.sort(
-        key=lambda item: (-item["payout"], item["symbol"])
+        key=lambda item: (
+            -item["payout"],
+            item["symbol"]
+        )
     )
 
     log(
@@ -293,6 +375,7 @@ def get_eligible_symbols():
 # =========================================================
 
 def get_candles(symbol):
+
     data = api_get(
         "/v1/candles",
         params={
@@ -307,16 +390,20 @@ def get_candles(symbol):
     gaps = data.get("gaps", {})
 
     if gaps.get("missingBars", 0) > 0:
+
         log(
             f"{symbol}: rejected, "
             f"missing bars={gaps.get('missingBars')}"
         )
+
         return []
 
     parsed = []
 
     for candle in candles:
+
         try:
+
             parsed.append({
                 "time": int(candle["time"]),
                 "open": float(candle["open"]),
@@ -324,46 +411,70 @@ def get_candles(symbol):
                 "low": float(candle["low"]),
                 "close": float(candle["close"])
             })
+
         except (KeyError, TypeError, ValueError):
             continue
 
     parsed.sort(key=lambda item: item["time"])
 
     if len(parsed) < MIN_CANDLES:
-        log(f"{symbol}: insufficient candles ({len(parsed)})")
+
+        log(
+            f"{symbol}: insufficient candles "
+            f"({len(parsed)})"
+        )
+
         return []
 
-    # Reject non-contiguous candle histories.
     for index in range(1, len(parsed)):
-        difference = parsed[index]["time"] - parsed[index - 1]["time"]
+
+        difference = (
+            parsed[index]["time"]
+            - parsed[index - 1]["time"]
+        )
 
         if difference != TIMEFRAME:
-            log(f"{symbol}: candle time gap detected.")
+
+            log(
+                f"{symbol}: candle time gap detected."
+            )
+
             return []
 
     return parsed[-CANDLE_LIMIT:]
 
 
 # =========================================================
-# INDICATORS
+# EMA
 # =========================================================
 
 def ema(values, period):
+
     if len(values) < period:
         return []
 
     multiplier = 2.0 / (period + 1)
-    result = [sum(values[:period]) / period]
+
+    result = [
+        sum(values[:period]) / period
+    ]
 
     for value in values[period:]:
+
         result.append(
-            (value - result[-1]) * multiplier + result[-1]
+            (value - result[-1]) * multiplier
+            + result[-1]
         )
 
     return [None] * (period - 1) + result
 
 
+# =========================================================
+# RSI
+# =========================================================
+
 def rsi(values, period=7):
+
     if len(values) <= period:
         return []
 
@@ -371,7 +482,9 @@ def rsi(values, period=7):
     losses = []
 
     for index in range(1, len(values)):
+
         change = values[index] - values[index - 1]
+
         gains.append(max(change, 0))
         losses.append(max(-change, 0))
 
@@ -381,12 +494,15 @@ def rsi(values, period=7):
     result = [None] * period
 
     for index in range(period, len(gains)):
+
         avg_gain = (
-            avg_gain * (period - 1) + gains[index]
+            avg_gain * (period - 1)
+            + gains[index]
         ) / period
 
         avg_loss = (
-            avg_loss * (period - 1) + losses[index]
+            avg_loss * (period - 1)
+            + losses[index]
         ) / period
 
         if avg_loss == 0:
@@ -397,83 +513,132 @@ def rsi(values, period=7):
 
         result.append(value)
 
-    if avg_loss == 0:
-        last = 100.0
-    else:
-        rs = avg_gain / avg_loss
-        last = 100 - (100 / (1 + rs))
+    return result
 
-    return result + [last] if len(result) < len(values) else result
 
+# =========================================================
+# STOCHASTIC
+# =========================================================
 
 def stochastic(candles, period=14):
+
     raw_k = []
 
     for index in range(len(candles)):
+
         if index < period - 1:
             raw_k.append(None)
             continue
 
-        window = candles[index - period + 1:index + 1]
+        window = candles[
+            index - period + 1:index + 1
+        ]
 
-        highest = max(item["high"] for item in window)
-        lowest = min(item["low"] for item in window)
+        highest = max(
+            item["high"] for item in window
+        )
+
+        lowest = min(
+            item["low"] for item in window
+        )
+
         close = candles[index]["close"]
 
         if highest == lowest:
             raw_k.append(50.0)
         else:
             raw_k.append(
-                100 * (close - lowest) / (highest - lowest)
+                100 * (close - lowest)
+                / (highest - lowest)
             )
 
     smooth_k = []
 
     for index in range(len(raw_k)):
-        window = raw_k[max(0, index - 2):index + 1]
-        valid = [value for value in window if value is not None]
+
+        window = raw_k[
+            max(0, index - 2):index + 1
+        ]
+
+        valid = [
+            value for value in window
+            if value is not None
+        ]
 
         smooth_k.append(
-            sum(valid) / len(valid) if len(valid) == 3 else None
+            sum(valid) / len(valid)
+            if len(valid) == 3
+            else None
         )
 
     smooth_d = []
 
     for index in range(len(smooth_k)):
-        window = smooth_k[max(0, index - 2):index + 1]
-        valid = [value for value in window if value is not None]
+
+        window = smooth_k[
+            max(0, index - 2):index + 1
+        ]
+
+        valid = [
+            value for value in window
+            if value is not None
+        ]
 
         smooth_d.append(
-            sum(valid) / len(valid) if len(valid) == 3 else None
+            sum(valid) / len(valid)
+            if len(valid) == 3
+            else None
         )
 
     return smooth_k, smooth_d
 
 
+# =========================================================
+# ADX AND DIRECTIONAL INDICATORS
+# =========================================================
+
 def adx_values(candles, period=14):
+
     plus_dm = [0.0]
     minus_dm = [0.0]
-    true_range = [candles[0]["high"] - candles[0]["low"]]
+
+    true_range = [
+        candles[0]["high"] - candles[0]["low"]
+    ]
 
     for index in range(1, len(candles)):
+
         current = candles[index]
         previous = candles[index - 1]
 
-        up_move = current["high"] - previous["high"]
-        down_move = previous["low"] - current["low"]
+        up_move = (
+            current["high"] - previous["high"]
+        )
+
+        down_move = (
+            previous["low"] - current["low"]
+        )
 
         plus_dm.append(
-            up_move if up_move > down_move and up_move > 0 else 0.0
+            up_move
+            if up_move > down_move and up_move > 0
+            else 0.0
         )
 
         minus_dm.append(
-            down_move if down_move > up_move and down_move > 0 else 0.0
+            down_move
+            if down_move > up_move and down_move > 0
+            else 0.0
         )
 
         tr = max(
             current["high"] - current["low"],
-            abs(current["high"] - previous["close"]),
-            abs(current["low"] - previous["close"])
+            abs(
+                current["high"] - previous["close"]
+            ),
+            abs(
+                current["low"] - previous["close"]
+            )
         )
 
         true_range.append(tr)
@@ -483,30 +648,46 @@ def adx_values(candles, period=14):
     minus_di_values = []
 
     for index in range(len(candles)):
+
         if index < period:
+
             dx_values.append(None)
             plus_di_values.append(None)
             minus_di_values.append(None)
+
             continue
 
         start = index - period + 1
 
-        tr_sum = sum(true_range[start:index + 1])
-        plus_sum = sum(plus_dm[start:index + 1])
-        minus_sum = sum(minus_dm[start:index + 1])
+        tr_sum = sum(
+            true_range[start:index + 1]
+        )
+
+        plus_sum = sum(
+            plus_dm[start:index + 1]
+        )
+
+        minus_sum = sum(
+            minus_dm[start:index + 1]
+        )
 
         if tr_sum == 0:
+
             plus_di = 0.0
             minus_di = 0.0
+
         else:
+
             plus_di = 100 * plus_sum / tr_sum
             minus_di = 100 * minus_sum / tr_sum
 
         denominator = plus_di + minus_di
 
         dx = (
-            100 * abs(plus_di - minus_di) / denominator
-            if denominator else 0.0
+            100 * abs(plus_di - minus_di)
+            / denominator
+            if denominator
+            else 0.0
         )
 
         plus_di_values.append(plus_di)
@@ -516,17 +697,24 @@ def adx_values(candles, period=14):
     adx = []
 
     for index in range(len(dx_values)):
+
         if index < period * 2:
+
             adx.append(None)
             continue
 
         window = [
-            value for value in dx_values[index - period + 1:index + 1]
+            value
+            for value in dx_values[
+                index - period + 1:index + 1
+            ]
             if value is not None
         ]
 
         adx.append(
-            sum(window) / len(window) if len(window) == period else None
+            sum(window) / len(window)
+            if len(window) == period
+            else None
         )
 
     return adx, plus_di_values, minus_di_values
@@ -537,23 +725,32 @@ def adx_values(candles, period=14):
 # =========================================================
 
 def analyze_signal(candles):
+
     if len(candles) < MIN_CANDLES:
         return None
 
-    closes = [item["close"] for item in candles]
+    closes = [
+        item["close"] for item in candles
+    ]
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
     ema50 = ema(closes, 50)
 
     rsi_data = rsi(closes, RSI_PERIOD)
-    k_values, d_values = stochastic(candles, STOCH_PERIOD)
+
+    k_values, d_values = stochastic(
+        candles,
+        STOCH_PERIOD
+    )
 
     adx_data, plus_di, minus_di = adx_values(
-        candles, ADX_PERIOD
+        candles,
+        ADX_PERIOD
     )
 
     try:
+
         k = k_values[-1]
         d = d_values[-1]
         old_k = k_values[-2]
@@ -572,8 +769,9 @@ def analyze_signal(candles):
         return None
 
     values = [
-        k, d, old_k, current_rsi, current_adx,
-        current_plus, current_minus, fast, medium, slow
+        k, d, old_k, current_rsi,
+        current_adx, current_plus,
+        current_minus, fast, medium, slow
     ]
 
     if any(value is None for value in values):
@@ -582,21 +780,25 @@ def analyze_signal(candles):
     if current_adx < ADX_MIN:
         return None
 
-    di_gap = abs(current_plus - current_minus)
+    di_gap = abs(
+        current_plus - current_minus
+    )
 
     if di_gap < MIN_DI_GAP:
         return None
 
     last = candles[-1]
-    previous = candles[-2]
 
-    candle_range = last["high"] - last["low"]
+    candle_range = (
+        last["high"] - last["low"]
+    )
 
     if candle_range <= 0:
         return None
 
     body_ratio = (
-        abs(last["close"] - last["open"]) / candle_range
+        abs(last["close"] - last["open"])
+        / candle_range
     )
 
     bullish = (
@@ -611,10 +813,11 @@ def analyze_signal(candles):
         and 30 <= k <= 75
     )
 
-    # Stochastic is mandatory.
-    # RSI can never override Stochastic.
+    # STOCHASTIC IS MANDATORY.
+    # RSI CANNOT OVERRIDE STOCHASTIC.
 
     if bullish:
+
         direction = "CALL"
 
         if current_plus <= current_minus:
@@ -624,6 +827,7 @@ def analyze_signal(candles):
             return None
 
     elif bearish:
+
         direction = "PUT"
 
         if current_minus <= current_plus:
@@ -635,9 +839,10 @@ def analyze_signal(candles):
     else:
         return None
 
-    score = 1  # Mandatory Stochastic condition
+    score = 1
 
     if direction == "CALL":
+
         if fast > medium > slow:
             score += 1
 
@@ -651,6 +856,7 @@ def analyze_signal(candles):
             score += 1
 
     else:
+
         if fast < medium < slow:
             score += 1
 
@@ -680,17 +886,24 @@ def analyze_signal(candles):
 
 
 # =========================================================
-# SIGNAL MESSAGE
+# SEND SIGNAL
 # =========================================================
 
 def send_signal(symbol, payout, signal):
+
     now = local_now()
 
-    entry = now.replace(second=0, microsecond=0) + timedelta(minutes=1)
+    entry = (
+        now.replace(second=0, microsecond=0)
+        + timedelta(minutes=1)
+    )
 
     direction = signal["direction"]
 
-    arrow = "🟢" if direction == "CALL" else "🔴"
+    arrow = (
+        "🟢" if direction == "CALL"
+        else "🔴"
+    )
 
     message = (
         f"🤖 {VERSION}\n\n"
@@ -705,18 +918,24 @@ def send_signal(symbol, payout, signal):
 
 
 # =========================================================
-# LIVE STREAM AND CANDLE BUILDER
+# LIVE STREAM
 # =========================================================
 
 def run_live_stream(monitored, histories):
-    symbols = [item["symbol"] for item in monitored]
+
+    symbols = [
+        item["symbol"] for item in monitored
+    ]
 
     params = {
         "venue": VENUE,
         "symbol": ",".join(symbols)
     }
 
-    log(f"Opening live stream for {len(symbols)} pairs.")
+    log(
+        f"Opening live stream for "
+        f"{len(symbols)} pairs."
+    )
 
     response = api_get(
         "/v1/stream",
@@ -726,23 +945,30 @@ def run_live_stream(monitored, histories):
 
     current_bars = {}
     signal_minute = {}
+
     pending = None
-
     connected_symbols = set()
-    started_at = time.time()
 
+    started_at = time.time()
     event_name = ""
 
     try:
+
         for raw_line in response.iter_lines(
             decode_unicode=True,
             chunk_size=1
         ):
-            if time.time() - started_at > MAX_SCAN_MINUTES * 60:
+
+            if (
+                time.time() - started_at
+                > MAX_SCAN_MINUTES * 60
+            ):
+
                 log("Maximum scan duration reached.")
                 return
 
             if not raw_line:
+
                 event_name = ""
                 continue
 
@@ -752,6 +978,7 @@ def run_live_stream(monitored, histories):
                 continue
 
             if line.startswith("event:"):
+
                 event_name = line[6:].strip()
                 continue
 
@@ -766,25 +993,43 @@ def run_live_stream(monitored, histories):
                 continue
 
             if event_name == "connected":
-                connected_symbols = set(data.get("symbols", []))
+
+                connected_symbols = set(
+                    data.get("symbols", [])
+                )
 
                 log(
                     "Stream connected: "
-                    + ", ".join(sorted(connected_symbols))
+                    + ", ".join(
+                        sorted(connected_symbols)
+                    )
                 )
 
                 if not connected_symbols:
-                    log("No symbols subscribed by OTCharts.")
+
+                    log(
+                        "OTCharts did not confirm "
+                        "any subscribed symbols."
+                    )
+
                     return
 
                 continue
 
             if event_name == "closed":
-                log(f"OTCharts closed event: {data}")
+
+                log(
+                    f"OTCharts closed event: {data}"
+                )
+
                 continue
 
             if event_name == "replaced":
-                log("Stream was replaced by another connection.")
+
+                log(
+                    "Stream replaced by another connection."
+                )
+
                 return
 
             if event_name != "tick":
@@ -796,21 +1041,28 @@ def run_live_stream(monitored, histories):
                 continue
 
             try:
+
                 price = float(data["price"])
                 feed_time = int(data["time"])
+
             except (KeyError, TypeError, ValueError):
                 continue
 
             receive_time = time.time()
-            bucket = (feed_time // 60) * 60
 
-            # Start a live candle for this symbol.
+            bucket = (
+                feed_time // 60
+            ) * 60
+
+            # INITIAL LIVE CANDLE
+
             if symbol not in current_bars:
+
                 history = histories.get(symbol, [])
 
-                # Keep only candles older than the live candle.
                 history = [
-                    candle for candle in history
+                    candle
+                    for candle in history
                     if candle["time"] < bucket
                 ]
 
@@ -826,22 +1078,29 @@ def run_live_stream(monitored, histories):
 
             current = current_bars[symbol]
 
-            # A new M1 candle has started.
+            # NEW MINUTE
+
             if bucket > current["time"]:
 
-                gap = bucket - current["time"]
+                gap = (
+                    bucket - current["time"]
+                )
 
                 if gap != 60:
+
                     log(
                         f"{symbol}: live feed gap detected. "
-                        "Skipping this pair."
+                        "Skipping pair."
                     )
+
                     connected_symbols.discard(symbol)
                     continue
 
                 histories[symbol].append(current)
 
-                histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
+                histories[symbol] = (
+                    histories[symbol][-CANDLE_LIMIT:]
+                )
 
                 current_bars[symbol] = {
                     "time": bucket,
@@ -853,42 +1112,68 @@ def run_live_stream(monitored, histories):
 
             elif bucket == current["time"]:
 
-                current["high"] = max(current["high"], price)
-                current["low"] = min(current["low"], price)
+                current["high"] = max(
+                    current["high"],
+                    price
+                )
+
+                current["low"] = min(
+                    current["low"],
+                    price
+                )
+
                 current["close"] = price
 
             else:
                 continue
 
-            # -------------------------------------------------
-            # RESULT CHECK: OTCHARTS TICK ESTIMATE
-            # -------------------------------------------------
+            # RESULT ESTIMATE
 
-            if pending and pending["symbol"] == symbol:
+            if (
+                pending
+                and pending["symbol"] == symbol
+            ):
 
                 if (
                     pending["entry_price"] is None
                     and receive_time >= pending["entry_time"]
                 ):
+
                     pending["entry_price"] = price
+
                     log(
-                        f"Entry tick captured for {symbol}: {price}"
+                        f"Entry tick captured: "
+                        f"{symbol} {price}"
                     )
 
                 if (
                     pending["entry_price"] is not None
                     and receive_time >= pending["expiry_time"]
                 ):
+
                     entry_price = pending["entry_price"]
 
                     if price == entry_price:
-                        result = "TIE"
-                    elif pending["direction"] == "CALL":
-                        result = "WIN" if price > entry_price else "LOSS"
-                    else:
-                        result = "WIN" if price < entry_price else "LOSS"
 
-                    result_message = (
+                        result = "TIE"
+
+                    elif pending["direction"] == "CALL":
+
+                        result = (
+                            "WIN"
+                            if price > entry_price
+                            else "LOSS"
+                        )
+
+                    else:
+
+                        result = (
+                            "WIN"
+                            if price < entry_price
+                            else "LOSS"
+                        )
+
+                    message = (
                         f"🤖 {VERSION}\n\n"
                         f"📊 OTCHARTS RESULT ESTIMATE\n"
                         f"💱 PAIR: {symbol}\n"
@@ -896,17 +1181,19 @@ def run_live_stream(monitored, histories):
                         f"📈 RESULT: {result}\n\n"
                         f"Entry: {entry_price}\n"
                         f"Exit: {price}\n\n"
-                        f"⚠️ This is an OTCharts tick estimate, "
-                        f"not a verified Pocket Option trade result."
+                        f"⚠️ OTCharts estimate only. "
+                        f"Not a verified Pocket Option result."
                     )
 
-                    send_telegram(result_message)
-                    log(f"{symbol}: estimated result = {result}")
+                    send_telegram(message)
+
+                    log(
+                        f"{symbol}: estimated result={result}"
+                    )
+
                     return
 
-            # -------------------------------------------------
-            # SIGNAL CHECK: 10 SECONDS BEFORE NEXT M1 CANDLE
-            # -------------------------------------------------
+            # SIGNAL CHECK
 
             if pending is not None:
                 continue
@@ -916,21 +1203,29 @@ def run_live_stream(monitored, histories):
             if now.second < 50:
                 continue
 
-            minute_key = int(receive_time // 60)
+            minute_key = int(
+                receive_time // 60
+            )
 
-            if signal_minute.get(symbol) == minute_key:
+            if (
+                signal_minute.get(symbol)
+                == minute_key
+            ):
                 continue
 
             signal_minute[symbol] = minute_key
 
             candles_for_analysis = (
-                histories[symbol] + [current_bars[symbol]]
+                histories[symbol]
+                + [current_bars[symbol]]
             )
 
             if len(candles_for_analysis) < MIN_CANDLES:
                 continue
 
-            signal = analyze_signal(candles_for_analysis)
+            signal = analyze_signal(
+                candles_for_analysis
+            )
 
             if not signal:
                 continue
@@ -951,15 +1246,20 @@ def run_live_stream(monitored, histories):
                 f"{symbol} | score={signal['score']}"
             )
 
-            if not send_signal(
+            delivered = send_signal(
                 symbol,
                 pair_info["payout"],
                 signal
-            ):
-                log("Telegram signal could not be delivered.")
+            )
+
+            if not delivered:
+
+                log(
+                    "Telegram signal delivery failed."
+                )
+
                 return
 
-            # Entry is the next local minute.
             entry_time = (
                 int(receive_time // 60) * 60 + 60
             )
@@ -973,11 +1273,12 @@ def run_live_stream(monitored, histories):
             }
 
             log(
-                f"Signal sent. Waiting for entry and "
-                f"60-second result estimate."
+                "Signal sent. Waiting for entry "
+                "and 60-second result estimate."
             )
 
     finally:
+
         response.close()
 
 
@@ -986,53 +1287,68 @@ def run_live_stream(monitored, histories):
 # =========================================================
 
 def main():
+
     log(f"{VERSION} starting...")
 
     if not API_KEY:
-        raise RuntimeError("OTCHARTS_API_KEY is missing.")
+        raise RuntimeError(
+            "OTCHARTS_API_KEY is missing."
+        )
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Telegram secrets are missing.")
+        raise RuntimeError(
+            "Telegram secrets are missing."
+        )
 
     account = check_account()
 
     eligible = get_eligible_symbols()
 
     if not eligible:
-        log("No Forex OTC pairs meet the payout requirement.")
+
+        log(
+            "No Forex OTC pairs meet "
+            "the payout requirement."
+        )
+
         return
 
-    if len(eligible) > MAX_HISTORY_REQUESTS_PER_RUN:
+    if (
+        len(eligible)
+        > MAX_HISTORY_REQUESTS_PER_RUN
+    ):
+
         raise RuntimeError(
-            f"{len(eligible)} eligible pairs exceed the "
-            f"per-run history request safety limit "
+            f"{len(eligible)} eligible pairs exceed "
+            f"the safety limit "
             f"({MAX_HISTORY_REQUESTS_PER_RUN})."
         )
 
     estimated_requests = len(eligible) + 4
 
     if account["remaining"] < estimated_requests:
+
         raise RuntimeError(
             "Not enough OTCharts requests remaining "
-            "to analyze every eligible pair."
+            "to analyze all eligible pairs."
         )
 
-    # -----------------------------------------------------
-    # ANALYZE HISTORY FOR ALL QUALIFYING PAIRS
-    # -----------------------------------------------------
+    # ANALYZE ALL ELIGIBLE PAIRS
 
     histories = {}
     ranked = []
 
     log(
-        f"Analyzing history for all {len(eligible)} "
-        f"eligible Forex OTC pairs."
+        f"Analyzing history for all "
+        f"{len(eligible)} eligible Forex OTC pairs."
     )
 
     for item in eligible:
+
         symbol = item["symbol"]
 
         try:
+
             candles = get_candles(symbol)
 
             if not candles:
@@ -1040,8 +1356,6 @@ def main():
 
             histories[symbol] = candles
 
-            # Historical data is used to assess whether the
-            # pair has enough clean data for live monitoring.
             ranked.append({
                 **item,
                 "history_count": len(candles)
@@ -1054,47 +1368,64 @@ def main():
             )
 
         except Exception as exc:
-            log(f"{symbol}: history error: {exc}")
+
+            log(
+                f"{symbol}: history error: {exc}"
+            )
 
     if not ranked:
-        log("No pairs have sufficient clean candle history.")
+
+        log(
+            "No pairs have sufficient clean "
+            "candle history."
+        )
+
         return
 
-    # -----------------------------------------------------
-    # LITE STREAM: MAXIMUM FIVE INSTRUMENTS
-    # -----------------------------------------------------
+    # LITE PLAN: MAXIMUM FIVE LIVE PAIRS
 
-    monitored = ranked[:min(
+    live_limit = min(
         MAX_LIVE_SYMBOLS,
         account["instruments_limit"]
-    )]
+    )
+
+    monitored = ranked[:live_limit]
 
     log(
-        f"All eligible pairs analyzed: {len(ranked)} | "
-        f"Live monitored: {len(monitored)}"
+        f"All eligible pairs analyzed: {len(ranked)} "
+        f"| Live monitored: {len(monitored)}"
     )
 
     log(
         "Live watchlist: "
-        + ", ".join(item["symbol"] for item in monitored)
+        + ", ".join(
+            item["symbol"] for item in monitored
+        )
     )
 
-    # -----------------------------------------------------
     # ONE LIVE STREAM
-    # -----------------------------------------------------
 
     reconnects = 0
 
     while reconnects <= MAX_RECONNECTS:
+
         try:
-            run_live_stream(monitored, histories)
+
+            run_live_stream(
+                monitored,
+                histories
+            )
+
             break
 
         except requests.RequestException as exc:
+
             reconnects += 1
+
             log(
                 f"Stream connection error "
-                f"({reconnects}/{MAX_RECONNECTS}): {exc}"
+                f"({reconnects}/{MAX_RECONNECTS}): "
+                f"{exc}"
             )
 
             if reconnects > MAX_RECONNECTS:
@@ -1103,11 +1434,16 @@ def main():
             time.sleep(5)
 
         except Exception as exc:
-            log(f"Bot stopped: {exc}")
+
+            log(
+                f"Bot stopped: {exc}"
+            )
+
             break
 
     log(f"{VERSION} finished.")
 
 
 if __name__ == "__main__":
+
     main()
