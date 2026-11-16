@@ -10,13 +10,14 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =========================================================
-# ROMARIO TRADER PRO 11.9
+# ROMARIO TRADER PRO 12.0
 # Bollinger Bands + RSI Reversal
 # Pocket Option OTC | M1 | 60s expiration
 # OTCharts Lite | Telegram alerts only
+# Fast signal check | 10-second entry timing
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO 11.9"
+VERSION = "ROMARIO TRADER PRO 12.0"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -39,7 +40,8 @@ CALL_RSI_MAX = 40
 PUT_RSI_MIN = 60
 
 # Timing
-ENTRY_LEAD_SECONDS = 10
+ENTRY_INTERVAL_SECONDS = 10
+EXPIRATION_SECONDS = 60
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
 
@@ -60,7 +62,7 @@ session = requests.Session()
 
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTraderPro/11.9",
+    "User-Agent": "RomarioTraderPro/12.0",
     "Accept": "application/json"
 })
 
@@ -75,6 +77,16 @@ def local_now():
 
 def log(message):
     logging.info(message)
+
+
+def next_entry_time(timestamp):
+    """
+    Return the next 10-second boundary.
+    Always choose a future boundary, not the current one.
+    """
+    return (
+        int(timestamp // ENTRY_INTERVAL_SECONDS) + 1
+    ) * ENTRY_INTERVAL_SECONDS
 
 
 # =========================================================
@@ -114,9 +126,7 @@ def api_get(path, params=None, stream=False):
                     f"{response.text[:300]}"
                 )
 
-            if response.status_code in (
-                500, 502, 503, 504
-            ):
+            if response.status_code in (500, 502, 503, 504):
 
                 if attempt < attempts:
 
@@ -202,6 +212,13 @@ def send_telegram(message):
         )
 
         response.raise_for_status()
+
+        result = response.json()
+
+        if not result.get("ok", False):
+            log(f"Telegram rejected message: {result}")
+            return False
+
         return True
 
     except Exception as exc:
@@ -440,7 +457,6 @@ def get_candles(symbol):
         key=lambda item: item["time"]
     )
 
-    # Remove duplicate candle timestamps.
     unique = {}
 
     for candle in parsed:
@@ -460,7 +476,6 @@ def get_candles(symbol):
 
         return []
 
-    # Reject histories with missing M1 bars.
     for index in range(1, len(parsed)):
 
         difference = (
@@ -565,9 +580,7 @@ def analyze_signal(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
-    # IMPORTANT:
-    # This function receives CLOSED candles only.
-
+    # Closed candles only.
     closes = [
         candle["close"]
         for candle in candles
@@ -598,7 +611,6 @@ def analyze_signal(candles):
     prev = candles[-2]
     last = candles[-1]
 
-    # Bands calculated before the latest candle.
     prev_upper, prev_mid, prev_lower = (
         bollinger_bands(
             closes[:-1],
@@ -617,9 +629,7 @@ def analyze_signal(candles):
     last_high = last["high"]
     last_low = last["low"]
 
-    # -----------------------------------------------------
     # CALL: LOWER BAND REVERSAL
-    # -----------------------------------------------------
 
     touched_lower = (
         prev_close <= prev_lower
@@ -641,21 +651,11 @@ def analyze_signal(candles):
             "direction": "CALL",
             "score": 6,
             "rsi": round(rsi_value, 2),
-            "k": 0.0,
-            "d": 0.0,
-            "adx": 0.0,
-            "plus_di": 0.0,
-            "minus_di": 0.0,
-            "ema9": mid,
-            "ema21": lower,
-            "ema50": upper,
             "close": last_close,
             "candle_time": last["time"]
         }
 
-    # -----------------------------------------------------
     # PUT: UPPER BAND REVERSAL
-    # -----------------------------------------------------
 
     touched_upper = (
         prev_close >= prev_upper
@@ -677,14 +677,6 @@ def analyze_signal(candles):
             "direction": "PUT",
             "score": 6,
             "rsi": round(rsi_value, 2),
-            "k": 0.0,
-            "d": 0.0,
-            "adx": 0.0,
-            "plus_di": 0.0,
-            "minus_di": 0.0,
-            "ema9": mid,
-            "ema21": upper,
-            "ema50": lower,
             "close": last_close,
             "candle_time": last["time"]
         }
@@ -696,13 +688,13 @@ def analyze_signal(candles):
 # SEND SIGNAL TO TELEGRAM
 # =========================================================
 
-def send_signal(symbol, payout, signal):
+def send_signal(symbol, payout, signal, entry_time):
 
     now = local_now()
 
-    entry = (
-        now.replace(second=0, microsecond=0)
-        + timedelta(minutes=1)
+    entry = datetime.fromtimestamp(
+        entry_time,
+        TIMEZONE
     )
 
     direction = signal["direction"]
@@ -718,7 +710,8 @@ def send_signal(symbol, payout, signal):
         f"💱 PAIR: {symbol}\n"
         f"💰 PAYOUT: {payout:.1f}%\n\n"
         f"⏰ SIGNAL: {now.strftime('%I:%M:%S %p')}\n"
-        f"🎯 ENTRY: {entry.strftime('%I:%M:%S %p')}"
+        f"🎯 ENTRY: {entry.strftime('%I:%M:%S %p')}\n"
+        f"⌛ EXPIRATION: 60 SECONDS"
     )
 
     return send_telegram(message)
@@ -800,9 +793,7 @@ def run_live_stream(monitored, histories):
             except json.JSONDecodeError:
                 continue
 
-            # ---------------------------------------------
             # STREAM CONNECTED
-            # ---------------------------------------------
 
             if event_name == "connected":
 
@@ -828,9 +819,7 @@ def run_live_stream(monitored, histories):
 
                 continue
 
-            # ---------------------------------------------
             # STREAM EVENTS
-            # ---------------------------------------------
 
             if event_name == "closed":
 
@@ -871,9 +860,7 @@ def run_live_stream(monitored, histories):
                 feed_time // 60
             ) * 60
 
-            # ---------------------------------------------
             # INITIAL LIVE CANDLE
-            # ---------------------------------------------
 
             if symbol not in current_bars:
 
@@ -882,8 +869,6 @@ def run_live_stream(monitored, histories):
                     []
                 )
 
-                # Do not reuse the currently forming candle
-                # from historical data.
                 history = [
                     candle
                     for candle in history
@@ -900,11 +885,11 @@ def run_live_stream(monitored, histories):
                     "close": price
                 }
 
+                continue
+
             current = current_bars[symbol]
 
-            # ---------------------------------------------
             # NEW M1 CANDLE
-            # ---------------------------------------------
 
             if bucket > current["time"]:
 
@@ -955,9 +940,7 @@ def run_live_stream(monitored, histories):
             else:
                 continue
 
-            # ---------------------------------------------
             # RESULT ESTIMATE
-            # ---------------------------------------------
 
             if (
                 pending
@@ -1023,35 +1006,20 @@ def run_live_stream(monitored, histories):
 
                     return
 
-            # ---------------------------------------------
-            # SIGNAL CHECK
-            # ---------------------------------------------
+            # FAST SIGNAL CHECK
+            # Run on the first tick of a new M1 candle.
+            # Analyze closed candles only.
 
             if pending is not None:
                 continue
 
-            now = local_now()
+            minute_key = int(bucket // 60)
 
-            # Send signal around 10 seconds before
-            # the next local minute.
-            if now.second < 50:
-                continue
-
-            minute_key = int(
-                receive_time // 60
-            )
-
-            if (
-                signal_minute.get(symbol)
-                == minute_key
-            ):
+            if signal_minute.get(symbol) == minute_key:
                 continue
 
             signal_minute[symbol] = minute_key
 
-            # IMPORTANT:
-            # Analyze CLOSED candles only.
-            # Do not include current_bars[symbol].
             closed_candles = histories.get(
                 symbol,
                 []
@@ -1060,17 +1028,14 @@ def run_live_stream(monitored, histories):
             if len(closed_candles) < MIN_CANDLES:
                 continue
 
-            signal = analyze_signal(
-                closed_candles
-            )
+            signal = analyze_signal(closed_candles)
 
             if not signal:
                 continue
 
             pair_info = next(
                 (
-                    item
-                    for item in monitored
+                    item for item in monitored
                     if item["symbol"] == symbol
                 ),
                 None
@@ -1079,17 +1044,22 @@ def run_live_stream(monitored, histories):
             if not pair_info:
                 continue
 
+            # Next 10-second entry boundary.
+            entry_time = next_entry_time(receive_time)
+
             log(
                 f"SIGNAL {signal['direction']} "
                 f"{symbol} | "
                 f"RSI={signal['rsi']} | "
-                f"score={signal['score']}"
+                f"score={signal['score']} | "
+                f"entry_in={entry_time - receive_time:.1f}s"
             )
 
             delivered = send_signal(
                 symbol,
                 pair_info["payout"],
-                signal
+                signal,
+                entry_time
             )
 
             if not delivered:
@@ -1100,22 +1070,17 @@ def run_live_stream(monitored, histories):
 
                 return
 
-            # Next minute is the planned entry.
-            entry_time = (
-                int(receive_time // 60) * 60 + 60
-            )
-
             pending = {
                 "symbol": symbol,
                 "direction": signal["direction"],
                 "entry_time": entry_time,
-                "expiry_time": entry_time + 60,
+                "expiry_time": entry_time + EXPIRATION_SECONDS,
                 "entry_price": None
             }
 
             log(
-                f"Signal sent for {symbol}. "
-                f"Waiting for entry and expiry estimate."
+                f"Fast signal sent for {symbol}. "
+                f"Entry scheduled at next 10-second boundary."
             )
 
     finally:
