@@ -40,7 +40,7 @@ CALL_RSI_MAX = 40
 PUT_RSI_MIN = 60
 
 # Timing
-ENTRY_INTERVAL_SECONDS = 10
+ENTRY_INTERVAL_SECONDS = 15
 EXPIRATION_SECONDS = 60
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
@@ -81,7 +81,7 @@ def log(message):
 
 def next_entry_time(timestamp):
     """
-    Return the next 10-second boundary.
+    Return the next 15-second boundary.
     Always choose a future boundary, not the current one.
     """
     return (
