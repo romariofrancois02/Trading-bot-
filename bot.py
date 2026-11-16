@@ -6,18 +6,18 @@ import math
 import logging
 import requests
 
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =========================================================
-# ROMARIO TRADER PRO 12.0
-# Bollinger Bands + RSI Reversal
+# ROMARIO TRADER PRO 12.2
+# Bollinger Bands + RSI + Wick Rejection
 # Pocket Option OTC | M1 | 60s expiration
 # OTCharts Lite | Telegram alerts only
-# Fast signal check | 10-second entry timing
+# Entry: 15 seconds after signal detection
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO 12.0"
+VERSION = "ROMARIO TRADER PRO 12.2"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -39,13 +39,24 @@ RSI_PERIOD = 7
 CALL_RSI_MAX = 40
 PUT_RSI_MIN = 60
 
+# Wick rejection confirmation
+MIN_WICK_BODY_RATIO = 1.2
+MIN_WICK_RANGE_RATIO = 0.30
+
 # Timing
-ENTRY_INTERVAL_SECONDS = 15
+ENTRY_DELAY_SECONDS = 15
+ENTRY_GRACE_SECONDS = 5
 EXPIRATION_SECONDS = 60
+
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
 
 API_TIMEOUT = 30
+
+# Telegram
+TELEGRAM_ATTEMPTS = 5
+TELEGRAM_TIMEOUT = (1.5, 1.5)
+TELEGRAM_RETRY_DELAYS = [0.3, 0.5, 0.8, 1.0]
 
 TIMEZONE = ZoneInfo("America/New_York")
 
@@ -62,7 +73,7 @@ session = requests.Session()
 
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTraderPro/12.0",
+    "User-Agent": "RomarioTraderPro/12.2",
     "Accept": "application/json"
 })
 
@@ -79,18 +90,17 @@ def log(message):
     logging.info(message)
 
 
-def next_entry_time(timestamp):
+def make_entry_time(signal_time):
     """
-    Return the next 15-second boundary.
-    Always choose a future boundary, not the current one.
+    Entry is exactly 15 seconds after signal detection.
+    It is NOT rounded to the next 15-second boundary.
     """
-    return (
-        int(timestamp // ENTRY_INTERVAL_SECONDS) + 1
-    ) * ENTRY_INTERVAL_SECONDS
+
+    return signal_time + ENTRY_DELAY_SECONDS
 
 
 # =========================================================
-# OTCHARTS API WITH AUTOMATIC RETRIES
+# OTCHARTS API WITH RETRIES
 # =========================================================
 
 def api_get(path, params=None, stream=False):
@@ -172,7 +182,7 @@ def api_get(path, params=None, stream=False):
             )
 
             log(
-                f"Connection problem. "
+                f"OTCharts connection problem. "
                 f"Retry {attempt}/{attempts} "
                 f"in {wait}s: {exc}"
             )
@@ -186,7 +196,7 @@ def api_get(path, params=None, stream=False):
 
 
 # =========================================================
-# TELEGRAM
+# TELEGRAM WITH 5 RETRIES
 # =========================================================
 
 def send_telegram(message):
@@ -200,31 +210,88 @@ def send_telegram(message):
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    try:
+    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
 
-        response = requests.post(
-            url,
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": message
-            },
-            timeout=15
-        )
+        response = None
 
-        response.raise_for_status()
+        try:
 
-        result = response.json()
+            response = requests.post(
+                url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "text": message
+                },
+                timeout=TELEGRAM_TIMEOUT
+            )
 
-        if not result.get("ok", False):
-            log(f"Telegram rejected message: {result}")
-            return False
+            try:
+                result = response.json()
+            except ValueError:
+                result = {}
 
-        return True
+            if (
+                response.ok
+                and result.get("ok") is True
+            ):
 
-    except Exception as exc:
+                log(
+                    f"Telegram delivered successfully "
+                    f"(attempt {attempt}/{TELEGRAM_ATTEMPTS})."
+                )
 
-        log(f"Telegram error: {exc}")
-        return False
+                return True
+
+            error_code = result.get("error_code")
+            description = result.get(
+                "description",
+                response.text[:200]
+            )
+
+            # Invalid token, chat or message:
+            # retrying will not solve these errors.
+            if error_code in (400, 401, 403, 404):
+
+                log(
+                    f"Telegram permanent error: "
+                    f"{error_code} - {description}"
+                )
+
+                return False
+
+            log(
+                f"Telegram temporary error "
+                f"(attempt {attempt}/{TELEGRAM_ATTEMPTS}): "
+                f"{error_code} - {description}"
+            )
+
+        except requests.exceptions.RequestException as exc:
+
+            log(
+                f"Telegram connection error "
+                f"(attempt {attempt}/{TELEGRAM_ATTEMPTS}): "
+                f"{exc}"
+            )
+
+        finally:
+
+            if response is not None:
+                response.close()
+
+        if attempt < TELEGRAM_ATTEMPTS:
+
+            wait = TELEGRAM_RETRY_DELAYS[
+                min(
+                    attempt - 1,
+                    len(TELEGRAM_RETRY_DELAYS) - 1
+                )
+            ]
+
+            log(f"Retrying Telegram in {wait}s...")
+            time.sleep(wait)
+
+    log("Telegram delivery failed after all retries.")
+    return False
 
 
 # =========================================================
@@ -572,7 +639,50 @@ def calculate_rsi(closes, period=7):
 
 
 # =========================================================
-# BOLLINGER + RSI REVERSAL STRATEGY
+# WICK REJECTION CONFIRMATION
+# =========================================================
+
+def wick_rejection(candle, direction):
+
+    candle_open = candle["open"]
+    candle_close = candle["close"]
+    candle_high = candle["high"]
+    candle_low = candle["low"]
+
+    body = abs(candle_close - candle_open)
+    candle_range = candle_high - candle_low
+
+    if candle_range <= 0:
+        return False
+
+    lower_wick = (
+        min(candle_open, candle_close)
+        - candle_low
+    )
+
+    upper_wick = (
+        candle_high
+        - max(candle_open, candle_close)
+    )
+
+    minimum_wick = max(
+        body * MIN_WICK_BODY_RATIO,
+        candle_range * MIN_WICK_RANGE_RATIO
+    )
+
+    if direction == "CALL":
+
+        return lower_wick >= minimum_wick
+
+    if direction == "PUT":
+
+        return upper_wick >= minimum_wick
+
+    return False
+
+
+# =========================================================
+# BOLLINGER + RSI + WICK STRATEGY
 # =========================================================
 
 def analyze_signal(candles):
@@ -580,7 +690,6 @@ def analyze_signal(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
-    # Closed candles only.
     closes = [
         candle["close"]
         for candle in candles
@@ -640,16 +749,22 @@ def analyze_signal(candles):
         last_close > last_open
     )
 
+    call_rejection = wick_rejection(
+        last,
+        "CALL"
+    )
+
     if (
         touched_lower
         and bullish_candle
+        and call_rejection
         and rsi_value <= CALL_RSI_MAX
         and last_close < mid
     ):
 
         return {
             "direction": "CALL",
-            "score": 6,
+            "score": 7,
             "rsi": round(rsi_value, 2),
             "close": last_close,
             "candle_time": last["time"]
@@ -666,16 +781,22 @@ def analyze_signal(candles):
         last_close < last_open
     )
 
+    put_rejection = wick_rejection(
+        last,
+        "PUT"
+    )
+
     if (
         touched_upper
         and bearish_candle
+        and put_rejection
         and rsi_value >= PUT_RSI_MIN
         and last_close > mid
     ):
 
         return {
             "direction": "PUT",
-            "score": 6,
+            "score": 7,
             "rsi": round(rsi_value, 2),
             "close": last_close,
             "candle_time": last["time"]
@@ -690,7 +811,7 @@ def analyze_signal(candles):
 
 def send_signal(symbol, payout, signal, entry_time):
 
-    now = local_now()
+    signal_time = local_now()
 
     entry = datetime.fromtimestamp(
         entry_time,
@@ -709,12 +830,61 @@ def send_signal(symbol, payout, signal, entry_time):
         f"{arrow} {direction}\n\n"
         f"💱 PAIR: {symbol}\n"
         f"💰 PAYOUT: {payout:.1f}%\n\n"
-        f"⏰ SIGNAL: {now.strftime('%I:%M:%S %p')}\n"
-        f"🎯 ENTRY: {entry.strftime('%I:%M:%S %p')}\n"
+        f"⏰ SIGNAL: "
+        f"{signal_time.strftime('%I:%M:%S %p')}\n"
+        f"🎯 ENTRY: "
+        f"{entry.strftime('%I:%M:%S %p')}\n"
         f"⌛ EXPIRATION: 60 SECONDS"
     )
 
     return send_telegram(message)
+
+
+# =========================================================
+# SEND RESULT ESTIMATE
+# =========================================================
+
+def send_result(symbol, pending, exit_price):
+
+    entry_price = pending["entry_price"]
+
+    if exit_price == entry_price:
+
+        result = "TIE"
+
+    elif pending["direction"] == "CALL":
+
+        result = (
+            "WIN"
+            if exit_price > entry_price
+            else "LOSS"
+        )
+
+    else:
+
+        result = (
+            "WIN"
+            if exit_price < entry_price
+            else "LOSS"
+        )
+
+    message = (
+        f"🤖 {VERSION}\n\n"
+        f"📊 OTCHARTS RESULT ESTIMATE\n"
+        f"💱 PAIR: {symbol}\n"
+        f"📍 SIGNAL: {pending['direction']}\n"
+        f"📈 RESULT: {result}\n\n"
+        f"Entry: {entry_price}\n"
+        f"Exit: {exit_price}\n\n"
+        f"⚠️ OTCharts estimate only. "
+        f"Not a verified Pocket Option result."
+    )
+
+    send_telegram(message)
+
+    log(
+        f"{symbol}: estimated result={result}"
+    )
 
 
 # =========================================================
@@ -855,7 +1025,6 @@ def run_live_stream(monitored, histories):
 
             receive_time = time.time()
 
-            # M1 candle bucket.
             bucket = (
                 feed_time // 60
             ) * 60
@@ -940,75 +1109,59 @@ def run_live_stream(monitored, histories):
             else:
                 continue
 
-            # RESULT ESTIMATE
+            # =================================================
+            # PENDING ENTRY AND RESULT
+            # =================================================
 
             if (
                 pending
                 and pending["symbol"] == symbol
             ):
 
+                if pending["entry_price"] is None:
+
+                    # If the first available tick is too late,
+                    # do not pretend it was the scheduled entry.
+                    if (
+                        receive_time
+                        > pending["entry_time"]
+                        + ENTRY_GRACE_SECONDS
+                    ):
+
+                        log(
+                            f"{symbol}: entry tick arrived too late. "
+                            "Discarding result estimate."
+                        )
+
+                        pending = None
+
+                    elif receive_time >= pending["entry_time"]:
+
+                        pending["entry_price"] = price
+
+                        log(
+                            f"Entry tick captured: "
+                            f"{symbol} {price}"
+                        )
+
                 if (
-                    pending["entry_price"] is None
-                    and receive_time >= pending["entry_time"]
-                ):
-
-                    pending["entry_price"] = price
-
-                    log(
-                        f"Entry tick captured: "
-                        f"{symbol} {price}"
-                    )
-
-                if (
-                    pending["entry_price"] is not None
+                    pending
+                    and pending["entry_price"] is not None
                     and receive_time >= pending["expiry_time"]
                 ):
 
-                    entry_price = pending["entry_price"]
-
-                    if price == entry_price:
-
-                        result = "TIE"
-
-                    elif pending["direction"] == "CALL":
-
-                        result = (
-                            "WIN"
-                            if price > entry_price
-                            else "LOSS"
-                        )
-
-                    else:
-
-                        result = (
-                            "WIN"
-                            if price < entry_price
-                            else "LOSS"
-                        )
-
-                    message = (
-                        f"🤖 {VERSION}\n\n"
-                        f"📊 OTCHARTS RESULT ESTIMATE\n"
-                        f"💱 PAIR: {symbol}\n"
-                        f"📍 SIGNAL: {pending['direction']}\n"
-                        f"📈 RESULT: {result}\n\n"
-                        f"Entry: {entry_price}\n"
-                        f"Exit: {price}\n\n"
-                        f"⚠️ OTCharts estimate only. "
-                        f"Not a verified Pocket Option result."
+                    send_result(
+                        symbol,
+                        pending,
+                        price
                     )
 
-                    send_telegram(message)
+                    # Continue monitoring after the result.
+                    pending = None
 
-                    log(
-                        f"{symbol}: estimated result={result}"
-                    )
-
-                    return
-
-            # FAST SIGNAL CHECK
-            # Run on the first tick of a new M1 candle.
-            # Analyze closed candles only.
+            # =================================================
+            # SIGNAL CHECK
+            # =================================================
 
             if pending is not None:
                 continue
@@ -1018,6 +1171,7 @@ def run_live_stream(monitored, histories):
             if signal_minute.get(symbol) == minute_key:
                 continue
 
+            # Only one signal check per pair per M1 candle.
             signal_minute[symbol] = minute_key
 
             closed_candles = histories.get(
@@ -1044,14 +1198,14 @@ def run_live_stream(monitored, histories):
             if not pair_info:
                 continue
 
-            # Next 10-second entry boundary.
-            entry_time = next_entry_time(receive_time)
+            # Exact 15-second delay after detection.
+            entry_time = make_entry_time(receive_time)
 
             log(
                 f"SIGNAL {signal['direction']} "
                 f"{symbol} | "
                 f"RSI={signal['rsi']} | "
-                f"score={signal['score']} | "
+                f"score={signal['score']}/7 | "
                 f"entry_in={entry_time - receive_time:.1f}s"
             )
 
@@ -1065,22 +1219,42 @@ def run_live_stream(monitored, histories):
             if not delivered:
 
                 log(
-                    "Telegram signal delivery failed."
+                    f"{symbol}: Telegram delivery failed. "
+                    "Continuing to monitor other pairs."
                 )
 
-                return
+                # No pending trade is created.
+                continue
+
+            # Do not keep a signal if Telegram took too long.
+            if time.time() >= entry_time:
+
+                log(
+                    f"{symbol}: Telegram delivered after "
+                    "scheduled entry. Signal cancelled."
+                )
+
+                send_telegram(
+                    f"⚠️ {VERSION}\n\n"
+                    f"Signal for {symbol} arrived too late. "
+                    f"Please ignore the previous signal."
+                )
+
+                continue
 
             pending = {
                 "symbol": symbol,
                 "direction": signal["direction"],
                 "entry_time": entry_time,
-                "expiry_time": entry_time + EXPIRATION_SECONDS,
+                "expiry_time": (
+                    entry_time + EXPIRATION_SECONDS
+                ),
                 "entry_price": None
             }
 
             log(
-                f"Fast signal sent for {symbol}. "
-                f"Entry scheduled at next 10-second boundary."
+                f"Signal delivered for {symbol}. "
+                f"Entry in 15 seconds."
             )
 
     finally:
