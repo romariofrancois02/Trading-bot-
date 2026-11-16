@@ -9,12 +9,12 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO 12.1
+# ROMARIO TRADER PRO 12.2
 # Pocket Option OTC | M1 | Expiration 60s
 # Telegram alerts only
 # =====================================================
 
-VERSION = "ROMARIO TRADER PRO 12.1"
+VERSION = "ROMARIO TRADER PRO 12.2"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -24,14 +24,15 @@ EXPIRATION = 60
 CANDLE_LIMIT = 300
 MIN_CANDLES = 80
 
-MIN_PAYOUT = 75.0
+MIN_PAYOUT = 80.0
 MAX_SYMBOLS = 0
 
 # 13 Gwo Pè Forex OTC Klasik Sèlman
 ALLOWED_PAIRS = {
-    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
-    "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
-    "EURJPY_otc", "GBPJPY_otc", "AUDCHF_otc", "EURCHF_otc",
+    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc",
+    "AUDUSD_otc", "USDCAD_otc", "USDCHF_otc",
+    "NZDUSD_otc", "EURGBP_otc", "EURJPY_otc",
+    "GBPJPY_otc", "AUDCHF_otc", "EURCHF_otc",
     "AUDNZD_otc"
 }
 
@@ -39,28 +40,28 @@ ALLOWED_NORMALIZED = {
     pair.upper() for pair in ALLOWED_PAIRS
 }
 
-# Filtè Tandans Balanse
+# Filtè tandans rapid
 ADX_PERIOD = 14
-ADX_MIN = 18
-MIN_DI_GAP = 3
+ADX_MIN = 15
+MIN_DI_GAP = 2
 
-# Endikatè Rapid
+# Endikatè rapid
 RSI_PERIOD = 7
 STOCH_PERIOD = 14
 
-# Kalite Siyal
+# Kalite siyal
 MIN_SCORE = 4
 
-# Tan Eskanè
+# Tan eskanè
 ENTRY_LEAD = 10
-SCAN_INTERVAL = 45
+SCAN_INTERVAL = 20
 MAX_SCAN_MINUTES = 300
 
 API_ATTEMPTS = 3
 API_TIMEOUT = 20
 
 STATE_FILE = "state.json"
-RECENT_SYMBOL_LIMIT = 2
+RECENT_SYMBOL_LIMIT = 1
 
 # Kenbe menm paramèt timestamp ansyen vèsyon an.
 # Verifye offset sa a ak done OTCharts reyèl.
@@ -228,7 +229,6 @@ def get_symbols():
 
         normalized = original_symbol.upper()
 
-        # Bloke tout pè ki pa nan 13 pè yo.
         if not is_allowed_pair(normalized):
             continue
 
@@ -728,7 +728,7 @@ def candle_quality(candle, direction):
 
 
 # =====================================================
-# ANALYZE CANDLES - STRATEGY 12.1
+# ANALYZE CANDLES - STRATEGY 12.2
 # =====================================================
 
 def analyze_candles(candles):
@@ -741,7 +741,6 @@ def analyze_candles(candles):
 
     ema9 = ema(closes, 9)
     ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
 
     old_ema9 = ema_previous(closes, 9)
     old_ema21 = ema_previous(closes, 21)
@@ -762,7 +761,7 @@ def analyze_candles(candles):
     )
 
     values = (
-        ema9, ema21, ema50,
+        ema9, ema21,
         old_ema9, old_ema21,
         rsi, k, d, old_k,
         adx, plus_di, minus_di
@@ -774,17 +773,15 @@ def analyze_candles(candles):
     last = candles[-1]
     close = last["close"]
 
-    # Aliyiman tandans obligatwa
+    # Tandans rapid EMA9 / EMA21
     call_trend = (
         ema9 > ema21
-        and ema21 > ema50
-        and close > ema21
+        and close > ema9
     )
 
     put_trend = (
         ema9 < ema21
-        and ema21 < ema50
-        and close < ema21
+        and close < ema9
     )
 
     if not call_trend and not put_trend:
@@ -798,20 +795,20 @@ def analyze_candles(candles):
             return None
 
         if not (
-            20 <= k <= 72
+            18 <= k <= 76
         ) or not (
-            42 <= rsi <= 70
+            40 <= rsi <= 72
         ):
             return None
 
         stoch_ok = (
             k > d
             and k > old_k
-            and 20 <= k <= 72
+            and 18 <= k <= 76
         )
 
         rsi_ok = (
-            42 <= rsi <= 70
+            40 <= rsi <= 72
         )
 
         adx_ok = (
@@ -902,7 +899,6 @@ def analyze_candles(candles):
         "minus_di": minus_di,
         "ema9": ema9,
         "ema21": ema21,
-        "ema50": ema50,
         "close": close,
         "candle_time": last["time"]
     }
@@ -1279,10 +1275,12 @@ def main():
     )
 
     logging.info(
-        "Settings | ADX=%s | DI GAP=%s | SCORE=%s/6",
+        "Settings | PAYOUT=%s | ADX=%s | DI GAP=%s | SCORE=%s/6 | SCAN=%ss",
+        MIN_PAYOUT,
         ADX_MIN,
         MIN_DI_GAP,
-        MIN_SCORE
+        MIN_SCORE,
+        SCAN_INTERVAL
     )
 
     start_time = time.time()
