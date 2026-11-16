@@ -2,6 +2,7 @@
 import os
 import json
 import time
+import math
 import logging
 import requests
 
@@ -9,12 +10,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # =========================================================
-# ROMARIO TRADER PRO 11.8
+# ROMARIO TRADER PRO 11.9
+# Bollinger Bands + RSI Reversal
 # Pocket Option OTC | M1 | 60s expiration
 # OTCharts Lite | Telegram alerts only
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO 11.8"
+VERSION = "ROMARIO TRADER PRO 11.9"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -27,20 +29,21 @@ MIN_PAYOUT = 92.0
 MAX_LIVE_SYMBOLS = 5
 MAX_HISTORY_REQUESTS_PER_RUN = 100
 
-ADX_PERIOD = 14
-ADX_MIN = 25
-MIN_DI_GAP = 6
+# Bollinger Bands
+BB_PERIOD = 20
+BB_STD = 1.9
 
+# RSI
 RSI_PERIOD = 7
-STOCH_PERIOD = 14
-MIN_SCORE = 4
+CALL_RSI_MAX = 40
+PUT_RSI_MIN = 60
 
+# Timing
 ENTRY_LEAD_SECONDS = 10
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
 
 API_TIMEOUT = 30
-STATE_FILE = "state.json"
 
 TIMEZONE = ZoneInfo("America/New_York")
 
@@ -57,7 +60,7 @@ session = requests.Session()
 
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTraderPro/11.8",
+    "User-Agent": "RomarioTraderPro/11.9",
     "Accept": "application/json"
 })
 
@@ -75,13 +78,12 @@ def log(message):
 
 
 # =========================================================
-# API REQUEST WITH AUTOMATIC RETRIES
+# OTCHARTS API WITH AUTOMATIC RETRIES
 # =========================================================
 
 def api_get(path, params=None, stream=False):
 
     url = BASE_URL + path
-
     attempts = 5 if not stream else 1
 
     for attempt in range(1, attempts + 1):
@@ -93,7 +95,10 @@ def api_get(path, params=None, stream=False):
             response = session.get(
                 url,
                 params=params,
-                timeout=(15, None if stream else API_TIMEOUT),
+                timeout=(
+                    15,
+                    None if stream else API_TIMEOUT
+                ),
                 stream=stream
             )
 
@@ -109,7 +114,9 @@ def api_get(path, params=None, stream=False):
                     f"{response.text[:300]}"
                 )
 
-            if response.status_code in (500, 502, 503, 504):
+            if response.status_code in (
+                500, 502, 503, 504
+            ):
 
                 if attempt < attempts:
 
@@ -119,10 +126,10 @@ def api_get(path, params=None, stream=False):
                     )
 
                     log(
-                        f"OTCharts temporary server error "
+                        f"OTCharts server error "
                         f"{response.status_code}. "
                         f"Retry {attempt}/{attempts} "
-                        f"in {wait} seconds..."
+                        f"in {wait}s."
                     )
 
                     response.close()
@@ -157,7 +164,7 @@ def api_get(path, params=None, stream=False):
             log(
                 f"Connection problem. "
                 f"Retry {attempt}/{attempts} "
-                f"in {wait} seconds..."
+                f"in {wait}s: {exc}"
             )
 
             if response is not None:
@@ -195,7 +202,6 @@ def send_telegram(message):
         )
 
         response.raise_for_status()
-
         return True
 
     except Exception as exc:
@@ -205,7 +211,7 @@ def send_telegram(message):
 
 
 # =========================================================
-# ACCOUNT AND PLAN CHECK
+# CHECK OTCHARTS PLAN AND OTC ACCESS
 # =========================================================
 
 def check_account():
@@ -213,16 +219,26 @@ def check_account():
     usage = api_get("/v1/usage")
 
     plan = str(
-        usage.get("planName", usage.get("plan", "Unknown"))
+        usage.get(
+            "planName",
+            usage.get("plan", "Unknown")
+        )
     )
 
     requests_data = usage.get("requests", {})
     streams_data = usage.get("streams", {})
 
-    remaining = int(requests_data.get("remaining", 0))
-    quota = int(requests_data.get("quota", 0))
+    remaining = int(
+        requests_data.get("remaining", 0)
+    )
 
-    stream_limit = int(streams_data.get("limit", 0))
+    quota = int(
+        requests_data.get("quota", 0)
+    )
+
+    stream_limit = int(
+        streams_data.get("limit", 0)
+    )
 
     instruments_limit = int(
         streams_data.get("instrumentsPerStream") or 0
@@ -235,12 +251,18 @@ def check_account():
         f"instruments per stream={instruments_limit}"
     )
 
-    if stream_limit < 1 or instruments_limit < 1:
+    if stream_limit < 1:
         raise RuntimeError(
-            "Kont OTCharts sa a pa gen live stream disponib."
+            "No live stream available on this plan."
         )
 
-    venues = api_get("/v1/venues").get("venues", [])
+    if instruments_limit < 1:
+        raise RuntimeError(
+            "No live instruments available on this plan."
+        )
+
+    venues_data = api_get("/v1/venues")
+    venues = venues_data.get("venues", [])
 
     otc = next(
         (
@@ -252,19 +274,19 @@ def check_account():
 
     if not otc or otc.get("open") is not True:
         raise RuntimeError(
-            "OTCharts pa konfime aksè OTC pou plan sa a."
+            "OTCharts does not confirm OTC access."
         )
 
     timeframes = otc.get("timeframes", [])
 
     if TIMEFRAME not in timeframes:
         raise RuntimeError(
-            "M1 timeframe pa disponib pou liv OTC sa a."
+            "M1 timeframe is not available for OTC."
         )
 
     if remaining < 20:
         raise RuntimeError(
-            "Pa gen ase demann API ki rete."
+            "Not enough API requests remaining."
         )
 
     return {
@@ -313,7 +335,7 @@ def is_forex_pair(symbol):
 
 
 # =========================================================
-# GET ALL ELIGIBLE OTC PAIRS
+# GET ALL QUALIFIED FOREX OTC PAIRS
 # =========================================================
 
 def get_eligible_symbols():
@@ -324,7 +346,6 @@ def get_eligible_symbols():
     )
 
     symbols = data.get("symbols", [])
-
     eligible = []
 
     for item in symbols:
@@ -363,7 +384,7 @@ def get_eligible_symbols():
     )
 
     log(
-        f"Forex OTC eligible pairs: {len(eligible)} "
+        f"Eligible Forex OTC pairs: {len(eligible)} "
         f"| Minimum payout: {MIN_PAYOUT}%"
     )
 
@@ -371,7 +392,7 @@ def get_eligible_symbols():
 
 
 # =========================================================
-# HISTORICAL CANDLES
+# GET HISTORICAL CANDLES
 # =========================================================
 
 def get_candles(symbol):
@@ -392,8 +413,8 @@ def get_candles(symbol):
     if gaps.get("missingBars", 0) > 0:
 
         log(
-            f"{symbol}: rejected, "
-            f"missing bars={gaps.get('missingBars')}"
+            f"{symbol}: missing candle bars: "
+            f"{gaps.get('missingBars')}"
         )
 
         return []
@@ -415,7 +436,20 @@ def get_candles(symbol):
         except (KeyError, TypeError, ValueError):
             continue
 
-    parsed.sort(key=lambda item: item["time"])
+    parsed.sort(
+        key=lambda item: item["time"]
+    )
+
+    # Remove duplicate candle timestamps.
+    unique = {}
+
+    for candle in parsed:
+        unique[candle["time"]] = candle
+
+    parsed = [
+        unique[key]
+        for key in sorted(unique)
+    ]
 
     if len(parsed) < MIN_CANDLES:
 
@@ -426,6 +460,7 @@ def get_candles(symbol):
 
         return []
 
+    # Reject histories with missing M1 bars.
     for index in range(1, len(parsed)):
 
         difference = (
@@ -445,55 +480,63 @@ def get_candles(symbol):
 
 
 # =========================================================
-# EMA
+# BOLLINGER BANDS
 # =========================================================
 
-def ema(values, period):
+def bollinger_bands(
+    closes,
+    period=20,
+    std_dev=1.9
+):
 
-    if len(values) < period:
-        return []
+    if len(closes) < period:
+        return None, None, None
 
-    multiplier = 2.0 / (period + 1)
+    window = closes[-period:]
 
-    result = [
-        sum(values[:period]) / period
-    ]
+    sma = sum(window) / period
 
-    for value in values[period:]:
+    variance = sum(
+        (value - sma) ** 2
+        for value in window
+    ) / period
 
-        result.append(
-            (value - result[-1]) * multiplier
-            + result[-1]
-        )
+    sd = math.sqrt(variance)
 
-    return [None] * (period - 1) + result
+    upper = sma + (std_dev * sd)
+    lower = sma - (std_dev * sd)
+
+    return upper, sma, lower
 
 
 # =========================================================
 # RSI
 # =========================================================
 
-def rsi(values, period=7):
+def calculate_rsi(closes, period=7):
 
-    if len(values) <= period:
-        return []
+    if len(closes) <= period:
+        return None
 
-    gains = []
-    losses = []
+    changes = [
+        closes[index] - closes[index - 1]
+        for index in range(1, len(closes))
+    ]
 
-    for index in range(1, len(values)):
+    gains = [
+        max(change, 0)
+        for change in changes
+    ]
 
-        change = values[index] - values[index - 1]
-
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
+    losses = [
+        max(-change, 0)
+        for change in changes
+    ]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    result = [None] * period
-
-    for index in range(period, len(gains)):
+    for index in range(period, len(changes)):
 
         avg_gain = (
             avg_gain * (period - 1)
@@ -505,223 +548,16 @@ def rsi(values, period=7):
             + losses[index]
         ) / period
 
-        if avg_loss == 0:
-            value = 100.0
-        else:
-            rs = avg_gain / avg_loss
-            value = 100 - (100 / (1 + rs))
+    if avg_loss == 0:
+        return 100.0
 
-        result.append(value)
+    rs = avg_gain / avg_loss
 
-    return result
+    return 100 - (100 / (1 + rs))
 
 
 # =========================================================
-# STOCHASTIC
-# =========================================================
-
-def stochastic(candles, period=14):
-
-    raw_k = []
-
-    for index in range(len(candles)):
-
-        if index < period - 1:
-            raw_k.append(None)
-            continue
-
-        window = candles[
-            index - period + 1:index + 1
-        ]
-
-        highest = max(
-            item["high"] for item in window
-        )
-
-        lowest = min(
-            item["low"] for item in window
-        )
-
-        close = candles[index]["close"]
-
-        if highest == lowest:
-            raw_k.append(50.0)
-        else:
-            raw_k.append(
-                100 * (close - lowest)
-                / (highest - lowest)
-            )
-
-    smooth_k = []
-
-    for index in range(len(raw_k)):
-
-        window = raw_k[
-            max(0, index - 2):index + 1
-        ]
-
-        valid = [
-            value for value in window
-            if value is not None
-        ]
-
-        smooth_k.append(
-            sum(valid) / len(valid)
-            if len(valid) == 3
-            else None
-        )
-
-    smooth_d = []
-
-    for index in range(len(smooth_k)):
-
-        window = smooth_k[
-            max(0, index - 2):index + 1
-        ]
-
-        valid = [
-            value for value in window
-            if value is not None
-        ]
-
-        smooth_d.append(
-            sum(valid) / len(valid)
-            if len(valid) == 3
-            else None
-        )
-
-    return smooth_k, smooth_d
-
-
-# =========================================================
-# ADX AND DIRECTIONAL INDICATORS
-# =========================================================
-
-def adx_values(candles, period=14):
-
-    plus_dm = [0.0]
-    minus_dm = [0.0]
-
-    true_range = [
-        candles[0]["high"] - candles[0]["low"]
-    ]
-
-    for index in range(1, len(candles)):
-
-        current = candles[index]
-        previous = candles[index - 1]
-
-        up_move = (
-            current["high"] - previous["high"]
-        )
-
-        down_move = (
-            previous["low"] - current["low"]
-        )
-
-        plus_dm.append(
-            up_move
-            if up_move > down_move and up_move > 0
-            else 0.0
-        )
-
-        minus_dm.append(
-            down_move
-            if down_move > up_move and down_move > 0
-            else 0.0
-        )
-
-        tr = max(
-            current["high"] - current["low"],
-            abs(
-                current["high"] - previous["close"]
-            ),
-            abs(
-                current["low"] - previous["close"]
-            )
-        )
-
-        true_range.append(tr)
-
-    dx_values = []
-    plus_di_values = []
-    minus_di_values = []
-
-    for index in range(len(candles)):
-
-        if index < period:
-
-            dx_values.append(None)
-            plus_di_values.append(None)
-            minus_di_values.append(None)
-
-            continue
-
-        start = index - period + 1
-
-        tr_sum = sum(
-            true_range[start:index + 1]
-        )
-
-        plus_sum = sum(
-            plus_dm[start:index + 1]
-        )
-
-        minus_sum = sum(
-            minus_dm[start:index + 1]
-        )
-
-        if tr_sum == 0:
-
-            plus_di = 0.0
-            minus_di = 0.0
-
-        else:
-
-            plus_di = 100 * plus_sum / tr_sum
-            minus_di = 100 * minus_sum / tr_sum
-
-        denominator = plus_di + minus_di
-
-        dx = (
-            100 * abs(plus_di - minus_di)
-            / denominator
-            if denominator
-            else 0.0
-        )
-
-        plus_di_values.append(plus_di)
-        minus_di_values.append(minus_di)
-        dx_values.append(dx)
-
-    adx = []
-
-    for index in range(len(dx_values)):
-
-        if index < period * 2:
-
-            adx.append(None)
-            continue
-
-        window = [
-            value
-            for value in dx_values[
-                index - period + 1:index + 1
-            ]
-            if value is not None
-        ]
-
-        adx.append(
-            sum(window) / len(window)
-            if len(window) == period
-            else None
-        )
-
-    return adx, plus_di_values, minus_di_values
-
-
-# =========================================================
-# SIGNAL STRATEGY
+# BOLLINGER + RSI REVERSAL STRATEGY
 # =========================================================
 
 def analyze_signal(candles):
@@ -729,164 +565,135 @@ def analyze_signal(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
+    # IMPORTANT:
+    # This function receives CLOSED candles only.
+
     closes = [
-        item["close"] for item in candles
+        candle["close"]
+        for candle in candles
     ]
 
-    ema9 = ema(closes, 9)
-    ema21 = ema(closes, 21)
-    ema50 = ema(closes, 50)
+    if len(closes) < BB_PERIOD + 1:
+        return None
 
-    rsi_data = rsi(closes, RSI_PERIOD)
-
-    k_values, d_values = stochastic(
-        candles,
-        STOCH_PERIOD
+    upper, mid, lower = bollinger_bands(
+        closes,
+        BB_PERIOD,
+        BB_STD
     )
 
-    adx_data, plus_di, minus_di = adx_values(
-        candles,
-        ADX_PERIOD
+    rsi_value = calculate_rsi(
+        closes,
+        RSI_PERIOD
     )
 
-    try:
-
-        k = k_values[-1]
-        d = d_values[-1]
-        old_k = k_values[-2]
-
-        current_rsi = rsi_data[-1]
-
-        current_adx = adx_data[-1]
-        current_plus = plus_di[-1]
-        current_minus = minus_di[-1]
-
-        fast = ema9[-1]
-        medium = ema21[-1]
-        slow = ema50[-1]
-
-    except (IndexError, TypeError):
+    if (
+        upper is None
+        or mid is None
+        or lower is None
+        or rsi_value is None
+    ):
         return None
 
-    values = [
-        k, d, old_k, current_rsi,
-        current_adx, current_plus,
-        current_minus, fast, medium, slow
-    ]
-
-    if any(value is None for value in values):
-        return None
-
-    if current_adx < ADX_MIN:
-        return None
-
-    di_gap = abs(
-        current_plus - current_minus
-    )
-
-    if di_gap < MIN_DI_GAP:
-        return None
-
+    prev = candles[-2]
     last = candles[-1]
 
-    candle_range = (
-        last["high"] - last["low"]
+    # Bands calculated before the latest candle.
+    prev_upper, prev_mid, prev_lower = (
+        bollinger_bands(
+            closes[:-1],
+            BB_PERIOD,
+            BB_STD
+        )
     )
 
-    if candle_range <= 0:
+    if prev_lower is None:
         return None
 
-    body_ratio = (
-        abs(last["close"] - last["open"])
-        / candle_range
+    prev_close = prev["close"]
+
+    last_open = last["open"]
+    last_close = last["close"]
+    last_high = last["high"]
+    last_low = last["low"]
+
+    # -----------------------------------------------------
+    # CALL: LOWER BAND REVERSAL
+    # -----------------------------------------------------
+
+    touched_lower = (
+        prev_close <= prev_lower
+        or last_low <= lower
     )
 
-    bullish = (
-        k > d
-        and k > old_k
-        and 25 <= k <= 75
+    bullish_candle = (
+        last_close > last_open
     )
 
-    bearish = (
-        k < d
-        and k < old_k
-        and 30 <= k <= 75
+    if (
+        touched_lower
+        and bullish_candle
+        and rsi_value <= CALL_RSI_MAX
+        and last_close < mid
+    ):
+
+        return {
+            "direction": "CALL",
+            "score": 6,
+            "rsi": round(rsi_value, 2),
+            "k": 0.0,
+            "d": 0.0,
+            "adx": 0.0,
+            "plus_di": 0.0,
+            "minus_di": 0.0,
+            "ema9": mid,
+            "ema21": lower,
+            "ema50": upper,
+            "close": last_close,
+            "candle_time": last["time"]
+        }
+
+    # -----------------------------------------------------
+    # PUT: UPPER BAND REVERSAL
+    # -----------------------------------------------------
+
+    touched_upper = (
+        prev_close >= prev_upper
+        or last_high >= upper
     )
 
-    # STOCHASTIC IS MANDATORY.
-    # RSI CANNOT OVERRIDE STOCHASTIC.
+    bearish_candle = (
+        last_close < last_open
+    )
 
-    if bullish:
+    if (
+        touched_upper
+        and bearish_candle
+        and rsi_value >= PUT_RSI_MIN
+        and last_close > mid
+    ):
 
-        direction = "CALL"
+        return {
+            "direction": "PUT",
+            "score": 6,
+            "rsi": round(rsi_value, 2),
+            "k": 0.0,
+            "d": 0.0,
+            "adx": 0.0,
+            "plus_di": 0.0,
+            "minus_di": 0.0,
+            "ema9": mid,
+            "ema21": upper,
+            "ema50": lower,
+            "close": last_close,
+            "candle_time": last["time"]
+        }
 
-        if current_plus <= current_minus:
-            return None
-
-        if fast <= medium:
-            return None
-
-    elif bearish:
-
-        direction = "PUT"
-
-        if current_minus <= current_plus:
-            return None
-
-        if fast >= medium:
-            return None
-
-    else:
-        return None
-
-    score = 1
-
-    if direction == "CALL":
-
-        if fast > medium > slow:
-            score += 1
-
-        if current_plus > current_minus:
-            score += 1
-
-        if current_rsi > 50:
-            score += 1
-
-        if last["close"] > last["open"]:
-            score += 1
-
-    else:
-
-        if fast < medium < slow:
-            score += 1
-
-        if current_minus > current_plus:
-            score += 1
-
-        if current_rsi < 50:
-            score += 1
-
-        if last["close"] < last["open"]:
-            score += 1
-
-    if body_ratio >= 0.50:
-        score += 1
-
-    if score < MIN_SCORE:
-        return None
-
-    return {
-        "direction": direction,
-        "score": score,
-        "k": round(k, 2),
-        "d": round(d, 2),
-        "rsi": round(current_rsi, 2),
-        "adx": round(current_adx, 2)
-    }
+    return None
 
 
 # =========================================================
-# SEND SIGNAL
+# SEND SIGNAL TO TELEGRAM
 # =========================================================
 
 def send_signal(symbol, payout, signal):
@@ -924,7 +731,8 @@ def send_signal(symbol, payout, signal):
 def run_live_stream(monitored, histories):
 
     symbols = [
-        item["symbol"] for item in monitored
+        item["symbol"]
+        for item in monitored
     ]
 
     params = {
@@ -946,8 +754,8 @@ def run_live_stream(monitored, histories):
     current_bars = {}
     signal_minute = {}
 
-    pending = None
     connected_symbols = set()
+    pending = None
 
     started_at = time.time()
     event_name = ""
@@ -992,6 +800,10 @@ def run_live_stream(monitored, histories):
             except json.JSONDecodeError:
                 continue
 
+            # ---------------------------------------------
+            # STREAM CONNECTED
+            # ---------------------------------------------
+
             if event_name == "connected":
 
                 connected_symbols = set(
@@ -1015,6 +827,10 @@ def run_live_stream(monitored, histories):
                     return
 
                 continue
+
+            # ---------------------------------------------
+            # STREAM EVENTS
+            # ---------------------------------------------
 
             if event_name == "closed":
 
@@ -1050,16 +866,24 @@ def run_live_stream(monitored, histories):
 
             receive_time = time.time()
 
+            # M1 candle bucket.
             bucket = (
                 feed_time // 60
             ) * 60
 
+            # ---------------------------------------------
             # INITIAL LIVE CANDLE
+            # ---------------------------------------------
 
             if symbol not in current_bars:
 
-                history = histories.get(symbol, [])
+                history = histories.get(
+                    symbol,
+                    []
+                )
 
+                # Do not reuse the currently forming candle
+                # from historical data.
                 history = [
                     candle
                     for candle in history
@@ -1078,7 +902,9 @@ def run_live_stream(monitored, histories):
 
             current = current_bars[symbol]
 
-            # NEW MINUTE
+            # ---------------------------------------------
+            # NEW M1 CANDLE
+            # ---------------------------------------------
 
             if bucket > current["time"]:
 
@@ -1086,7 +912,7 @@ def run_live_stream(monitored, histories):
                     bucket - current["time"]
                 )
 
-                if gap != 60:
+                if gap != TIMEFRAME:
 
                     log(
                         f"{symbol}: live feed gap detected. "
@@ -1096,12 +922,14 @@ def run_live_stream(monitored, histories):
                     connected_symbols.discard(symbol)
                     continue
 
+                # Previous live candle is now closed.
                 histories[symbol].append(current)
 
                 histories[symbol] = (
                     histories[symbol][-CANDLE_LIMIT:]
                 )
 
+                # Start new forming candle.
                 current_bars[symbol] = {
                     "time": bucket,
                     "open": price,
@@ -1127,7 +955,9 @@ def run_live_stream(monitored, histories):
             else:
                 continue
 
+            # ---------------------------------------------
             # RESULT ESTIMATE
+            # ---------------------------------------------
 
             if (
                 pending
@@ -1193,13 +1023,17 @@ def run_live_stream(monitored, histories):
 
                     return
 
+            # ---------------------------------------------
             # SIGNAL CHECK
+            # ---------------------------------------------
 
             if pending is not None:
                 continue
 
             now = local_now()
 
+            # Send signal around 10 seconds before
+            # the next local minute.
             if now.second < 50:
                 continue
 
@@ -1215,16 +1049,19 @@ def run_live_stream(monitored, histories):
 
             signal_minute[symbol] = minute_key
 
-            candles_for_analysis = (
-                histories[symbol]
-                + [current_bars[symbol]]
+            # IMPORTANT:
+            # Analyze CLOSED candles only.
+            # Do not include current_bars[symbol].
+            closed_candles = histories.get(
+                symbol,
+                []
             )
 
-            if len(candles_for_analysis) < MIN_CANDLES:
+            if len(closed_candles) < MIN_CANDLES:
                 continue
 
             signal = analyze_signal(
-                candles_for_analysis
+                closed_candles
             )
 
             if not signal:
@@ -1232,7 +1069,8 @@ def run_live_stream(monitored, histories):
 
             pair_info = next(
                 (
-                    item for item in monitored
+                    item
+                    for item in monitored
                     if item["symbol"] == symbol
                 ),
                 None
@@ -1243,7 +1081,9 @@ def run_live_stream(monitored, histories):
 
             log(
                 f"SIGNAL {signal['direction']} "
-                f"{symbol} | score={signal['score']}"
+                f"{symbol} | "
+                f"RSI={signal['rsi']} | "
+                f"score={signal['score']}"
             )
 
             delivered = send_signal(
@@ -1260,6 +1100,7 @@ def run_live_stream(monitored, histories):
 
                 return
 
+            # Next minute is the planned entry.
             entry_time = (
                 int(receive_time // 60) * 60 + 60
             )
@@ -1273,8 +1114,8 @@ def run_live_stream(monitored, histories):
             }
 
             log(
-                "Signal sent. Waiting for entry "
-                "and 60-second result estimate."
+                f"Signal sent for {symbol}. "
+                f"Waiting for entry and expiry estimate."
             )
 
     finally:
@@ -1300,8 +1141,10 @@ def main():
             "Telegram secrets are missing."
         )
 
+    # 1. Check plan and API limits.
     account = check_account()
 
+    # 2. Find every eligible Forex OTC pair.
     eligible = get_eligible_symbols()
 
     if not eligible:
@@ -1333,8 +1176,7 @@ def main():
             "to analyze all eligible pairs."
         )
 
-    # ANALYZE ALL ELIGIBLE PAIRS
-
+    # 3. Download history once for each eligible pair.
     histories = {}
     ranked = []
 
@@ -1382,8 +1224,7 @@ def main():
 
         return
 
-    # LITE PLAN: MAXIMUM FIVE LIVE PAIRS
-
+    # 4. Lite supports up to five live instruments.
     live_limit = min(
         MAX_LIVE_SYMBOLS,
         account["instruments_limit"]
@@ -1399,12 +1240,12 @@ def main():
     log(
         "Live watchlist: "
         + ", ".join(
-            item["symbol"] for item in monitored
+            item["symbol"]
+            for item in monitored
         )
     )
 
-    # ONE LIVE STREAM
-
+    # 5. Open one live stream.
     reconnects = 0
 
     while reconnects <= MAX_RECONNECTS:
@@ -1444,6 +1285,9 @@ def main():
     log(f"{VERSION} finished.")
 
 
-if __name__ == "__main__":
+# =========================================================
+# START BOT
+# =========================================================
 
+if __name__ == "__main__":
     main()
