@@ -4,19 +4,21 @@ import json
 import time
 import math
 import logging
+import threading
 import requests
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 
 # =========================================================
-# ROMARIO TRADER PRO 14.1
+# ROMARIO TRADER PRO 14.3
 # S30 | Expiration 60s | Manual Telegram Alerts
-# One signal per GitHub Actions run
+# Parallel history downloads | One signal per run
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO 14.1"
+VERSION = "ROMARIO TRADER PRO 14.3"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -28,6 +30,7 @@ MIN_CANDLES = 100
 MIN_PAYOUT = 92.0
 MAX_LIVE_SYMBOLS = 5
 MAX_HISTORY_REQUESTS_PER_RUN = 100
+MAX_HISTORY_WORKERS = 5
 
 BB_PERIOD = 20
 BB_STD = 2.2
@@ -46,7 +49,8 @@ EXPIRATION_SECONDS = 60
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
 
-API_TIMEOUT = 30
+API_CONNECT_TIMEOUT = 5
+API_READ_TIMEOUT = 12
 
 TELEGRAM_ATTEMPTS = 5
 TELEGRAM_TIMEOUT = (2, 3)
@@ -64,13 +68,25 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
-session = requests.Session()
 
-session.headers.update({
-    "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTraderPro/14.1",
-    "Accept": "application/json"
-})
+# Each worker gets its own Session.
+# This avoids sharing one requests.Session across threads.
+_thread_local = threading.local()
+
+
+def get_session():
+
+    if not hasattr(_thread_local, "session"):
+
+        _thread_local.session = requests.Session()
+
+        _thread_local.session.headers.update({
+            "Authorization": f"Bearer {API_KEY}",
+            "User-Agent": "RomarioTraderPro/14.3",
+            "Accept": "application/json"
+        })
+
+    return _thread_local.session
 
 
 # =========================================================
@@ -99,7 +115,10 @@ def make_entry_time(signal_time):
 def api_get(path, params=None, stream=False):
 
     url = BASE_URL + path
-    attempts = 1 if stream else 5
+
+    # Short bounded retries for normal requests.
+    # A stream is opened only once per attempt.
+    attempts = 1 if stream else 2
 
     for attempt in range(1, attempts + 1):
 
@@ -107,12 +126,12 @@ def api_get(path, params=None, stream=False):
 
         try:
 
-            response = session.get(
+            response = get_session().get(
                 url,
                 params=params,
                 timeout=(
-                    15,
-                    None if stream else API_TIMEOUT
+                    API_CONNECT_TIMEOUT,
+                    None if stream else API_READ_TIMEOUT
                 ),
                 stream=stream
             )
@@ -133,18 +152,14 @@ def api_get(path, params=None, stream=False):
 
                 if attempt < attempts:
 
-                    wait = min(
-                        3 * (2 ** (attempt - 1)),
-                        30
-                    )
-
                     log(
-                        f"Server error {response.status_code}. "
-                        f"Retry in {wait}s."
+                        f"OTCharts server error "
+                        f"{response.status_code}. "
+                        "Retrying once."
                     )
 
                     response.close()
-                    time.sleep(wait)
+                    time.sleep(0.5)
                     continue
 
             response.raise_for_status()
@@ -159,22 +174,16 @@ def api_get(path, params=None, stream=False):
             requests.exceptions.ConnectionError
         ) as exc:
 
+            if response is not None:
+                response.close()
+
             if attempt >= attempts:
                 raise RuntimeError(
                     f"OTCharts connection failed: {exc}"
                 )
 
-            wait = min(
-                3 * (2 ** (attempt - 1)),
-                30
-            )
-
             log(f"API retry {attempt}: {exc}")
-
-            if response is not None:
-                response.close()
-
-            time.sleep(wait)
+            time.sleep(0.5)
 
     raise RuntimeError("OTCharts request failed.")
 
@@ -775,6 +784,7 @@ def strategy_engulfing(prev, last, rsi):
     bearish = (
         prev["close"] > prev["open"]
         and last["close"] < last["open"]
+        and last["close"] < last["open"]
         and last["close"] < prev["open"]
         and last["open"] >= prev["close"]
         and 38 <= rsi <= 58
@@ -1018,58 +1028,6 @@ def send_signal(
 
 
 # =========================================================
-# OTCHARTS RESULT ESTIMATE
-# =========================================================
-
-def send_result(symbol, pending, exit_price):
-
-    entry_price = pending["entry_price"]
-
-    tolerance = max(
-        abs(entry_price) * 1e-10,
-        1e-12
-    )
-
-    difference = exit_price - entry_price
-
-    if abs(difference) <= tolerance:
-
-        result = "TIE"
-
-    elif pending["direction"] == "CALL":
-
-        result = (
-            "WIN" if difference > 0
-            else "LOSS"
-        )
-
-    else:
-
-        result = (
-            "WIN" if difference < 0
-            else "LOSS"
-        )
-
-    message = (
-        f"🤖 {VERSION}\n\n"
-        f"📊 OTCHARTS RESULT ESTIMATE\n"
-        f"💱 PAIR: {symbol}\n"
-        f"📍 SIGNAL: {pending['direction']}\n"
-        f"📈 ESTIMATE: {result}\n\n"
-        f"Entry: {entry_price}\n"
-        f"Exit: {exit_price}\n\n"
-        f"⚠️ This is only an OTCharts price estimate. "
-        f"It is NOT a verified Pocket Option result."
-    )
-
-    send_telegram(message)
-
-    log(
-        f"{symbol}: estimated result={result}"
-    )
-
-
-# =========================================================
 # LIVE STREAM
 # =========================================================
 
@@ -1101,7 +1059,7 @@ def run_live_stream(monitored, histories):
 
     connected_symbols = set()
 
-    # Only one signal is allowed in this entire run.
+    # One signal maximum in this entire run.
     signal_sent = False
     pending_signal = None
 
@@ -1314,7 +1272,7 @@ def run_live_stream(monitored, histories):
 
             # ---------------------------------------------
             # PENDING SIGNAL MANAGEMENT
-            # IMPORTANT: ONLY USE THE PENDING PAIR'S TICKS.
+            # Only use the pending pair's ticks.
             # ---------------------------------------------
 
             if pending_signal is not None:
@@ -1355,27 +1313,26 @@ def run_live_stream(monitored, histories):
                                 f"reference entry price={price}"
                             )
 
-                    # Capture exit price after 60 seconds.
+                    # End after the 60-second expiration.
+                    # No OTCharts WIN/LOSS estimate is sent.
                     if (
                         pending["entry_price"] is not None
                         and receive_time >= pending["expiry_time"]
                     ):
 
-                        send_result(
-                            pending_symbol,
-                            pending,
-                            price
+                        log(
+                            f"{pending_symbol}: 60-second period "
+                            "completed. No OTCharts result message."
                         )
 
                         log(
                             "One signal completed. "
-                            "Ending this run to prevent another signal."
+                            "Ending this run."
                         )
 
                         return
 
-                # Do not analyze or create another signal
-                # while the one signal is active.
+                # Do not analyze another signal while active.
                 continue
 
             # ---------------------------------------------
@@ -1492,12 +1449,104 @@ def run_live_stream(monitored, histories):
 
             log(
                 f"{symbol}: ONE signal activated. "
-                f"No other signal will be sent in this run."
+                "No other signal will be sent in this run."
             )
 
     finally:
 
         response.close()
+
+
+# =========================================================
+# PARALLEL HISTORY DOWNLOAD
+# =========================================================
+
+def download_all_histories(eligible):
+
+    histories = {}
+    ranked = []
+
+    total = len(eligible)
+
+    log(
+        f"FAST HISTORY DOWNLOAD: {total} eligible pairs | "
+        f"{MAX_HISTORY_WORKERS} parallel workers."
+    )
+
+    def fetch_history(item):
+
+        symbol = item["symbol"]
+        candles = get_candles(symbol)
+
+        return item, candles
+
+    worker_count = min(
+        MAX_HISTORY_WORKERS,
+        total
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=max(1, worker_count)
+    ) as executor:
+
+        futures = {
+            executor.submit(fetch_history, item): item
+            for item in eligible
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+
+            completed += 1
+            item = futures[future]
+            symbol = item["symbol"]
+
+            try:
+
+                returned_item, candles = future.result()
+
+                if not candles:
+
+                    log(
+                        f"[{completed}/{total}] "
+                        f"{symbol}: insufficient S30 history."
+                    )
+
+                    continue
+
+                histories[symbol] = candles
+
+                ranked.append({
+                    **returned_item,
+                    "history_count": len(candles)
+                })
+
+                log(
+                    f"[{completed}/{total}] "
+                    f"History ready: {symbol} | "
+                    f"Payout={returned_item['payout']}% | "
+                    f"Candles={len(candles)}"
+                )
+
+            except Exception as exc:
+
+                log(
+                    f"[{completed}/{total}] "
+                    f"{symbol}: history error: {exc}"
+                )
+
+    # Keep payout ranking after all downloads complete.
+    ranked.sort(
+        key=lambda x: (-x["payout"], x["symbol"])
+    )
+
+    log(
+        f"Parallel history complete: "
+        f"{len(ranked)}/{total} pairs ready."
+    )
+
+    return histories, ranked
 
 
 # =========================================================
@@ -1511,7 +1560,8 @@ def main():
     log(
         "SETTINGS: S30 | EXPIRATION 60s | "
         "ENTRY NEXT 10-SECOND BOUNDARY | "
-        "ONE SIGNAL PER RUN | PAYOUT 92%"
+        "ONE SIGNAL PER RUN | PAYOUT 92%+ | "
+        "PARALLEL HISTORY"
     )
 
     if not API_KEY:
@@ -1549,47 +1599,10 @@ def main():
             "Not enough API requests to analyze pairs."
         )
 
-    # 3. Download historical candles.
-    histories = {}
-    ranked = []
-
-    log(
-        f"Downloading S30 history for "
-        f"{len(eligible)} eligible pairs."
+    # 3. Download historical candles in parallel.
+    histories, ranked = download_all_histories(
+        eligible
     )
-
-    for item in eligible:
-
-        symbol = item["symbol"]
-
-        try:
-
-            candles = get_candles(symbol)
-
-            if not candles:
-                log(
-                    f"{symbol}: insufficient S30 history."
-                )
-                continue
-
-            histories[symbol] = candles
-
-            ranked.append({
-                **item,
-                "history_count": len(candles)
-            })
-
-            log(
-                f"History ready: {symbol} | "
-                f"Payout={item['payout']}% | "
-                f"Candles={len(candles)}"
-            )
-
-        except Exception as exc:
-
-            log(
-                f"{symbol}: history error: {exc}"
-            )
 
     if not ranked:
 
@@ -1643,7 +1656,7 @@ def main():
             if reconnects > MAX_RECONNECTS:
                 break
 
-            time.sleep(5)
+            time.sleep(2)
 
         except Exception as exc:
 
