@@ -11,19 +11,19 @@ from zoneinfo import ZoneInfo
 
 
 # =========================================================
-# ROMARIO TRADER PRO 13.0
-# Bollinger Reversal
-# EMA 9/21/50 Pullback
-# Engulfing Momentum
-# Pocket Option OTC | M1 | 60s
-# OTCharts Lite | Telegram Alerts
+# ROMARIO TRADER PRO 14.0
+# S30 | Expiration 60s | Manual Telegram Alerts
+# Bollinger Reversal + EMA Pullback + Engulfing
+# OTCharts Lite
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO 13.0"
+VERSION = "ROMARIO TRADER PRO 14.0"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 60
+
+# S30 = 30 seconds
+TIMEFRAME = 30
 
 CANDLE_LIMIT = 300
 MIN_CANDLES = 100
@@ -33,7 +33,7 @@ MAX_LIVE_SYMBOLS = 5
 MAX_HISTORY_REQUESTS_PER_RUN = 100
 
 BB_PERIOD = 20
-BB_STD = 1.9
+BB_STD = 2.2
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -41,14 +41,17 @@ EMA_SLOW = 50
 
 RSI_PERIOD = 7
 
-MIN_SCORE = 4
+# At least 2 of the 3 strategies must agree.
+MIN_STRATEGY_AGREEMENT = 2
 
-MIN_WICK_BODY_RATIO = 1.2
-MIN_WICK_RANGE_RATIO = 0.30
-
-ENTRY_DELAY_SECONDS = 15
-ENTRY_GRACE_SECONDS = 5
+# Manual entry timing
+ENTRY_DELAY_SECONDS = 10
+ENTRY_GRACE_SECONDS = 3
 EXPIRATION_SECONDS = 60
+
+# Avoid signal flooding
+GLOBAL_COOLDOWN_SECONDS = 60
+PAIR_COOLDOWN_SECONDS = 180
 
 MAX_SCAN_MINUTES = 300
 MAX_RECONNECTS = 3
@@ -56,7 +59,7 @@ MAX_RECONNECTS = 3
 API_TIMEOUT = 30
 
 TELEGRAM_ATTEMPTS = 5
-TELEGRAM_TIMEOUT = (1.5, 1.5)
+TELEGRAM_TIMEOUT = (2, 3)
 TELEGRAM_RETRY_DELAYS = [0.3, 0.5, 0.8, 1.0]
 
 TIMEZONE = ZoneInfo("America/New_York")
@@ -75,7 +78,7 @@ session = requests.Session()
 
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
-    "User-Agent": "RomarioTraderPro/13.0",
+    "User-Agent": "RomarioTraderPro/14.0",
     "Accept": "application/json"
 })
 
@@ -103,7 +106,6 @@ def make_entry_time(signal_time):
 def api_get(path, params=None, stream=False):
 
     url = BASE_URL + path
-
     attempts = 1 if stream else 5
 
     for attempt in range(1, attempts + 1):
@@ -111,7 +113,6 @@ def api_get(path, params=None, stream=False):
         response = None
 
         try:
-
             response = session.get(
                 url,
                 params=params,
@@ -195,7 +196,7 @@ def send_telegram(message):
         return False
 
     url = (
-        f"https://api.telegram.org/"
+        "https://api.telegram.org/"
         f"bot{TELEGRAM_TOKEN}/sendMessage"
     )
 
@@ -204,7 +205,6 @@ def send_telegram(message):
         response = None
 
         try:
-
             response = requests.post(
                 url,
                 json={
@@ -220,12 +220,10 @@ def send_telegram(message):
                 result = {}
 
             if response.ok and result.get("ok") is True:
-
                 log(
                     f"Telegram delivered "
                     f"{attempt}/{TELEGRAM_ATTEMPTS}"
                 )
-
                 return True
 
             error_code = result.get("error_code")
@@ -236,44 +234,35 @@ def send_telegram(message):
             )
 
             if error_code in (400, 401, 403, 404):
-
                 log(
                     f"Telegram permanent error: "
                     f"{error_code}: {description}"
                 )
-
                 return False
 
-            log(
-                f"Telegram temporary error: "
-                f"{description}"
-            )
+            log(f"Telegram temporary error: {description}")
 
         except requests.exceptions.RequestException as exc:
-
             log(f"Telegram error: {exc}")
 
         finally:
-
             if response is not None:
                 response.close()
 
         if attempt < TELEGRAM_ATTEMPTS:
-
             wait = TELEGRAM_RETRY_DELAYS[
                 min(
                     attempt - 1,
                     len(TELEGRAM_RETRY_DELAYS) - 1
                 )
             ]
-
             time.sleep(wait)
 
     return False
 
 
 # =========================================================
-# ACCOUNT CHECK
+# ACCOUNT AND S30 CHECK
 # =========================================================
 
 def check_account():
@@ -290,17 +279,10 @@ def check_account():
     requests_data = usage.get("requests", {})
     streams_data = usage.get("streams", {})
 
-    remaining = int(
-        requests_data.get("remaining", 0)
-    )
+    remaining = int(requests_data.get("remaining", 0))
+    quota = int(requests_data.get("quota", 0))
 
-    quota = int(
-        requests_data.get("quota", 0)
-    )
-
-    stream_limit = int(
-        streams_data.get("limit", 0)
-    )
+    stream_limit = int(streams_data.get("limit", 0))
 
     instruments_limit = int(
         streams_data.get("instrumentsPerStream") or 0
@@ -320,7 +302,6 @@ def check_account():
         raise RuntimeError("No live instruments available.")
 
     venues_data = api_get("/v1/venues")
-
     venues = venues_data.get("venues", [])
 
     otc = next(
@@ -334,11 +315,33 @@ def check_account():
     if not otc or otc.get("open") is not True:
         raise RuntimeError("OTC access not confirmed.")
 
-    if TIMEFRAME not in otc.get("timeframes", []):
-        raise RuntimeError("M1 is not available.")
+    available_timeframes = otc.get("timeframes", [])
+
+    normalized_timeframes = set()
+
+    for value in available_timeframes:
+        try:
+            normalized_timeframes.add(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    log(
+        f"OTC timeframes available: "
+        f"{sorted(normalized_timeframes)}"
+    )
+
+    if TIMEFRAME not in normalized_timeframes:
+        raise RuntimeError(
+            "S30 NOT CONFIRMED by OTCharts. "
+            f"Available timeframes: "
+            f"{available_timeframes}. "
+            "Bot stopped to avoid using the wrong timeframe."
+        )
 
     if remaining < 20:
         raise RuntimeError("Insufficient API requests.")
+
+    log("S30 confirmed by OTCharts.")
 
     return {
         "remaining": remaining,
@@ -426,15 +429,10 @@ def get_eligible_symbols():
         })
 
     eligible.sort(
-        key=lambda x: (
-            -x["payout"],
-            x["symbol"]
-        )
+        key=lambda x: (-x["payout"], x["symbol"])
     )
 
-    log(
-        f"Eligible Forex OTC pairs: {len(eligible)}"
-    )
+    log(f"Eligible Forex OTC pairs: {len(eligible)}")
 
     return eligible
 
@@ -456,21 +454,16 @@ def get_candles(symbol):
     )
 
     candles = data.get("candles", [])
-
     gaps = data.get("gaps", {})
 
     if gaps.get("missingBars", 0) > 0:
-
         log(f"{symbol}: missing historical bars.")
-
         return []
 
     parsed = []
 
     for candle in candles:
-
         try:
-
             parsed.append({
                 "time": int(candle["time"]),
                 "open": float(candle["open"]),
@@ -478,7 +471,6 @@ def get_candles(symbol):
                 "low": float(candle["low"]),
                 "close": float(candle["close"])
             })
-
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -505,14 +497,13 @@ def get_candles(symbol):
         ) != TIMEFRAME:
 
             log(f"{symbol}: historical candle gap.")
-
             return []
 
     return parsed[-CANDLE_LIMIT:]
 
 
 # =========================================================
-# EMA
+# INDICATORS
 # =========================================================
 
 def ema(values, period):
@@ -525,7 +516,6 @@ def ema(values, period):
     result = sum(values[:period]) / period
 
     for value in values[period:]:
-
         result = (
             value * multiplier
             + result * (1 - multiplier)
@@ -534,21 +524,16 @@ def ema(values, period):
     return result
 
 
-# =========================================================
-# BOLLINGER BANDS
-# =========================================================
-
 def bollinger_bands(
     closes,
     period=20,
-    std_dev=1.9
+    std_dev=2.2
 ):
 
     if len(closes) < period:
         return None, None, None
 
     window = closes[-period:]
-
     sma = sum(window) / period
 
     variance = sum(
@@ -565,10 +550,6 @@ def bollinger_bands(
     )
 
 
-# =========================================================
-# RSI
-# =========================================================
-
 def calculate_rsi(closes, period=7):
 
     if len(closes) <= period:
@@ -579,21 +560,13 @@ def calculate_rsi(closes, period=7):
         for i in range(1, len(closes))
     ]
 
-    gains = [
-        max(x, 0)
-        for x in changes
-    ]
-
-    losses = [
-        max(-x, 0)
-        for x in changes
-    ]
+    gains = [max(x, 0) for x in changes]
+    losses = [max(-x, 0) for x in changes]
 
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(changes)):
-
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
@@ -603,20 +576,12 @@ def calculate_rsi(closes, period=7):
         ) / period
 
     if avg_loss == 0:
-
-        if avg_gain == 0:
-            return 50.0
-
-        return 100.0
+        return 50.0 if avg_gain == 0 else 100.0
 
     rs = avg_gain / avg_loss
 
     return 100 - (100 / (1 + rs))
 
-
-# =========================================================
-# ATR
-# =========================================================
 
 def calculate_atr(candles, period=14):
 
@@ -632,12 +597,8 @@ def calculate_atr(candles, period=14):
 
         tr = max(
             current["high"] - current["low"],
-            abs(
-                current["high"] - previous["close"]
-            ),
-            abs(
-                current["low"] - previous["close"]
-            )
+            abs(current["high"] - previous["close"]),
+            abs(current["low"] - previous["close"])
         )
 
         ranges.append(tr)
@@ -646,7 +607,7 @@ def calculate_atr(candles, period=14):
 
 
 # =========================================================
-# WICK REJECTION
+# CANDLE CONFIRMATION
 # =========================================================
 
 def wick_rejection(candle, direction):
@@ -666,8 +627,8 @@ def wick_rejection(candle, direction):
     upper_wick = h - max(o, c)
 
     minimum = max(
-        body * MIN_WICK_BODY_RATIO,
-        candle_range * MIN_WICK_RANGE_RATIO
+        body * 1.2,
+        candle_range * 0.30
     )
 
     if direction == "CALL":
@@ -702,17 +663,15 @@ def strategy_bollinger(
             or last["low"] <= lower
         )
         and last["close"] > last["open"]
-        and 24 <= rsi <= 40
+        and 25 <= rsi <= 38
         and last["close"] < middle
         and wick_rejection(last, "CALL")
     )
 
     if call:
-
         return {
             "direction": "CALL",
-            "strategy": "BOLLINGER REVERSAL",
-            "base_score": 4
+            "strategy": "BOLLINGER REVERSAL"
         }
 
     put = (
@@ -721,28 +680,25 @@ def strategy_bollinger(
             or last["high"] >= upper
         )
         and last["close"] < last["open"]
-        and 60 <= rsi <= 76
+        and 62 <= rsi <= 75
         and last["close"] > middle
         and wick_rejection(last, "PUT")
     )
 
     if put:
-
         return {
             "direction": "PUT",
-            "strategy": "BOLLINGER REVERSAL",
-            "base_score": 4
+            "strategy": "BOLLINGER REVERSAL"
         }
 
     return None
 
 
 # =========================================================
-# STRATEGY 2: EMA 9/21 PULLBACK
+# STRATEGY 2: EMA 9/21/50 PULLBACK
 # =========================================================
 
 def strategy_ema(
-    closes,
     prev,
     last,
     ema9,
@@ -753,7 +709,6 @@ def strategy_ema(
 ):
 
     # Bullish trend pullback
-
     if (
         ema9 > ema21 > ema50
         and prev["close"] < prev["open"]
@@ -762,15 +717,12 @@ def strategy_ema(
         and last["close"] > ema9
         and 45 <= rsi <= 65
     ):
-
         return {
             "direction": "CALL",
-            "strategy": "EMA 9/21 PULLBACK",
-            "base_score": 4
+            "strategy": "EMA 9/21/50 PULLBACK"
         }
 
     # Bearish trend pullback
-
     if (
         ema9 < ema21 < ema50
         and prev["close"] > prev["open"]
@@ -779,11 +731,9 @@ def strategy_ema(
         and last["close"] < ema9
         and 35 <= rsi <= 55
     ):
-
         return {
             "direction": "PUT",
-            "strategy": "EMA 9/21 PULLBACK",
-            "base_score": 4
+            "strategy": "EMA 9/21/50 PULLBACK"
         }
 
     return None
@@ -795,8 +745,6 @@ def strategy_ema(
 
 def strategy_engulfing(prev, last, rsi):
 
-    # Bullish engulfing
-
     bullish = (
         prev["close"] < prev["open"]
         and last["close"] > last["open"]
@@ -806,14 +754,10 @@ def strategy_engulfing(prev, last, rsi):
     )
 
     if bullish:
-
         return {
             "direction": "CALL",
-            "strategy": "ENGULFING MOMENTUM",
-            "base_score": 4
+            "strategy": "BULLISH ENGULFING"
         }
-
-    # Bearish engulfing
 
     bearish = (
         prev["close"] > prev["open"]
@@ -824,11 +768,9 @@ def strategy_engulfing(prev, last, rsi):
     )
 
     if bearish:
-
         return {
             "direction": "PUT",
-            "strategy": "ENGULFING MOMENTUM",
-            "base_score": 4
+            "strategy": "BEARISH ENGULFING"
         }
 
     return None
@@ -843,10 +785,7 @@ def analyze_candles(candles):
     if len(candles) < MIN_CANDLES:
         return None
 
-    closes = [
-        float(c["close"])
-        for c in candles
-    ]
+    closes = [float(c["close"]) for c in candles]
 
     upper, middle, lower = bollinger_bands(
         closes,
@@ -864,27 +803,19 @@ def analyze_candles(candles):
     ema21 = ema(closes, EMA_MID)
     ema50 = ema(closes, EMA_SLOW)
 
-    ema9_prev = ema(
-        closes[:-1],
-        EMA_FAST
-    )
+    ema9_prev = ema(closes[:-1], EMA_FAST)
 
-    rsi = calculate_rsi(
-        closes,
-        RSI_PERIOD
-    )
-
+    rsi = calculate_rsi(closes, RSI_PERIOD)
     atr = calculate_atr(candles)
 
-    if any(
-        value is None
-        for value in (
-            upper, middle, lower,
-            prev_upper, prev_lower,
-            ema9, ema21, ema50,
-            ema9_prev, rsi, atr
-        )
-    ):
+    values = (
+        upper, middle, lower,
+        prev_upper, prev_lower,
+        ema9, ema21, ema50,
+        ema9_prev, rsi, atr
+    )
+
+    if any(value is None for value in values):
         return None
 
     if atr <= 0:
@@ -893,43 +824,40 @@ def analyze_candles(candles):
     prev = candles[-2]
     last = candles[-1]
 
-    # Run all three strategies.
+    results = [
+        strategy_bollinger(
+            candles,
+            upper,
+            middle,
+            lower,
+            prev_upper,
+            prev_lower,
+            rsi
+        ),
 
-    candidates = []
+        strategy_ema(
+            prev,
+            last,
+            ema9,
+            ema21,
+            ema50,
+            ema9_prev,
+            rsi
+        ),
 
-    result1 = strategy_bollinger(
-        candles,
-        upper,
-        middle,
-        lower,
-        prev_upper,
-        prev_lower,
-        rsi
-    )
+        strategy_engulfing(
+            prev,
+            last,
+            rsi
+        )
+    ]
 
-    result2 = strategy_ema(
-        closes,
-        prev,
-        last,
-        ema9,
-        ema21,
-        ema50,
-        ema9_prev,
-        rsi
-    )
+    candidates = [
+        result for result in results
+        if result is not None
+    ]
 
-    result3 = strategy_engulfing(
-        prev,
-        last,
-        rsi
-    )
-
-    for result in (result1, result2, result3):
-
-        if result:
-            candidates.append(result)
-
-    if not candidates:
+    if len(candidates) < MIN_STRATEGY_AGREEMENT:
         return None
 
     directions = {
@@ -937,17 +865,13 @@ def analyze_candles(candles):
         for item in candidates
     }
 
-    # If strategies disagree, avoid ambiguous signals.
-
-    if len(directions) > 1:
+    # Never trade if strategies disagree.
+    if len(directions) != 1:
         return None
 
     direction = candidates[0]["direction"]
 
-    # Agreement between strategies.
-
-    agreement = len(candidates)
-
+    # Additional trend confirmation.
     confirmations = []
 
     if direction == "CALL":
@@ -964,9 +888,6 @@ def analyze_candles(candles):
         if last["close"] > last["open"]:
             confirmations.append("BULLISH CANDLE")
 
-        if 40 <= rsi <= 65:
-            confirmations.append("RSI CONFIRMATION")
-
     else:
 
         if ema9 < ema21:
@@ -981,58 +902,34 @@ def analyze_candles(candles):
         if last["close"] < last["open"]:
             confirmations.append("BEARISH CANDLE")
 
-        if 35 <= rsi <= 60:
-            confirmations.append("RSI CONFIRMATION")
+    # Select the actual strategies that agreed.
+    strategy_names = [
+        item["strategy"]
+        for item in candidates
+    ]
 
-    best = max(
-        candidates,
-        key=lambda x: x["base_score"]
+    score = min(
+        8,
+        4
+        + (len(candidates) - 2)
+        + min(len(confirmations), 2)
     )
 
-    score = (
-        best["base_score"]
-        + min(len(confirmations), 3)
-        + (agreement - 1)
-    )
-
-    if score < MIN_SCORE:
+    if score < 5:
         return None
-
-    # EMA21 distance measured in ATR units.
-
-    ema_distance = (
-        abs(last["close"] - ema21) / atr
-    )
 
     return {
         "direction": direction,
-
-        "strategy": best["strategy"],
-
-        "strategies_agree": agreement,
-
-        "score": min(score, 8),
-
+        "strategies": strategy_names,
+        "strategies_agree": len(candidates),
+        "score": score,
         "rsi": round(rsi, 2),
-
         "ema9": ema9,
         "ema21": ema21,
         "ema50": ema50,
-
-        "ema_distance_atr": round(
-            ema_distance, 3
-        ),
-
-        "bb_upper": upper,
-        "bb_middle": middle,
-        "bb_lower": lower,
-
         "atr": atr,
-
         "close": last["close"],
-
         "confirmations": confirmations,
-
         "candle_time": last["time"]
     }
 
@@ -1061,35 +958,43 @@ def send_signal(
 
     direction = signal["direction"]
 
-    arrow = (
-        "🟢" if direction == "CALL"
-        else "🔴"
+    arrow = "🟢" if direction == "CALL" else "🔴"
+
+    strategy_text = "\n".join(
+        f"• {name}"
+        for name in signal["strategies"]
     )
 
     message = (
         f"🤖 {VERSION}\n\n"
         f"{arrow} {direction}\n\n"
         f"💱 PAIR: {symbol}\n"
-        f"💰 PAYOUT: {payout:.1f}%\n\n"
-        f"🧠 STRATEGY: {signal['strategy']}\n"
-        f"⭐ SIGNAL QUALITY: {signal['score']}/8\n"
-        f"🤝 STRATEGIES AGREE: "
-        f"{signal['strategies_agree']}\n\n"
+        f"💰 PAYOUT: {payout:.1f}%\n"
+        f"⏱ TIMEFRAME: S30\n"
+        f"⌛ EXPIRATION: 60 SECONDS\n\n"
+        f"🧠 STRATEGIES:\n"
+        f"{strategy_text}\n\n"
+        f"🤝 AGREEMENT: "
+        f"{signal['strategies_agree']}/3\n"
+        f"⭐ QUALITY SCORE: "
+        f"{signal['score']}/8\n"
         f"📊 RSI 7: {signal['rsi']}\n"
-        f"📈 EMA9: {signal['ema9']:.8f}\n"
-        f"📈 EMA21: {signal['ema21']:.8f}\n"
-        f"📈 EMA50: {signal['ema50']:.8f}\n\n"
+        f"📈 EMA 9: {signal['ema9']:.8f}\n"
+        f"📈 EMA 21: {signal['ema21']:.8f}\n"
+        f"📈 EMA 50: {signal['ema50']:.8f}\n\n"
         f"⏰ SIGNAL: "
         f"{signal_datetime.strftime('%I:%M:%S %p')}\n"
-        f"🎯 ENTRY: "
-        f"{entry_datetime.strftime('%I:%M:%S %p')}\n"
+        f"🎯 MANUAL ENTRY: "
+        f"{entry_datetime.strftime('%I:%M:%S %p')}\n\n"
+        f"⚠️ If entry is missed by more than "
+        f"{ENTRY_GRACE_SECONDS} seconds, skip it."
     )
 
     return send_telegram(message)
 
 
 # =========================================================
-# OTCHARTS RESULT ESTIMATE
+# RESULT ESTIMATE
 # =========================================================
 
 def send_result(symbol, pending, exit_price):
@@ -1104,40 +1009,29 @@ def send_result(symbol, pending, exit_price):
     difference = exit_price - entry_price
 
     if abs(difference) <= tolerance:
-
         result = "TIE"
 
     elif pending["direction"] == "CALL":
-
-        result = (
-            "WIN" if difference > 0
-            else "LOSS"
-        )
+        result = "WIN" if difference > 0 else "LOSS"
 
     else:
-
-        result = (
-            "WIN" if difference < 0
-            else "LOSS"
-        )
+        result = "WIN" if difference < 0 else "LOSS"
 
     message = (
         f"🤖 {VERSION}\n\n"
         f"📊 OTCHARTS RESULT ESTIMATE\n"
         f"💱 PAIR: {symbol}\n"
         f"📍 SIGNAL: {pending['direction']}\n"
-        f"📈 RESULT: {result}\n\n"
+        f"📈 ESTIMATE: {result}\n\n"
         f"Entry: {entry_price}\n"
         f"Exit: {exit_price}\n\n"
-        f"⚠️ OTCharts estimate only.\n"
-        f"Not a verified Pocket Option result."
+        f"⚠️ This is only an OTCharts price estimate. "
+        f"It is NOT a verified Pocket Option result."
     )
 
     send_telegram(message)
 
-    log(
-        f"{symbol}: estimated result={result}"
-    )
+    log(f"{symbol}: estimated result={result}")
 
 
 # =========================================================
@@ -1157,7 +1051,8 @@ def run_live_stream(monitored, histories):
     }
 
     log(
-        f"Opening stream for {len(symbols)} pairs."
+        f"Opening S30 stream for "
+        f"{len(symbols)} pairs."
     )
 
     response = api_get(
@@ -1167,18 +1062,18 @@ def run_live_stream(monitored, histories):
     )
 
     current_bars = {}
-
     bar_complete = {}
-
-    signal_minute = {}
+    last_analyzed_bar = {}
 
     connected_symbols = set()
 
-    # One pending signal per pair.
-    pending_signals = {}
+    # ONE global pending signal only.
+    pending_signal = None
+
+    last_global_signal_time = 0
+    last_pair_signal_time = {}
 
     started_at = time.time()
-
     event_name = ""
 
     try:
@@ -1188,16 +1083,13 @@ def run_live_stream(monitored, histories):
             chunk_size=1
         ):
 
-            if (
-                time.time() - started_at
-                > MAX_SCAN_MINUTES * 60
-            ):
+            now = time.time()
 
+            if now - started_at > MAX_SCAN_MINUTES * 60:
                 log("Maximum scan duration reached.")
                 return
 
             if not raw_line:
-
                 event_name = ""
                 continue
 
@@ -1209,24 +1101,18 @@ def run_live_stream(monitored, histories):
             else:
                 line = raw_line.strip()
 
-            if not line:
-                continue
-
-            if line.startswith(":"):
+            if not line or line.startswith(":"):
                 continue
 
             if line.startswith("event:"):
-
                 event_name = line[6:].strip()
                 continue
 
             if not line.startswith("data:"):
                 continue
 
-            raw_data = line[5:].strip()
-
             try:
-                data = json.loads(raw_data)
+                data = json.loads(line[5:].strip())
             except json.JSONDecodeError:
                 continue
 
@@ -1242,25 +1128,20 @@ def run_live_stream(monitored, histories):
 
                 log(
                     "Connected symbols: "
-                    + ", ".join(
-                        sorted(connected_symbols)
-                    )
+                    + ", ".join(sorted(connected_symbols))
                 )
 
                 if not connected_symbols:
-
                     log("No symbols confirmed by stream.")
                     return
 
                 continue
 
             if event_name == "closed":
-
                 log(f"Stream closed: {data}")
                 continue
 
             if event_name == "replaced":
-
                 log("Stream replaced.")
                 return
 
@@ -1273,10 +1154,8 @@ def run_live_stream(monitored, histories):
                 continue
 
             try:
-
                 price = float(data["price"])
                 feed_time = int(data["time"])
-
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -1287,28 +1166,22 @@ def run_live_stream(monitored, histories):
             ) * TIMEFRAME
 
             # ---------------------------------------------
-            # INITIAL BAR
+            # INITIAL LIVE BAR
             # ---------------------------------------------
 
             if symbol not in current_bars:
 
-                history = histories.get(
-                    symbol,
-                    []
-                )
+                history = histories.get(symbol, [])
 
                 history = [
-                    candle
-                    for candle in history
+                    candle for candle in history
                     if candle["time"] < bucket
                 ]
 
                 if history:
-
                     if (
                         bucket - history[-1]["time"]
-                        != TIMEFRAME
-                    ):
+                    ) != TIMEFRAME:
 
                         log(
                             f"{symbol}: history/live gap. "
@@ -1328,16 +1201,17 @@ def run_live_stream(monitored, histories):
                     "close": price
                 }
 
-                # First live candle may be incomplete.
+                # First live candle is incomplete.
                 bar_complete[symbol] = False
-
                 continue
 
             current = current_bars[symbol]
 
             # ---------------------------------------------
-            # NEW M1 CANDLE
+            # NEW S30 CANDLE
             # ---------------------------------------------
+
+            new_closed_candle = False
 
             if bucket > current["time"]:
 
@@ -1346,7 +1220,7 @@ def run_live_stream(monitored, histories):
                 if gap != TIMEFRAME:
 
                     log(
-                        f"{symbol}: live candle gap. "
+                        f"{symbol}: live S30 candle gap. "
                         "Skipping pair."
                     )
 
@@ -1360,6 +1234,8 @@ def run_live_stream(monitored, histories):
                     histories[symbol] = (
                         histories[symbol][-CANDLE_LIMIT:]
                     )
+
+                    new_closed_candle = True
 
                 current_bars[symbol] = {
                     "time": bucket,
@@ -1389,28 +1265,32 @@ def run_live_stream(monitored, histories):
                 continue
 
             # ---------------------------------------------
-            # ENTRY AND EXPIRATION
+            # PENDING SIGNAL: ENTRY AND EXPIRATION
             # ---------------------------------------------
 
-            pending = pending_signals.get(symbol)
+            if pending_signal is not None:
 
-            if pending is not None:
+                pending = pending_signal
 
                 if pending["entry_price"] is None:
 
-                    if (
-                        receive_time
-                        > pending["entry_time"]
+                    if receive_time > (
+                        pending["entry_time"]
                         + ENTRY_GRACE_SECONDS
                     ):
 
                         log(
-                            f"{symbol}: entry missed. "
-                            "Signal cancelled."
+                            f"{pending['symbol']}: "
+                            "manual entry window missed."
                         )
 
-                        del pending_signals[symbol]
+                        send_telegram(
+                            f"⚠️ {VERSION}\n\n"
+                            f"{pending['symbol']}: "
+                            f"ENTRY MISSED. Skip this signal."
+                        )
 
+                        pending_signal = None
                         pending = None
 
                     elif receive_time >= pending["entry_time"]:
@@ -1418,8 +1298,8 @@ def run_live_stream(monitored, histories):
                         pending["entry_price"] = price
 
                         log(
-                            f"{symbol}: entry captured "
-                            f"at {price}"
+                            f"{pending['symbol']}: "
+                            f"reference entry price={price}"
                         )
 
                 if (
@@ -1429,41 +1309,52 @@ def run_live_stream(monitored, histories):
                 ):
 
                     send_result(
-                        symbol,
+                        pending["symbol"],
                         pending,
                         price
                     )
 
-                    del pending_signals[symbol]
-
-                    pending = None
+                    pending_signal = None
 
             # ---------------------------------------------
-            # SIGNAL CHECK
+            # ONE SIGNAL AT A TIME
             # ---------------------------------------------
 
-            if symbol in pending_signals:
+            if pending_signal is not None:
                 continue
 
-            minute_key = int(bucket // TIMEFRAME)
-
-            if signal_minute.get(symbol) == minute_key:
+            # Analyze only after a candle has closed.
+            if not new_closed_candle:
                 continue
 
-            closed_candles = histories.get(
-                symbol,
-                []
-            )
-
-            if len(closed_candles) < MIN_CANDLES:
+            if len(histories.get(symbol, [])) < MIN_CANDLES:
                 continue
 
-            # One analysis per newly closed candle.
-            signal_minute[symbol] = minute_key
+            closed_candles = histories[symbol]
 
-            signal = analyze_candles(
-                closed_candles
-            )
+            candle_key = closed_candles[-1]["time"]
+
+            if last_analyzed_bar.get(symbol) == candle_key:
+                continue
+
+            last_analyzed_bar[symbol] = candle_key
+
+            # Global cooldown
+            if (
+                receive_time - last_global_signal_time
+                < GLOBAL_COOLDOWN_SECONDS
+            ):
+                continue
+
+            # Pair cooldown
+            if (
+                receive_time
+                - last_pair_signal_time.get(symbol, 0)
+                < PAIR_COOLDOWN_SECONDS
+            ):
+                continue
+
+            signal = analyze_candles(closed_candles)
 
             if not signal:
                 continue
@@ -1480,27 +1371,32 @@ def run_live_stream(monitored, histories):
                 continue
 
             # ---------------------------------------------
-            # SCHEDULE ENTRY
+            # SCHEDULE MANUAL ENTRY
             # ---------------------------------------------
 
+            detection_time = time.time()
+
             entry_time = make_entry_time(
-                receive_time
+                detection_time
+            )
+
+            expiry_time = (
+                entry_time + EXPIRATION_SECONDS
             )
 
             log(
-                f"SIGNAL {signal['direction']} "
+                f"S30 SIGNAL {signal['direction']} "
                 f"{symbol} | "
-                f"strategy={signal['strategy']} | "
+                f"strategies={signal['strategies_agree']}/3 | "
                 f"score={signal['score']}/8 | "
-                f"RSI={signal['rsi']} | "
-                f"entry in 15 seconds"
+                f"entry in {ENTRY_DELAY_SECONDS}s"
             )
 
             delivered = send_signal(
                 symbol,
                 pair_info["payout"],
                 signal,
-                receive_time,
+                detection_time,
                 entry_time
             )
 
@@ -1513,39 +1409,39 @@ def run_live_stream(monitored, histories):
 
                 continue
 
-            # Check Telegram delivery delay.
+            # Check whether Telegram delivery took too long.
             if time.time() >= entry_time:
 
                 log(
-                    f"{symbol}: entry time already passed. "
-                    "Cancelling signal."
+                    f"{symbol}: entry time passed "
+                    "before delivery completed. Cancelled."
                 )
 
                 send_telegram(
                     f"⚠️ {VERSION}\n\n"
-                    f"{symbol}: previous signal cancelled "
-                    f"because delivery was late."
+                    f"{symbol}: signal cancelled because "
+                    f"Telegram delivery was late."
                 )
 
                 continue
 
-            pending_signals[symbol] = {
+            pending_signal = {
                 "symbol": symbol,
                 "direction": signal["direction"],
                 "entry_time": entry_time,
-                "expiry_time": (
-                    entry_time + EXPIRATION_SECONDS
-                ),
+                "expiry_time": expiry_time,
                 "entry_price": None
             }
 
+            last_global_signal_time = time.time()
+            last_pair_signal_time[symbol] = time.time()
+
             log(
-                f"{symbol}: signal activated. "
-                f"Entry scheduled in 15 seconds."
+                f"{symbol}: activated. "
+                f"One global signal is now locked."
             )
 
     finally:
-
         response.close()
 
 
@@ -1556,32 +1452,28 @@ def run_live_stream(monitored, histories):
 def main():
 
     log(f"{VERSION} starting...")
+    log(
+        "SETTINGS: S30 | EXPIRATION 60s | "
+        "ENTRY 10s | MIN PAYOUT 92%"
+    )
 
     if not API_KEY:
-        raise RuntimeError(
-            "OTCHARTS_API_KEY is missing."
-        )
+        raise RuntimeError("OTCHARTS_API_KEY is missing.")
 
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "Telegram credentials missing."
-        )
+        raise RuntimeError("Telegram credentials missing.")
 
-    # 1. Account and plan.
-
+    # 1. Account and S30 verification
     account = check_account()
 
-    # 2. All eligible pairs.
-
+    # 2. Eligible OTC pairs
     eligible = get_eligible_symbols()
 
     if not eligible:
-
         log("No eligible Forex OTC pairs.")
         return
 
     if len(eligible) > MAX_HISTORY_REQUESTS_PER_RUN:
-
         raise RuntimeError(
             f"Too many pairs: {len(eligible)}"
         )
@@ -1589,18 +1481,17 @@ def main():
     estimated_requests = len(eligible) + 4
 
     if account["remaining"] < estimated_requests:
-
         raise RuntimeError(
             "Not enough API requests to analyze pairs."
         )
 
-    # 3. Download historical candles.
-
+    # 3. Historical candles
     histories = {}
     ranked = []
 
     log(
-        f"Analyzing {len(eligible)} eligible pairs."
+        f"Downloading S30 history for "
+        f"{len(eligible)} eligible pairs."
     )
 
     for item in eligible:
@@ -1612,6 +1503,9 @@ def main():
             candles = get_candles(symbol)
 
             if not candles:
+                log(
+                    f"{symbol}: insufficient S30 history."
+                )
                 continue
 
             histories[symbol] = candles
@@ -1634,12 +1528,10 @@ def main():
             )
 
     if not ranked:
-
-        log("No pairs have sufficient history.")
+        log("No pairs have sufficient S30 history.")
         return
 
-    # 4. Live instruments.
-
+    # 4. Live instruments
     live_limit = min(
         MAX_LIVE_SYMBOLS,
         account["instruments_limit"]
@@ -1660,8 +1552,7 @@ def main():
         )
     )
 
-    # 5. Stream.
-
+    # 5. Live stream
     reconnects = 0
 
     while reconnects <= MAX_RECONNECTS:
@@ -1692,7 +1583,8 @@ def main():
         except Exception as exc:
 
             log(
-                f"Bot stopped: {type(exc).__name__}: {exc}"
+                f"Bot stopped: "
+                f"{type(exc).__name__}: {exc}"
             )
 
             raise
