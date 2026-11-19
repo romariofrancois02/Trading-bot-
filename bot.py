@@ -10,13 +10,12 @@ from zoneinfo import ZoneInfo
 
 
 # =========================================================
-# ROMARIO TRADER PRO CLEAN 1.5
-# OTCharts OTC | M1 | 60s expiry | Telegram manual alerts
-# Corrected Pocket Option UTC+2 candle timestamps
-# This bot DOES NOT place trades.
+# ROMARIO TRADER PRO CLEAN 1.6
+# OTCharts OTC | M1 | 60s expiration
+# Telegram manual alerts only
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO CLEAN 1.5"
+VERSION = "ROMARIO TRADER PRO CLEAN 1.6"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -29,9 +28,12 @@ MIN_CANDLES = 25
 CANDLE_LIMIT = 50
 
 MAX_MARKETS = 15
-MAX_API_REQUESTS = 100
 
-SCAN_INTERVAL = 5
+# Increased from 100 to 180 requests per run.
+# Watch your OTCharts daily plan usage.
+MAX_API_REQUESTS = 180
+
+SCAN_INTERVAL = 10
 MAX_SCAN_SECONDS = 120
 
 ENTRY_DELAY = 15
@@ -45,8 +47,7 @@ EMA_SLOW = 20
 RSI_PERIOD = 7
 ATR_PERIOD = 14
 
-# Pocket Option OTC candle clock is UTC+2.
-# OTCharts timestamps are Unix timestamps on the broker's clock.
+# Pocket Option OTC timestamp correction.
 OTC_TIMESTAMP_OFFSET_SECONDS = 7200
 
 ET = ZoneInfo("America/New_York")
@@ -67,15 +68,14 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "RomarioTrader/1.5"
+    "User-Agent": "RomarioTrader/1.6"
 })
 
 request_count = 0
-unavailable_symbols = set()
 
 
 # =========================================================
-# TIME FUNCTIONS
+# TIME
 # =========================================================
 
 def now_utc():
@@ -87,13 +87,6 @@ def fmt_et(dt):
 
 
 def parse_time(raw):
-    """
-    Convert OTCharts Pocket Option OTC candle time to UTC.
-
-    OTCharts documents that Pocket Option candles use UTC+2.
-    Other venues use UTC, but this bot is configured for otc.
-    """
-
     if raw is None:
         return None
 
@@ -101,7 +94,6 @@ def parse_time(raw):
         if isinstance(raw, (int, float)):
             value = float(raw)
 
-            # Convert milliseconds to seconds if necessary.
             if value > 1e12:
                 value /= 1000.0
 
@@ -134,7 +126,6 @@ def parse_time(raw):
 
                 dt = dt.astimezone(timezone.utc)
 
-        # Correct Pocket Option's UTC+2 candle clock.
         if VENUE == "otc":
             dt -= timedelta(
                 seconds=OTC_TIMESTAMP_OFFSET_SECONDS
@@ -152,7 +143,7 @@ def parse_time(raw):
 
 
 # =========================================================
-# API FUNCTIONS
+# API
 # =========================================================
 
 def api_get(path, params=None, retries=2):
@@ -162,7 +153,8 @@ def api_get(path, params=None, retries=2):
 
         if request_count >= MAX_API_REQUESTS:
             log.warning(
-                "API request guard reached (%d).",
+                "API request limit reached: %d/%d",
+                request_count,
                 MAX_API_REQUESTS
             )
             return None
@@ -178,7 +170,7 @@ def api_get(path, params=None, retries=2):
 
             if response.status_code == 503:
                 log.warning(
-                    "API 503 for %s.",
+                    "API 503: endpoint or market unavailable: %s",
                     params.get("symbol") if params else path
                 )
                 return None
@@ -187,21 +179,20 @@ def api_get(path, params=None, retries=2):
                 429, 500, 502, 504
             ):
                 log.warning(
-                    "Temporary API HTTP %s for %s.",
+                    "Temporary API HTTP %s: %s",
                     response.status_code,
                     path
                 )
 
                 if attempt < retries:
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(attempt + 1)
                     continue
 
                 return None
 
             if response.status_code != 200:
                 log.warning(
-                    "API %s returned HTTP %s: %s",
-                    path,
+                    "API HTTP %s: %s",
                     response.status_code,
                     response.text[:250]
                 )
@@ -212,30 +203,31 @@ def api_get(path, params=None, retries=2):
 
             except ValueError:
                 log.warning(
-                    "API returned invalid JSON for %s.",
+                    "Invalid JSON from API: %s",
                     path
                 )
                 return None
 
         except requests.RequestException as exc:
             log.warning(
-                "API connection error (%s/%s): %s",
-                attempt + 1,
-                retries + 1,
+                "API connection error: %s",
                 exc
             )
 
             if attempt < retries:
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(attempt + 1)
             else:
                 return None
 
     return None
 
 
+# =========================================================
+# DATA HELPERS
+# =========================================================
+
 def unwrap(obj):
     if isinstance(obj, dict):
-
         for key in (
             "data",
             "result",
@@ -262,7 +254,6 @@ def as_list(obj):
         result = []
 
         for key, value in obj.items():
-
             if isinstance(value, dict):
                 row = dict(value)
                 row.setdefault("symbol", key)
@@ -285,11 +276,10 @@ def getv(data, keys, default=None):
 
 
 # =========================================================
-# MARKET FUNCTIONS
+# MARKETS
 # =========================================================
 
 def symbol_name(row):
-
     if isinstance(row, str):
         return row.strip()
 
@@ -310,7 +300,6 @@ def symbol_name(row):
 
 
 def payout_value(row):
-
     raw = getv(
         row,
         [
@@ -336,7 +325,6 @@ def payout_value(row):
 
 
 def is_open(row):
-
     status = getv(
         row,
         [
@@ -366,7 +354,6 @@ def is_open(row):
 
 
 def fetch_symbols():
-
     raw = api_get(
         "/v1/symbols",
         {"venue": VENUE}
@@ -378,13 +365,9 @@ def fetch_symbols():
     seen = set()
 
     for row in rows:
-
         name = symbol_name(row)
 
-        if not name:
-            continue
-
-        if not name.lower().endswith("_otc"):
+        if not name or not name.lower().endswith("_otc"):
             continue
 
         payout = payout_value(row)
@@ -422,12 +405,10 @@ def fetch_symbols():
 
 
 def rotate_markets(markets):
-
     if not markets:
         return []
 
     bucket = int(now_utc().timestamp() // 300)
-
     start = bucket % len(markets)
 
     rotated = markets[start:] + markets[:start]
@@ -436,26 +417,18 @@ def rotate_markets(markets):
 
 
 # =========================================================
-# CANDLE FUNCTIONS
+# CANDLES
 # =========================================================
 
 def candle_fields(candle):
 
     if isinstance(candle, (list, tuple)) and len(candle) >= 5:
-
         timestamp, open_price, high, low, close = candle[:5]
 
     elif isinstance(candle, dict):
-
         timestamp = getv(
             candle,
-            [
-                "timestamp",
-                "time",
-                "date",
-                "datetime",
-                "t"
-            ]
+            ["timestamp", "time", "date", "datetime", "t"]
         )
 
         open_price = getv(candle, ["open", "o"])
@@ -467,7 +440,6 @@ def candle_fields(candle):
         return None
 
     try:
-
         dt = parse_time(timestamp)
 
         values = [
@@ -480,15 +452,12 @@ def candle_fields(candle):
         if dt is None:
             return None
 
-        if not all(math.isfinite(value) for value in values):
+        if not all(math.isfinite(x) for x in values):
             return None
 
         op, hi, lo, cl = values
 
-        if min(op, hi, lo, cl) <= 0:
-            return None
-
-        if hi < lo:
+        if min(op, hi, lo, cl) <= 0 or hi < lo:
             return None
 
         return {
@@ -504,9 +473,6 @@ def candle_fields(candle):
 
 
 def fetch_candles(symbol):
-
-    if symbol in unavailable_symbols:
-        return []
 
     raw = api_get(
         "/v1/candles",
@@ -529,15 +495,13 @@ def fetch_candles(symbol):
     ]
 
     parsed = [
-        candle
-        for candle in parsed
+        candle for candle in parsed
         if candle is not None
     ]
 
     if not parsed:
-
         log.warning(
-            "%s: API returned %d rows but none parsed as OHLC candles.",
+            "%s: no valid OHLC candles. API rows=%d",
             symbol,
             len(rows)
         )
@@ -546,7 +510,7 @@ def fetch_candles(symbol):
             log.info(
                 "%s RAW SAMPLE: %s",
                 symbol,
-                str(rows[0])[:400]
+                str(rows[-1])[:400]
             )
 
         return []
@@ -555,7 +519,6 @@ def fetch_candles(symbol):
         key=lambda candle: candle["time"]
     )
 
-    # Remove duplicate candle timestamps.
     dedup = {
         candle["time"]: candle
         for candle in parsed
@@ -566,27 +529,16 @@ def fetch_candles(symbol):
     now = now_utc()
     latest = parsed[-1]["time"]
 
-    # Safety check: reject timestamps more than five minutes ahead.
     if latest > now + timedelta(minutes=5):
-
         log.warning(
-            "%s: candle timestamp still appears in the future. "
-            "latest=%s | now=%s. Refusing to guess.",
+            "%s: future candle timestamp. latest=%s now=%s",
             symbol,
             latest.isoformat(),
             now.isoformat()
         )
-
-        log.info(
-            "%s RAW SAMPLE: %s",
-            symbol,
-            str(rows[-1])[:400]
-        )
-
         return []
 
-    # OTCharts Pocket Option timestamps mark candle OPEN.
-    # A candle is closed only after its full timeframe has elapsed.
+    # Candle timestamp is treated as candle OPEN.
     closed = [
         candle
         for candle in parsed
@@ -594,12 +546,11 @@ def fetch_candles(symbol):
     ]
 
     log.info(
-        "%s: API candles=%d | confirmed closed=%d | latest=%s | now=%s",
+        "%s: API candles=%d | confirmed closed=%d | latest=%s",
         symbol,
         len(parsed),
         len(closed),
-        latest.isoformat(),
-        now.isoformat()
+        latest.isoformat()
     )
 
     return closed
@@ -610,12 +561,10 @@ def fetch_candles(symbol):
 # =========================================================
 
 def ema(values, period):
-
     if len(values) < period:
         return None
 
     alpha = 2.0 / (period + 1)
-
     result = values[0]
 
     for value in values[1:]:
@@ -628,7 +577,6 @@ def ema(values, period):
 
 
 def rsi(values, period=7):
-
     if len(values) < period + 1:
         return None
 
@@ -653,36 +601,26 @@ def rsi(values, period=7):
     if avg_loss == 0:
         return 100.0
 
-    relative_strength = avg_gain / avg_loss
+    rs = avg_gain / avg_loss
 
-    return 100.0 - (
-        100.0 / (1.0 + relative_strength)
-    )
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
 def atr(candles, period=14):
-
     if len(candles) < period + 1:
         return None
 
     ranges = []
 
-    for index in range(1, len(candles)):
-
-        current = candles[index]
-        previous = candles[index - 1]
+    for i in range(1, len(candles)):
+        current = candles[i]
+        previous = candles[i - 1]
 
         ranges.append(
             max(
                 current["high"] - current["low"],
-                abs(
-                    current["high"]
-                    - previous["close"]
-                ),
-                abs(
-                    current["low"]
-                    - previous["close"]
-                )
+                abs(current["high"] - previous["close"]),
+                abs(current["low"] - previous["close"])
             )
         )
 
@@ -690,20 +628,18 @@ def atr(candles, period=14):
 
 
 # =========================================================
-# STRATEGY
+# STRATEGY WITH REJECTION DIAGNOSTICS
 # =========================================================
 
 def analyze(symbol, payout, candles):
 
     if len(candles) < MIN_CANDLES:
-
         log.info(
-            "%s skipped: %d closed candles; minimum=%d",
+            "%s REJECTED: not enough closed candles (%d/%d)",
             symbol,
             len(candles),
             MIN_CANDLES
         )
-
         return None
 
     closes = [
@@ -715,29 +651,24 @@ def analyze(symbol, payout, candles):
     e21 = ema(closes, EMA_MID)
     e20 = ema(closes, EMA_SLOW)
 
-    rsi_value = rsi(
-        closes,
-        RSI_PERIOD
-    )
-
-    atr_value = atr(
-        candles,
-        ATR_PERIOD
-    )
+    rsi_value = rsi(closes, RSI_PERIOD)
+    atr_value = atr(candles, ATR_PERIOD)
 
     if any(
         value is None
-        for value in (
-            e9,
-            e21,
-            e20,
-            rsi_value,
-            atr_value
-        )
+        for value in (e9, e21, e20, rsi_value, atr_value)
     ):
+        log.info(
+            "%s REJECTED: indicator data unavailable",
+            symbol
+        )
         return None
 
     if atr_value <= 0:
+        log.info(
+            "%s REJECTED: ATR is zero",
+            symbol
+        )
         return None
 
     last = candles[-1]
@@ -746,27 +677,60 @@ def analyze(symbol, payout, candles):
         last["close"] - last["open"]
     )
 
-    # Avoid candles that are too weak or unusually large.
     if body < atr_value * 0.08:
+        log.info(
+            "%s REJECTED: candle body too weak (body/ATR=%.3f)",
+            symbol,
+            body / atr_value
+        )
         return None
 
     if body > atr_value * 1.35:
+        log.info(
+            "%s REJECTED: candle body too large (body/ATR=%.3f)",
+            symbol,
+            body / atr_value
+        )
         return None
 
-    bullish = (
+    bullish_trend = (
         e9 > e21
         and e21 >= e20
         and last["close"] > e9
-        and last["close"] > last["open"]
-        and 52 <= rsi_value <= 72
     )
 
-    bearish = (
+    bearish_trend = (
         e9 < e21
         and e21 <= e20
         and last["close"] < e9
-        and last["close"] < last["open"]
-        and 28 <= rsi_value <= 48
+    )
+
+    bullish_candle = (
+        last["close"] > last["open"]
+    )
+
+    bearish_candle = (
+        last["close"] < last["open"]
+    )
+
+    bullish_rsi = (
+        52 <= rsi_value <= 72
+    )
+
+    bearish_rsi = (
+        28 <= rsi_value <= 48
+    )
+
+    bullish = (
+        bullish_trend
+        and bullish_candle
+        and bullish_rsi
+    )
+
+    bearish = (
+        bearish_trend
+        and bearish_candle
+        and bearish_rsi
     )
 
     if bullish:
@@ -776,29 +740,70 @@ def analyze(symbol, payout, candles):
         direction = "PUT"
 
     else:
+        reasons = []
+
+        if not bullish_trend and not bearish_trend:
+            reasons.append("EMA trend not aligned")
+
+        if not bullish_candle and not bearish_candle:
+            reasons.append("neutral candle")
+
+        if not bullish_rsi and not bearish_rsi:
+            reasons.append(
+                f"RSI outside entry zones ({rsi_value:.1f})"
+            )
+
+        elif bullish_trend and not bullish_rsi:
+            reasons.append(
+                f"CALL RSI not confirmed ({rsi_value:.1f})"
+            )
+
+        elif bearish_trend and not bearish_rsi:
+            reasons.append(
+                f"PUT RSI not confirmed ({rsi_value:.1f})"
+            )
+
+        if bullish_trend and not bullish_candle:
+            reasons.append("CALL candle not bullish")
+
+        if bearish_trend and not bearish_candle:
+            reasons.append("PUT candle not bearish")
+
+        log.info(
+            "%s REJECTED: %s",
+            symbol,
+            "; ".join(reasons) if reasons else "no complete setup"
+        )
+
         return None
 
-    # Technical quality score.
-    # This is NOT a measured win probability.
-    score = 0
-
-    score += 25
-    score += 20
-    score += 20
+    # Technical score only; NOT win probability.
+    score = 65
 
     if body >= atr_value * 0.15:
         score += 15
 
-    if payout >= 90:
-        score += 10
-    else:
-        score += 5
+    score += 10 if payout >= 90 else 5
 
     if body <= atr_value:
         score += 10
 
     if score < 75:
+        log.info(
+            "%s REJECTED: score too low (%d)",
+            symbol,
+            score
+        )
         return None
+
+    log.info(
+        "%s SETUP: %s | score=%d | RSI=%.1f | ATR=%.6f",
+        symbol,
+        direction,
+        score,
+        rsi_value,
+        atr_value
+    )
 
     return {
         "symbol": symbol,
@@ -817,13 +822,10 @@ def analyze(symbol, payout, candles):
 def telegram_send(message):
 
     if not TG_TOKEN or not TG_CHAT_ID:
-
         log.error("Telegram secrets missing.")
-
         return False
 
     try:
-
         response = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={
@@ -834,24 +836,20 @@ def telegram_send(message):
         )
 
         if response.status_code != 200:
-
             log.error(
                 "Telegram HTTP %s: %s",
                 response.status_code,
                 response.text[:250]
             )
-
             return False
 
         result = response.json()
 
         if not result.get("ok", False):
-
             log.error(
                 "Telegram rejected message: %s",
                 result
             )
-
             return False
 
         return True
@@ -860,12 +858,10 @@ def telegram_send(message):
         requests.RequestException,
         ValueError
     ) as exc:
-
         log.error(
             "Telegram send error: %s",
             exc
         )
-
         return False
 
 
@@ -885,6 +881,7 @@ def signal_message(signal, entry_time, sent_time):
         f"⏱ TIMEFRAME: 1M\n"
         f"⌛ EXPIRATION: 1M\n"
         f"💰 PAYOUT: {signal['payout']:.1f}%\n"
+        f"📊 RSI: {signal['rsi']:.1f}\n"
         f"📩 SIGNAL SENT: {fmt_et(sent_time)}\n"
         f"🎯 ENTRY: {fmt_et(entry_time)}\n\n"
         f"EMA + RSI + ATR CONFIRMATION\n"
@@ -900,59 +897,42 @@ def signal_message(signal, entry_time, sent_time):
 def main():
 
     if not API_KEY:
-
-        log.error(
-            "OTCHARTS_API_KEY is missing."
-        )
-
+        log.error("OTCHARTS_API_KEY is missing.")
         return
 
     if not TG_TOKEN or not TG_CHAT_ID:
-
-        log.error(
-            "TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing."
-        )
-
+        log.error("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing.")
         return
 
-    log.info(
-        "======================================================="
-    )
+    log.info("=======================================================")
+    log.info("%s starting", VERSION)
 
     log.info(
-        "%s starting",
-        VERSION
-    )
-
-    log.info(
-        "Settings: M1 | expiry=%ds | payout>=%.1f%% | "
-        "min candles=%d | market pool=%d | OTC clock correction=-2h",
+        "SETTINGS: M1 | expiry=%ds | payout>=%.1f%% | "
+        "min candles=%d | markets=%d | API cap=%d | scan=%ds",
         EXPIRATION,
         MIN_PAYOUT,
         MIN_CANDLES,
-        MAX_MARKETS
+        MAX_MARKETS,
+        MAX_API_REQUESTS,
+        MAX_SCAN_SECONDS
     )
 
     markets = fetch_symbols()
 
     if not markets:
-
-        log.error(
-            "No eligible OTC symbols found."
-        )
-
+        log.error("No eligible OTC symbols found.")
         return
 
     chosen = rotate_markets(markets)
 
     log.info(
-        "Eligible markets=%d | selected this run=%d",
+        "Eligible markets=%d | selected=%d",
         len(markets),
         len(chosen)
     )
 
     for market in chosen:
-
         log.info(
             "WATCH: %s | PAYOUT %.1f%%",
             market["symbol"],
@@ -964,10 +944,21 @@ def main():
         + MAX_SCAN_SECONDS
     )
 
+    scan_number = 0
+
     while (
         time.monotonic() < deadline
         and request_count < MAX_API_REQUESTS
     ):
+
+        scan_number += 1
+
+        log.info(
+            "----- SCAN CYCLE %d | API requests=%d/%d -----",
+            scan_number,
+            request_count,
+            MAX_API_REQUESTS
+        )
 
         for market in chosen:
 
@@ -982,6 +973,10 @@ def main():
             candles = fetch_candles(symbol)
 
             if not candles:
+                log.info(
+                    "%s skipped: no confirmed closed candles",
+                    symbol
+                )
                 continue
 
             signal = analyze(
@@ -990,12 +985,11 @@ def main():
                 candles
             )
 
-            if not signal:
+            if signal is None:
                 continue
 
-            # Last candle timestamp marks its OPEN.
-            # It closes after 60 seconds.
-            # Entry is scheduled 15 seconds after that close.
+            # Candle timestamp marks its OPEN.
+            # Entry is 15 seconds after the candle closes.
             entry_time = (
                 signal["candle_time"]
                 + timedelta(
@@ -1013,13 +1007,11 @@ def main():
                 lead < MIN_ENTRY_LEAD
                 or lead > MAX_ENTRY_LEAD
             ):
-
                 log.info(
-                    "%s: setup rejected because entry is %.1fs away.",
+                    "%s setup rejected: entry is %.1f seconds away",
                     symbol,
                     lead
                 )
-
                 continue
 
             message = signal_message(
@@ -1029,7 +1021,7 @@ def main():
             )
 
             log.info(
-                "SIGNAL FOUND: %s %s score=%d entry=%s",
+                "SIGNAL FOUND: %s %s | score=%d | entry=%s",
                 symbol,
                 signal["direction"],
                 signal["score"],
@@ -1037,25 +1029,38 @@ def main():
             )
 
             if telegram_send(message):
-
                 log.info(
-                    "SIGNAL_SENT to Telegram; stopping run."
+                    "SIGNAL SENT successfully. Stopping this run."
                 )
-
             else:
-
                 log.error(
-                    "Telegram delivery failed; stopping run "
-                    "to avoid duplicate alerts."
+                    "Telegram delivery failed. Stopping this run."
                 )
 
             return
 
+        if request_count >= MAX_API_REQUESTS:
+            log.warning(
+                "Stopped because API request cap was reached."
+            )
+            break
+
         time.sleep(SCAN_INTERVAL)
 
     log.info(
-        "Scan ended: no valid setup. API requests used=%d",
-        request_count
+        "SCAN FINISHED | cycles=%d | API requests=%d | "
+        "reason=%s",
+        scan_number,
+        request_count,
+        (
+            "API request cap"
+            if request_count >= MAX_API_REQUESTS
+            else "scan time ended"
+        )
+    )
+
+    log.info(
+        "No valid signal was found during this run."
     )
 
 
@@ -1065,13 +1070,7 @@ if __name__ == "__main__":
         main()
 
     except KeyboardInterrupt:
-
-        log.info(
-            "Stopped by user."
-        )
+        log.info("Stopped by user.")
 
     except Exception:
-
-        log.exception(
-            "Unexpected fatal error."
-        )
+        log.exception("Unexpected fatal error.")
