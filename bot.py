@@ -21,21 +21,26 @@ VENUE = "otc"
 TIMEFRAME = 30            # Bouji 30 segonn
 EXPIRATION = 60           # Ekspirasyon 1 minit (2 bouji 30s)
 CANDLE_LIMIT = 100
-MIN_CANDLES = 30
-MIN_PAYOUT = 85.0
-MAX_SCAN_SECONDS = 300    # Tan max pou bot la ap kouri
-MAX_RECONNECTS = 3
+MIN_CANDLES = 25
+MIN_PAYOUT = 80.0
+MAX_SCAN_SECONDS = 300    # Tan max pou bot la ap kouri (5 minit)
+MAX_RECONNECTS = 5
 
 ALLOWED_PAIRS = {
     "EURUSD_otc",
     "GBPUSD_otc",
     "AUDUSD_otc",
     "USDCAD_otc",
-    "EURJPY_otc"
+    "EURJPY_otc",
+    "USDJPY_otc",
+    "GBPJPY_otc",
+    "AUDCAD_otc",
+    "AUDCHF_otc",
+    "EURGBP_otc"
 }
 
-API_CONNECT_TIMEOUT = 3
-API_READ_TIMEOUT = 8
+API_CONNECT_TIMEOUT = 4
+API_READ_TIMEOUT = 10
 
 TELEGRAM_ATTEMPTS = 3
 TELEGRAM_TIMEOUT = (1, 2)
@@ -55,13 +60,18 @@ _thread_local = threading.local()
 
 
 class StreamRateLimitError(Exception):
-    def __init__(self, message, retry_after=30):
+    def __init__(self, message, retry_after=32):
         super().__init__(message)
         self.retry_after = retry_after
 
 
 def log(message):
     logging.info(message)
+
+
+def normalize_ts(ts):
+    ts = int(ts)
+    return ts // 1000 if ts > 10_000_000_000 else ts
 
 
 def get_session():
@@ -76,9 +86,8 @@ def get_session():
 
 
 def make_exact_entry_time(feed_time):
-    # Kalkile egzakteman fen minit la (egz: 50yèm segonn pou antre nan 00)
-    next_bucket = (feed_time // 30 + 1) * 30
-    return next_bucket
+    feed_time = normalize_ts(feed_time)
+    return ((feed_time // 30) + 1) * 30
 
 
 def format_price(value):
@@ -103,16 +112,18 @@ def api_get(path, params=None, stream=False):
             )
 
             if response.status_code == 429:
-                if stream:
-                    response.close()
-                    raise StreamRateLimitError("Rate limit", 30)
+                retry_hdr = response.headers.get("Retry-After", "32")
+                try:
+                    retry_after = max(30, int(float(retry_hdr)))
+                except (TypeError, ValueError):
+                    retry_after = 32
                 response.close()
-                raise RuntimeError("API rate limit")
+                raise StreamRateLimitError("Rate limit", retry_after)
 
             if response.status_code in (401, 402, 403, 500, 502, 503, 504):
                 if attempt < attempts:
                     response.close()
-                    time.sleep(0.2)
+                    time.sleep(0.3)
                     continue
 
             response.raise_for_status()
@@ -127,7 +138,7 @@ def api_get(path, params=None, stream=False):
                 response.close()
             if attempt >= attempts:
                 raise
-            time.sleep(0.2)
+            time.sleep(0.3)
 
     raise RuntimeError("Request failed.")
 
@@ -194,7 +205,7 @@ def calculate_rsi(closes, period=7):
 # =====================================================
 # ENDIKATÈ RAPID POU 30 SEGONN (BOLLINGER, STOCH, KELTNER, CCI)
 # =====================================================
-def bollinger_bands(closes, period=20, std_dev=2.2):
+def bollinger_bands(closes, period=20, std_dev=2.0):
     if len(closes) < period:
         return None, None, None
     window = closes[-period:]
@@ -257,7 +268,7 @@ def analyze_candles(candles):
         return None
 
     closes = [c["close"] for c in candles]
-    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, period=20, std_dev=2.2)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, period=20, std_dev=2.0)
     kc_upper, kc_mid, kc_lower = keltner_channels(candles, period=20, multiplier=1.5)
     ema20 = ema(closes, 20)
     rsi = calculate_rsi(closes, 7)
@@ -281,36 +292,30 @@ def analyze_candles(candles):
     strategy_name = ""
 
     # 1. BOLLINGER REVERSAL
-    if (p_close <= bb_lower or l_low <= bb_lower) and l_close > l_open and l_close > bb_lower and l_close < bb_mid:
-        if 24 <= rsi <= 38:
-            direction = "CALL"
-            strategy_name = "BOLLINGER REVERSAL"
-    elif (p_close >= bb_upper or l_high >= bb_upper) and l_close < l_open and l_close < bb_upper and l_close > bb_mid:
-        if 62 <= rsi <= 76:
-            direction = "PUT"
-            strategy_name = "BOLLINGER REVERSAL"
+    if (p_close <= bb_lower or l_low <= bb_lower or l_close <= bb_lower) and l_close > l_open and rsi <= 45:
+        direction = "CALL"
+        strategy_name = "BOLLINGER REVERSAL"
+    elif (p_close >= bb_upper or l_high >= bb_upper or l_close >= bb_upper) and l_close < l_open and rsi >= 55:
+        direction = "PUT"
+        strategy_name = "BOLLINGER REVERSAL"
 
     # 2. EMA 20 + STOCHASTIC PULLBACK
     if direction is None:
-        if l_close > ema20 and p_close < p_open and prev["low"] <= ema20 and l_close > l_open:
-            if k > d and (20 <= k <= 65) and (48 <= rsi <= 65):
-                direction = "CALL"
-                strategy_name = "EMA 20 + STOCH PULLBACK"
-        elif l_close < ema20 and p_close > p_open and prev["high"] >= ema20 and l_close < l_open:
-            if k < d and (35 <= k <= 80) and (35 <= rsi <= 52):
-                direction = "PUT"
-                strategy_name = "EMA 20 + STOCH PULLBACK"
+        if l_close > ema20 and l_close > l_open and k > d and rsi >= 45:
+            direction = "CALL"
+            strategy_name = "EMA 20 + STOCH PULLBACK"
+        elif l_close < ema20 and l_close < l_open and k < d and rsi <= 55:
+            direction = "PUT"
+            strategy_name = "EMA 20 + STOCH PULLBACK"
 
     # 3. KELTNER CHANNEL + CCI BREAKOUT
     if direction is None:
-        if p_close <= kc_upper and l_close > kc_upper and l_close > l_open:
-            if (100 <= cci <= 220) and (52 <= rsi <= 68):
-                direction = "CALL"
-                strategy_name = "KELTNER + CCI BREAKOUT"
-        elif p_close >= kc_lower and l_close < kc_lower and l_close < l_open:
-            if (-220 <= cci <= -100) and (32 <= rsi <= 48):
-                direction = "PUT"
-                strategy_name = "KELTNER + CCI BREAKOUT"
+        if l_close > kc_upper and l_close > l_open and cci >= 80:
+            direction = "CALL"
+            strategy_name = "KELTNER + CCI BREAKOUT"
+        elif l_close < kc_lower and l_close < l_open and cci <= -80:
+            direction = "PUT"
+            strategy_name = "KELTNER + CCI BREAKOUT"
 
     if direction is None:
         return None
@@ -395,19 +400,28 @@ def send_result(symbol, pending, exit_price):
 def get_eligible_symbols():
     data = api_get("/v1/symbols", params={"venue": VENUE})
     eligible = []
+    seen = set()
+
     for item in data.get("symbols", []):
         symbol = item.get("symbol")
-        if symbol not in ALLOWED_PAIRS:
+        if symbol not in ALLOWED_PAIRS or symbol in seen:
             continue
-        if item.get("open") is not True:
+        if item.get("open") is False:
             continue
         try:
-            payout = float(item.get("payout", 85))
+            payout = float(item.get("payout", 85.0))
         except (TypeError, ValueError):
             payout = 85.0
         if payout < MIN_PAYOUT:
             continue
+        seen.add(symbol)
         eligible.append({"symbol": symbol, "payout": payout})
+
+    if not eligible:
+        for symbol in ALLOWED_PAIRS:
+            eligible.append({"symbol": symbol, "payout": 85.0})
+
+    eligible.sort(key=lambda x: (-x["payout"], x["symbol"]))
     return eligible
 
 
@@ -421,7 +435,7 @@ def get_candles(symbol):
     for candle in candles:
         try:
             parsed.append({
-                "time": int(candle["time"]),
+                "time": normalize_ts(candle["time"]),
                 "open": float(candle["open"]),
                 "high": float(candle["high"]),
                 "low": float(candle["low"]),
@@ -452,14 +466,13 @@ def download_all_histories(eligible):
     return histories, ranked
 
 
-def run_live_stream(monitored, histories, deadline):
+def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
     log(f"Opening S30 stream for {len(symbols)} pairs.")
     response = api_get("/v1/stream", params=params, stream=True)
 
-    current_bars = {}
     connected_symbols = set()
     pending_signal = None
     event_name = ""
@@ -469,7 +482,7 @@ def run_live_stream(monitored, histories, deadline):
             now = time.time()
             if now >= deadline:
                 log("Scan completed.")
-                return
+                return "done"
 
             if not raw_line:
                 event_name = ""
@@ -500,12 +513,12 @@ def run_live_stream(monitored, histories, deadline):
                 continue
 
             symbol = data.get("symbol")
-            if symbol not in connected_symbols:
+            if connected_symbols and symbol not in connected_symbols:
                 continue
 
             try:
                 price = float(data["price"])
-                feed_time = int(data["time"])
+                feed_time = normalize_ts(data["time"])
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -520,7 +533,7 @@ def run_live_stream(monitored, histories, deadline):
                             log(f"{symbol}: Entry price set at {format_price(price)}")
                     if pending["entry_price"] is not None and now >= pending["expiry_time"]:
                         send_result(symbol, pending, price)
-                        return
+                        return "done"
                 continue
 
             bucket = (feed_time // TIMEFRAME) * TIMEFRAME
@@ -534,28 +547,27 @@ def run_live_stream(monitored, histories, deadline):
             current = current_bars[symbol]
 
             if bucket > current["time"]:
-                histories[symbol].append(current)
+                histories.setdefault(symbol, []).append(current)
                 histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
 
                 closed_candles = histories.get(symbol, [])
                 signal = analyze_candles(closed_candles)
 
                 if signal:
-                    pair_info = next((item for item in monitored if item["symbol"] == symbol), None)
-                    if pair_info:
-                        detection_time = time.time()
-                        entry_time = make_exact_entry_time(feed_time)
+                    pair_info = next((item for item in monitored if item["symbol"] == symbol), {"symbol": symbol, "payout": 85.0})
+                    detection_time = time.time()
+                    entry_time = make_exact_entry_time(feed_time)
 
-                        send_signal(symbol, pair_info["payout"], signal, detection_time, entry_time)
+                    send_signal(symbol, pair_info["payout"], signal, detection_time, entry_time)
 
-                        pending_signal = {
-                            "symbol": symbol,
-                            "direction": signal["direction"],
-                            "entry_time": entry_time,
-                            "expiry_time": entry_time + EXPIRATION,
-                            "entry_price": None
-                        }
-                        log(f"{symbol}: Signal sent successfully!")
+                    pending_signal = {
+                        "symbol": symbol,
+                        "direction": signal["direction"],
+                        "entry_time": entry_time,
+                        "expiry_time": entry_time + EXPIRATION,
+                        "entry_price": None
+                    }
+                    log(f"{symbol}: Signal sent successfully!")
 
                 current_bars[symbol] = {"time": bucket, "open": price, "high": price, "low": price, "close": price}
             else:
@@ -565,6 +577,8 @@ def run_live_stream(monitored, histories, deadline):
 
     finally:
         response.close()
+
+    return "reconnect"
 
 
 def main():
@@ -583,19 +597,42 @@ def main():
         log("No histories available.")
         return
 
+    current_bars = {}
     deadline = time.time() + MAX_SCAN_SECONDS
 
     reconnects = 0
     while time.time() < deadline:
         try:
-            run_live_stream(ranked, histories, deadline)
-            break
+            status = run_live_stream(ranked, histories, current_bars, deadline)
+            if status == "done":
+                break
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                break
+            wait_sec = min(5.0, max(1.0, deadline - time.time()))
+            log(f"Stream ended. Reconnecting in {wait_sec:.1f}s...")
+            time.sleep(wait_sec)
+        except StreamRateLimitError as e:
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                log("Max reconnects reached after rate limit.")
+                break
+            remaining = deadline - time.time()
+            wait_sec = min(e.retry_after, remaining)
+            if wait_sec <= 2:
+                break
+            log(f"Rate limit hit. Waiting {wait_sec:.1f}s before retry...")
+            time.sleep(wait_sec)
         except Exception as e:
             log(f"Stream error: {e}")
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 break
-            time.sleep(2)
+            remaining = deadline - time.time()
+            wait_sec = min(5.0, max(1.0, remaining))
+            if wait_sec <= 1:
+                break
+            time.sleep(wait_sec)
 
     log(f"{VERSION} finished.")
 
