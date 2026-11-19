@@ -18,26 +18,22 @@ VERSION = "ROMARIO TRADER PRO 15.0 M1"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 60            # Bouji 1 minit
+TIMEFRAME = 60            # Bouji 1 minit (pi estab)
 EXPIRATION = 180          # Ekspirasyon 3 minit
 ENTRY_LEAD = 10
 CANDLE_LIMIT = 100
 MIN_CANDLES = 30
 MIN_PAYOUT = 80.0
-MAX_SCAN_SECONDS = 300    # Tan max pou bot la ap kouri (5 minit)
+MAX_SCAN_MINUTES = 60     # Tan max pou bot la ap kouri (60 minit = 1 èdtan)
+MAX_SCAN_SECONDS = MAX_SCAN_MINUTES * 60
 MAX_RECONNECTS = 5
 
 ALLOWED_PAIRS = {
     "EURUSD_otc",
-    "GBPUSD_otc",
-    "AUDUSD_otc",
-    "USDCAD_otc",
-    "EURJPY_otc",
-    "USDJPY_otc",
-    "GBPJPY_otc",
     "AUDCAD_otc",
     "AUDCHF_otc",
-    "EURGBP_otc"
+    "AUDUSD_otc",
+    "GBPUSD_otc"
 }
 
 API_CONNECT_TIMEOUT = 4
@@ -172,7 +168,7 @@ def send_telegram(message):
 # =====================================================
 # ENDIKATÈ YO (BOLLINGER BANDS AK RSI)
 # =====================================================
-def bollinger_bands(closes, period=20, std_dev=2.5):
+def bollinger_bands(closes, period=20, std_dev=2.0):
     if len(closes) < period:
         return None, None, None
     window = closes[-period:]
@@ -204,14 +200,14 @@ def calculate_rsi(closes, period=7):
 
 
 # =====================================================
-# ANALIZ BOUJI M1 (BOLLINGER 2.5 + RSI 7)
+# ANALIZ BOUJI M1 (BOLLINGER 2.0 + RSI 7)
 # =====================================================
 def analyze_candles(candles):
     if len(candles) < 30:
         return None
 
     closes = [c["close"] for c in candles]
-    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, period=20, std_dev=2.5)
+    bb_upper, bb_mid, bb_lower = bollinger_bands(closes, period=20, std_dev=2.0)
     rsi = calculate_rsi(closes, 7)
 
     if bb_upper is None or rsi is None:
@@ -220,9 +216,9 @@ def analyze_candles(candles):
     prev = candles[-2]
     last = candles[-1]
 
-    # CALL: Pri a te soti/touche anba (2.5) epi bouji M1 ki fèmen an monte anndan
+    # CALL: Pri a te soti/touche anba (2.0) epi bouji M1 ki fèmen an monte anndan
     if (prev["close"] <= bb_lower or prev["low"] <= bb_lower) and last["close"] > last["open"] and last["close"] > bb_lower:
-        if 20 <= rsi <= 48:
+        if 20 <= rsi <= 52:
             return {
                 "direction": "CALL", "score": 6, "rsi": rsi,
                 "k": 0.0, "d": 0.0, "adx": 0.0, "plus_di": 0.0, "minus_di": 0.0,
@@ -230,9 +226,9 @@ def analyze_candles(candles):
                 "close": last["close"], "candle_time": last["time"]
             }
 
-    # PUT: Pri a te soti/touche anwo (2.5) epi bouji M1 ki fèmen an desann anndan
+    # PUT: Pri a te soti/touche anwo (2.0) epi bouji M1 ki fèmen an desann anndan
     if (prev["close"] >= bb_upper or prev["high"] >= bb_upper) and last["close"] < last["open"] and last["close"] < bb_upper:
-        if 52 <= rsi <= 80:
+        if 48 <= rsi <= 80:
             return {
                 "direction": "PUT", "score": 6, "rsi": rsi,
                 "k": 0.0, "d": 0.0, "adx": 0.0, "plus_di": 0.0, "minus_di": 0.0,
@@ -256,7 +252,7 @@ def send_signal(symbol, payout, signal, detection_time, entry_time):
         f"💱 PAIR: {symbol}\n"
         f"💰 PAYOUT: {payout:.1f}%\n"
         f"⏱ TIMEFRAME: M1 | EXPIRATION: {EXPIRATION}s\n"
-        f"🧠 STRATEGY: BB (2.5) REVERSAL + RSI(7)\n\n"
+        f"🧠 STRATEGY: BB (2.0) REVERSAL + RSI(7)\n\n"
         f"📊 RSI: {round(signal['rsi'], 2)}\n\n"
         f"⏰ DETECTED: {signal_dt.strftime('%I:%M:%S %p')}\n"
         f"🎯 EXACT ENTRY: {entry_dt.strftime('%I:%M:%S %p')}\n\n"
