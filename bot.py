@@ -10,12 +10,12 @@ from zoneinfo import ZoneInfo
 
 
 # =========================================================
-# ROMARIO TRADER PRO CLEAN 1.6
+# ROMARIO TRADER PRO CLEAN 1.7
 # OTCharts OTC | M1 | 60s expiration
 # Telegram manual alerts only
 # =========================================================
 
-VERSION = "ROMARIO TRADER PRO CLEAN 1.6"
+VERSION = "ROMARIO TRADER PRO CLEAN 1.7"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -24,30 +24,31 @@ TIMEFRAME = 60
 EXPIRATION = 60
 
 MIN_PAYOUT = 85.0
-MIN_CANDLES = 25
+MIN_CANDLES = 45
 CANDLE_LIMIT = 50
 
 MAX_MARKETS = 15
 
-# Increased from 100 to 180 requests per run.
-# Watch your OTCharts daily plan usage.
-MAX_API_REQUESTS = 180
+# Request protection
+MAX_API_REQUESTS = 100
 
-SCAN_INTERVAL = 10
+# One scan per new M1 candle
 MAX_SCAN_SECONDS = 120
 
 ENTRY_DELAY = 15
 MIN_ENTRY_LEAD = 3
 MAX_ENTRY_LEAD = 80
 
+# Correct EMA order
 EMA_FAST = 9
-EMA_MID = 21
-EMA_SLOW = 20
+EMA_MID = 20
+EMA_SLOW = 40
 
 RSI_PERIOD = 7
 ATR_PERIOD = 14
 
-# Pocket Option OTC timestamp correction.
+# Keep the timestamp correction that matched
+# the previous CLEAN 1.6 logs.
 OTC_TIMESTAMP_OFFSET_SECONDS = 7200
 
 ET = ZoneInfo("America/New_York")
@@ -68,7 +69,7 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "RomarioTrader/1.6"
+    "User-Agent": "RomarioTrader/1.7"
 })
 
 request_count = 0
@@ -87,6 +88,7 @@ def fmt_et(dt):
 
 
 def parse_time(raw):
+
     if raw is None:
         return None
 
@@ -146,7 +148,8 @@ def parse_time(raw):
 # API
 # =========================================================
 
-def api_get(path, params=None, retries=2):
+def api_get(path, params=None, retries=1):
+
     global request_count
 
     for attempt in range(retries + 1):
@@ -170,7 +173,7 @@ def api_get(path, params=None, retries=2):
 
             if response.status_code == 503:
                 log.warning(
-                    "API 503: endpoint or market unavailable: %s",
+                    "API 503: market unavailable: %s",
                     params.get("symbol") if params else path
                 )
                 return None
@@ -227,6 +230,7 @@ def api_get(path, params=None, retries=2):
 # =========================================================
 
 def unwrap(obj):
+
     if isinstance(obj, dict):
         for key in (
             "data",
@@ -245,6 +249,7 @@ def unwrap(obj):
 
 
 def as_list(obj):
+
     obj = unwrap(obj)
 
     if isinstance(obj, list):
@@ -265,6 +270,7 @@ def as_list(obj):
 
 
 def getv(data, keys, default=None):
+
     if not isinstance(data, dict):
         return default
 
@@ -280,6 +286,7 @@ def getv(data, keys, default=None):
 # =========================================================
 
 def symbol_name(row):
+
     if isinstance(row, str):
         return row.strip()
 
@@ -300,6 +307,7 @@ def symbol_name(row):
 
 
 def payout_value(row):
+
     raw = getv(
         row,
         [
@@ -325,6 +333,7 @@ def payout_value(row):
 
 
 def is_open(row):
+
     status = getv(
         row,
         [
@@ -354,6 +363,7 @@ def is_open(row):
 
 
 def fetch_symbols():
+
     raw = api_get(
         "/v1/symbols",
         {"venue": VENUE}
@@ -365,6 +375,7 @@ def fetch_symbols():
     seen = set()
 
     for row in rows:
+
         name = symbol_name(row)
 
         if not name or not name.lower().endswith("_otc"):
@@ -396,24 +407,12 @@ def fetch_symbols():
     )
 
     log.info(
-        "OTC symbols received=%d | eligible payout/open=%d",
+        "OTC symbols received=%d | eligible=%d",
         len(rows),
         len(markets)
     )
 
-    return markets
-
-
-def rotate_markets(markets):
-    if not markets:
-        return []
-
-    bucket = int(now_utc().timestamp() // 300)
-    start = bucket % len(markets)
-
-    rotated = markets[start:] + markets[:start]
-
-    return rotated[:MAX_MARKETS]
+    return markets[:MAX_MARKETS]
 
 
 # =========================================================
@@ -426,6 +425,7 @@ def candle_fields(candle):
         timestamp, open_price, high, low, close = candle[:5]
 
     elif isinstance(candle, dict):
+
         timestamp = getv(
             candle,
             ["timestamp", "time", "date", "datetime", "t"]
@@ -458,6 +458,9 @@ def candle_fields(candle):
         op, hi, lo, cl = values
 
         if min(op, hi, lo, cl) <= 0 or hi < lo:
+            return None
+
+        if hi < max(op, cl) or lo > min(op, cl):
             return None
 
         return {
@@ -546,7 +549,7 @@ def fetch_candles(symbol):
     ]
 
     log.info(
-        "%s: API candles=%d | confirmed closed=%d | latest=%s",
+        "%s: candles=%d | closed=%d | latest=%s",
         symbol,
         len(parsed),
         len(closed),
@@ -561,13 +564,16 @@ def fetch_candles(symbol):
 # =========================================================
 
 def ema(values, period):
+
     if len(values) < period:
         return None
 
-    alpha = 2.0 / (period + 1)
-    result = values[0]
+    # Seed EMA with the first period's SMA.
+    result = sum(values[:period]) / period
 
-    for value in values[1:]:
+    alpha = 2.0 / (period + 1)
+
+    for value in values[period:]:
         result = (
             value * alpha
             + result * (1 - alpha)
@@ -577,6 +583,7 @@ def ema(values, period):
 
 
 def rsi(values, period=7):
+
     if len(values) < period + 1:
         return None
 
@@ -585,21 +592,23 @@ def rsi(values, period=7):
         for i in range(1, len(values))
     ]
 
+    recent = changes[-period:]
+
     gains = [
         max(change, 0.0)
-        for change in changes
+        for change in recent
     ]
 
     losses = [
         max(-change, 0.0)
-        for change in changes
+        for change in recent
     ]
 
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
 
     if avg_loss == 0:
-        return 100.0
+        return 100.0 if avg_gain > 0 else 50.0
 
     rs = avg_gain / avg_loss
 
@@ -607,12 +616,14 @@ def rsi(values, period=7):
 
 
 def atr(candles, period=14):
+
     if len(candles) < period + 1:
         return None
 
     ranges = []
 
     for i in range(1, len(candles)):
+
         current = candles[i]
         previous = candles[i - 1]
 
@@ -628,14 +639,14 @@ def atr(candles, period=14):
 
 
 # =========================================================
-# STRATEGY WITH REJECTION DIAGNOSTICS
+# STRATEGY
 # =========================================================
 
 def analyze(symbol, payout, candles):
 
     if len(candles) < MIN_CANDLES:
         log.info(
-            "%s REJECTED: not enough closed candles (%d/%d)",
+            "%s REJECTED: candles insufficient (%d/%d)",
             symbol,
             len(candles),
             MIN_CANDLES
@@ -648,15 +659,15 @@ def analyze(symbol, payout, candles):
     ]
 
     e9 = ema(closes, EMA_FAST)
-    e21 = ema(closes, EMA_MID)
-    e20 = ema(closes, EMA_SLOW)
+    e20 = ema(closes, EMA_MID)
+    e40 = ema(closes, EMA_SLOW)
 
     rsi_value = rsi(closes, RSI_PERIOD)
     atr_value = atr(candles, ATR_PERIOD)
 
     if any(
         value is None
-        for value in (e9, e21, e20, rsi_value, atr_value)
+        for value in (e9, e20, e40, rsi_value, atr_value)
     ):
         log.info(
             "%s REJECTED: indicator data unavailable",
@@ -677,31 +688,36 @@ def analyze(symbol, payout, candles):
         last["close"] - last["open"]
     )
 
-    if body < atr_value * 0.08:
+    body_ratio = body / atr_value
+
+    # Reject weak or unusually large candles.
+    if body_ratio < 0.08:
         log.info(
-            "%s REJECTED: candle body too weak (body/ATR=%.3f)",
+            "%s REJECTED: weak candle | body/ATR=%.3f",
             symbol,
-            body / atr_value
+            body_ratio
         )
         return None
 
-    if body > atr_value * 1.35:
+    if body_ratio > 1.35:
         log.info(
-            "%s REJECTED: candle body too large (body/ATR=%.3f)",
+            "%s REJECTED: oversized candle | body/ATR=%.3f",
             symbol,
-            body / atr_value
+            body_ratio
         )
         return None
+
+    # Correct EMA alignment:
+    # CALL: EMA9 > EMA20 > EMA40
+    # PUT:  EMA9 < EMA20 < EMA40
 
     bullish_trend = (
-        e9 > e21
-        and e21 >= e20
+        e9 > e20 > e40
         and last["close"] > e9
     )
 
     bearish_trend = (
-        e9 < e21
-        and e21 <= e20
+        e9 < e20 < e40
         and last["close"] < e9
     )
 
@@ -714,11 +730,11 @@ def analyze(symbol, payout, candles):
     )
 
     bullish_rsi = (
-        52 <= rsi_value <= 72
+        52 <= rsi_value <= 70
     )
 
     bearish_rsi = (
-        28 <= rsi_value <= 48
+        30 <= rsi_value <= 48
     )
 
     bullish = (
@@ -740,20 +756,20 @@ def analyze(symbol, payout, candles):
         direction = "PUT"
 
     else:
+
         reasons = []
 
         if not bullish_trend and not bearish_trend:
-            reasons.append("EMA trend not aligned")
-
-        if not bullish_candle and not bearish_candle:
-            reasons.append("neutral candle")
-
-        if not bullish_rsi and not bearish_rsi:
             reasons.append(
-                f"RSI outside entry zones ({rsi_value:.1f})"
+                "EMA alignment not confirmed"
             )
 
-        elif bullish_trend and not bullish_rsi:
+        if not bullish_candle and not bearish_candle:
+            reasons.append(
+                "neutral candle"
+            )
+
+        if bullish_trend and not bullish_rsi:
             reasons.append(
                 f"CALL RSI not confirmed ({rsi_value:.1f})"
             )
@@ -763,30 +779,57 @@ def analyze(symbol, payout, candles):
                 f"PUT RSI not confirmed ({rsi_value:.1f})"
             )
 
+        elif not bullish_rsi and not bearish_rsi:
+            reasons.append(
+                f"RSI outside zones ({rsi_value:.1f})"
+            )
+
         if bullish_trend and not bullish_candle:
-            reasons.append("CALL candle not bullish")
+            reasons.append(
+                "CALL candle not bullish"
+            )
 
         if bearish_trend and not bearish_candle:
-            reasons.append("PUT candle not bearish")
+            reasons.append(
+                "PUT candle not bearish"
+            )
 
         log.info(
-            "%s REJECTED: %s",
+            "%s REJECTED: %s | EMA9=%.6f EMA20=%.6f "
+            "EMA40=%.6f | RSI=%.1f | body/ATR=%.3f",
             symbol,
-            "; ".join(reasons) if reasons else "no complete setup"
+            "; ".join(reasons),
+            e9,
+            e20,
+            e40,
+            rsi_value,
+            body_ratio
         )
 
         return None
 
-    # Technical score only; NOT win probability.
-    score = 65
+    # Technical quality score only.
+    # This is NOT a win probability.
 
-    if body >= atr_value * 0.15:
-        score += 15
+    score = 60
 
-    score += 10 if payout >= 90 else 5
-
-    if body <= atr_value:
+    if body_ratio >= 0.15:
         score += 10
+
+    if body_ratio >= 0.30:
+        score += 5
+
+    if body_ratio <= 1.0:
+        score += 5
+
+    if payout >= 90:
+        score += 5
+
+    if direction == "CALL" and 55 <= rsi_value <= 65:
+        score += 5
+
+    if direction == "PUT" and 35 <= rsi_value <= 45:
+        score += 5
 
     if score < 75:
         log.info(
@@ -797,12 +840,17 @@ def analyze(symbol, payout, candles):
         return None
 
     log.info(
-        "%s SETUP: %s | score=%d | RSI=%.1f | ATR=%.6f",
+        "%s SETUP: %s | score=%d | RSI=%.1f | "
+        "EMA9=%.6f | EMA20=%.6f | EMA40=%.6f | "
+        "body/ATR=%.3f",
         symbol,
         direction,
         score,
         rsi_value,
-        atr_value
+        e9,
+        e20,
+        e40,
+        body_ratio
     )
 
     return {
@@ -884,10 +932,46 @@ def signal_message(signal, entry_time, sent_time):
         f"📊 RSI: {signal['rsi']:.1f}\n"
         f"📩 SIGNAL SENT: {fmt_et(sent_time)}\n"
         f"🎯 ENTRY: {fmt_et(entry_time)}\n\n"
-        f"EMA + RSI + ATR CONFIRMATION\n"
+        f"EMA 9/20/40 + RSI 7 + ATR 14\n"
         f"⚠️ Score is not win probability.\n"
         f"Manual entry only; test on demo first."
     )
+
+
+# =========================================================
+# WAIT FOR NEXT M1 CANDLE
+# =========================================================
+
+def wait_for_next_candle(deadline):
+
+    now = now_utc()
+
+    next_minute = (
+        int(now.timestamp() // 60) + 1
+    ) * 60
+
+    # Wait two seconds after the minute boundary
+    # so the previous M1 candle can be confirmed closed.
+    target = next_minute + 2
+
+    delay = max(
+        1,
+        target - now.timestamp()
+    )
+
+    remaining = deadline - time.monotonic()
+
+    if remaining <= 0:
+        return
+
+    delay = min(delay, remaining)
+
+    log.info(
+        "Waiting %.1f seconds for next M1 candle.",
+        delay
+    )
+
+    time.sleep(delay)
 
 
 # =========================================================
@@ -901,7 +985,9 @@ def main():
         return
 
     if not TG_TOKEN or not TG_CHAT_ID:
-        log.error("TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing.")
+        log.error(
+            "TELEGRAM_TOKEN or TELEGRAM_CHAT_ID is missing."
+        )
         return
 
     log.info("=======================================================")
@@ -909,7 +995,8 @@ def main():
 
     log.info(
         "SETTINGS: M1 | expiry=%ds | payout>=%.1f%% | "
-        "min candles=%d | markets=%d | API cap=%d | scan=%ds",
+        "min candles=%d | markets=%d | API cap=%d | "
+        "scan duration=%ds",
         EXPIRATION,
         MIN_PAYOUT,
         MIN_CANDLES,
@@ -924,15 +1011,13 @@ def main():
         log.error("No eligible OTC symbols found.")
         return
 
-    chosen = rotate_markets(markets)
-
     log.info(
         "Eligible markets=%d | selected=%d",
         len(markets),
-        len(chosen)
+        len(markets)
     )
 
-    for market in chosen:
+    for market in markets:
         log.info(
             "WATCH: %s | PAYOUT %.1f%%",
             market["symbol"],
@@ -946,6 +1031,9 @@ def main():
 
     scan_number = 0
 
+    # Remember the last candle analyzed for each pair.
+    last_analyzed = {}
+
     while (
         time.monotonic() < deadline
         and request_count < MAX_API_REQUESTS
@@ -954,13 +1042,13 @@ def main():
         scan_number += 1
 
         log.info(
-            "----- SCAN CYCLE %d | API requests=%d/%d -----",
+            "----- SCAN CYCLE %d | API=%d/%d -----",
             scan_number,
             request_count,
             MAX_API_REQUESTS
         )
 
-        for market in chosen:
+        for market in markets:
 
             if request_count >= MAX_API_REQUESTS:
                 break
@@ -979,6 +1067,18 @@ def main():
                 )
                 continue
 
+            latest_closed_time = candles[-1]["time"]
+
+            # Never analyze the same closed candle twice.
+            if last_analyzed.get(symbol) == latest_closed_time:
+                log.info(
+                    "%s skipped: candle already analyzed",
+                    symbol
+                )
+                continue
+
+            last_analyzed[symbol] = latest_closed_time
+
             signal = analyze(
                 symbol,
                 market["payout"],
@@ -988,7 +1088,7 @@ def main():
             if signal is None:
                 continue
 
-            # Candle timestamp marks its OPEN.
+            # Candle timestamp represents its OPEN.
             # Entry is 15 seconds after the candle closes.
             entry_time = (
                 signal["candle_time"]
@@ -1008,7 +1108,7 @@ def main():
                 or lead > MAX_ENTRY_LEAD
             ):
                 log.info(
-                    "%s setup rejected: entry is %.1f seconds away",
+                    "%s setup rejected: entry lead %.1f seconds",
                     symbol,
                     lead
                 )
@@ -1045,11 +1145,11 @@ def main():
             )
             break
 
-        time.sleep(SCAN_INTERVAL)
+        if time.monotonic() < deadline:
+            wait_for_next_candle(deadline)
 
     log.info(
-        "SCAN FINISHED | cycles=%d | API requests=%d | "
-        "reason=%s",
+        "SCAN FINISHED | cycles=%d | API requests=%d | reason=%s",
         scan_number,
         request_count,
         (
