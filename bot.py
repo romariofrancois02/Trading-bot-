@@ -18,8 +18,8 @@ VERSION = "ROMARIO TRADER PRO 15.0 M1"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 60            # Retounen nan bouji 1 minit (pi estab)
-EXPIRATION = 180          # Ekspirasyon 3 minit (evite pèdi ak 1 ti bouji)
+TIMEFRAME = 60            # Bouji 1 minit
+EXPIRATION = 180          # Ekspirasyon 3 minit
 ENTRY_LEAD = 10
 CANDLE_LIMIT = 100
 MIN_CANDLES = 30
@@ -211,7 +211,6 @@ def analyze_candles(candles):
         return None
 
     closes = [c["close"] for c in candles]
-    # Bann Bollinger pi laj (2.5) pou sèlman pran vrè ekstrèm yo
     bb_upper, bb_mid, bb_lower = bollinger_bands(closes, period=20, std_dev=2.5)
     rsi = calculate_rsi(closes, 7)
 
@@ -221,9 +220,9 @@ def analyze_candles(candles):
     prev = candles[-2]
     last = candles[-1]
 
-    # CALL: Pri a te soti lwen anba (2.5) epi premye bouji vèt la fèmen anndan
-    if prev["close"] < bb_lower and last["close"] > last["open"] and last["close"] > bb_lower:
-        if 25 <= rsi <= 42:
+    # CALL: Pri a te soti/touche anba (2.5) epi bouji M1 ki fèmen an monte anndan
+    if (prev["close"] <= bb_lower or prev["low"] <= bb_lower) and last["close"] > last["open"] and last["close"] > bb_lower:
+        if 20 <= rsi <= 48:
             return {
                 "direction": "CALL", "score": 6, "rsi": rsi,
                 "k": 0.0, "d": 0.0, "adx": 0.0, "plus_di": 0.0, "minus_di": 0.0,
@@ -231,9 +230,9 @@ def analyze_candles(candles):
                 "close": last["close"], "candle_time": last["time"]
             }
 
-    # PUT: Pri a te soti lwen anwo (2.5) epi premye bouji wouj la fèmen anndan
-    if prev["close"] > bb_upper and last["close"] < last["open"] and last["close"] < bb_upper:
-        if 58 <= rsi <= 75:
+    # PUT: Pri a te soti/touche anwo (2.5) epi bouji M1 ki fèmen an desann anndan
+    if (prev["close"] >= bb_upper or prev["high"] >= bb_upper) and last["close"] < last["open"] and last["close"] < bb_upper:
+        if 52 <= rsi <= 80:
             return {
                 "direction": "PUT", "score": 6, "rsi": rsi,
                 "k": 0.0, "d": 0.0, "adx": 0.0, "plus_di": 0.0, "minus_di": 0.0,
@@ -261,7 +260,7 @@ def send_signal(symbol, payout, signal, detection_time, entry_time):
         f"📊 RSI: {round(signal['rsi'], 2)}\n\n"
         f"⏰ DETECTED: {signal_dt.strftime('%I:%M:%S %p')}\n"
         f"🎯 EXACT ENTRY: {entry_dt.strftime('%I:%M:%S %p')}\n\n"
-        f"⚠️ Antre nan egzakteman fen minit la (egz: XX:XX:50 pou XX:XX:00)."
+        f"⚠️ Antre apre konfimasyon sou fen minit la."
     )
     return send_telegram(message)
 
@@ -461,6 +460,9 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
 
                 closed_candles = histories.get(symbol, [])
+                rsi_now = calculate_rsi([c["close"] for c in closed_candles], 7)
+                log(f"{symbol}: M1 closed | close={format_price(current['close'])} | RSI7={round(rsi_now, 1) if rsi_now is not None else 'NA'}")
+
                 signal = analyze_candles(closed_candles)
 
                 if signal:
