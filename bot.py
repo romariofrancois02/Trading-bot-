@@ -5,16 +5,17 @@ import csv
 import logging
 import requests
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+
 # ============================================================
-# ROMARIO TRADER PRO - CLEAN 1.1
-# M1 | EXPIRATION 60s | EMA PULLBACK
+# ROMARIO TRADER PRO CLEAN 1.2
+# M1 | 60s EXPIRATION | CLOSED CANDLE CONFIRMATION
 # ONE SIGNAL PER RUN | TELEGRAM ALERTS ONLY
 # ============================================================
 
-VERSION = "ROMARIO TRADER PRO CLEAN 1.1"
+VERSION = "ROMARIO TRADER PRO CLEAN 1.2"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -23,7 +24,7 @@ TIMEFRAME = 60
 EXPIRATION = 60
 
 MIN_PAYOUT = 85.0
-MIN_SCORE = 85
+MIN_SCORE = 75
 
 MAX_SYMBOLS = 5
 CANDLE_LIMIT = 150
@@ -32,7 +33,14 @@ MIN_CANDLES = 80
 SCAN_INTERVAL = 5
 MAX_SCAN_SECONDS = 120
 
-ENTRY_DELAY = 10
+# Entry is 15 seconds after the confirmed candle closes.
+ENTRY_DELAY = 15
+
+# Require a few seconds remaining before planned entry.
+MIN_ENTRY_LEAD = 3
+
+# Assumption: OTCharts candle timestamp is candle OPEN time.
+CANDLE_TIMESTAMP_IS_OPEN = True
 
 EMA_FAST = 9
 EMA_MID = 21
@@ -53,6 +61,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+
 # ============================================================
 # SECRETS
 # ============================================================
@@ -72,10 +81,77 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "ROMARIO-TRADER-CLEAN-1.1"
+    "User-Agent": "ROMARIO-TRADER-CLEAN-1.2"
 })
 
 api_requests = 0
+
+
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def now_et():
+    return datetime.now(TZ)
+
+
+def parse_timestamp(value):
+    """
+    Supports Unix seconds, Unix milliseconds,
+    ISO timestamps and datetime strings.
+    """
+
+    if value is None:
+        return None
+
+    try:
+        if isinstance(value, (int, float)):
+            stamp = float(value)
+
+            if stamp > 1000000000000:
+                stamp /= 1000
+
+            return datetime.fromtimestamp(
+                stamp,
+                timezone.utc
+            )
+
+        text = str(value).strip()
+
+        if not text:
+            return None
+
+        try:
+            stamp = float(text)
+
+            if stamp > 1000000000000:
+                stamp /= 1000
+
+            return datetime.fromtimestamp(
+                stamp,
+                timezone.utc
+            )
+
+        except ValueError:
+            pass
+
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+
+        parsed = datetime.fromisoformat(text)
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+
+        return parsed.astimezone(timezone.utc)
+
+    except (ValueError, TypeError, OverflowError):
+        return None
+
 
 # ============================================================
 # OTCHARTS API
@@ -148,7 +224,7 @@ def telegram_send(message):
     if not result.get("ok"):
         raise RuntimeError("Telegram message was not accepted")
 
-    return True
+    return result
 
 
 # ============================================================
@@ -248,10 +324,7 @@ def get_symbols():
 
         payout = normalize_payout(item)
 
-        if payout is None:
-            continue
-
-        if payout < MIN_PAYOUT:
+        if payout is None or payout < MIN_PAYOUT:
             continue
 
         if not symbol_is_open(item):
@@ -313,7 +386,7 @@ def get_candles(symbol):
                 ["timestamp", "time", "ts", "datetime"]
             )
 
-            if h < l:
+            if h < l or h < max(o, c) or l > min(o, c):
                 continue
 
             candles.append({
@@ -327,10 +400,16 @@ def get_candles(symbol):
         except (ValueError, TypeError):
             continue
 
-    # Keep API chronological order.
-    # Do not sort timestamps as strings.
+    # Sort chronologically if timestamps are readable.
+    if candles and all(
+        parse_timestamp(c["timestamp"]) is not None
+        for c in candles
+    ):
+        candles.sort(
+            key=lambda c: parse_timestamp(c["timestamp"])
+        )
 
-    # Remove duplicates only when timestamp exists.
+    # Remove duplicate timestamps.
     unique = []
     seen = set()
 
@@ -348,6 +427,41 @@ def get_candles(symbol):
         unique.append(candle)
 
     return unique
+
+
+def get_closed_candles(candles):
+    """
+    Keep only candles whose full 60-second period
+    has ended.
+
+    This assumes OTCharts timestamps represent
+    the candle opening time.
+    """
+
+    if not CANDLE_TIMESTAMP_IS_OPEN:
+        return []
+
+    current_time = now_utc()
+    closed = []
+
+    for candle in candles:
+        candle_start = parse_timestamp(
+            candle["timestamp"]
+        )
+
+        if candle_start is None:
+            continue
+
+        candle_close = candle_start + timedelta(
+            seconds=TIMEFRAME
+        )
+
+        if candle_close <= current_time:
+            item = dict(candle)
+            item["close_time"] = candle_close
+            closed.append(item)
+
+    return closed
 
 
 # ============================================================
@@ -459,6 +573,68 @@ def candle_quality(current, previous, atr_value, direction):
 
 
 # ============================================================
+# QUALITY SCORE
+# ============================================================
+
+def calculate_quality_score(
+    direction,
+    ema9,
+    ema21,
+    ema50,
+    rsi_value,
+    atr_value,
+    near_ema,
+    body_ratio
+):
+    if atr_value <= 0:
+        return 0
+
+    trend_strength = (
+        abs(ema9 - ema21) +
+        abs(ema21 - ema50)
+    ) / atr_value
+
+    trend_score = min(
+        25,
+        trend_strength * 12.5
+    )
+
+    pullback_score = max(
+        0,
+        20 * (
+            1 - near_ema / (atr_value * 0.40)
+        )
+    )
+
+    target_rsi = 59 if direction == "CALL" else 41
+
+    rsi_score = max(
+        0,
+        15 * (
+            1 - abs(rsi_value - target_rsi) / 18
+        )
+    )
+
+    candle_score = min(
+        20,
+        body_ratio * 20
+    )
+
+    volatility_score = 10
+
+    score = (
+        trend_score
+        + pullback_score
+        + rsi_score
+        + candle_score
+        + volatility_score
+        + 10
+    )
+
+    return round(min(100, score))
+
+
+# ============================================================
 # EMA PULLBACK STRATEGY
 # ============================================================
 
@@ -466,27 +642,21 @@ def analyze_candles(candles, payout):
     if len(candles) < MIN_CANDLES:
         return None
 
-    # The newest candle may still be forming.
-    # Analyze the previous, closed candle.
-    closed = candles[:-1]
-
-    if len(closed) < MIN_CANDLES:
-        return None
-
+    # All candles passed here must already be closed.
     closes = [
         candle["close"]
-        for candle in closed
+        for candle in candles
     ]
 
-    current = closed[-1]
-    previous = closed[-2]
+    current = candles[-1]
+    previous = candles[-2]
 
     ema9 = ema(closes, EMA_FAST)
     ema21 = ema(closes, EMA_MID)
     ema50 = ema(closes, EMA_SLOW)
 
     rsi_value = rsi(closes, RSI_PERIOD)
-    atr_value = atr(closed, ATR_PERIOD)
+    atr_value = atr(candles, ATR_PERIOD)
 
     if any(value is None for value in (
         ema9, ema21, ema50, rsi_value, atr_value
@@ -496,7 +666,6 @@ def analyze_candles(candles, payout):
     if atr_value <= 0 or current["close"] <= 0:
         return None
 
-    # Volatility filter
     atr_ratio = atr_value / current["close"]
 
     if atr_ratio < 0.00005 or atr_ratio > 0.003:
@@ -505,13 +674,20 @@ def analyze_candles(candles, payout):
     if payout < MIN_PAYOUT:
         return None
 
-    direction = None
-    score = 0
-    reasons = []
+    candle_range = current["high"] - current["low"]
 
-    # --------------------------------------------------------
-    # CALL
-    # --------------------------------------------------------
+    if candle_range <= 0:
+        return None
+
+    body_ratio = (
+        abs(current["close"] - current["open"])
+        / candle_range
+    )
+
+    direction = None
+    near_ema = None
+
+    # ---------------- CALL ----------------
 
     if ema9 > ema21 > ema50:
 
@@ -523,7 +699,6 @@ def analyze_candles(candles, payout):
         )
 
         pullback_ok = near_ema <= atr_value * 0.40
-
         rsi_ok = 50 <= rsi_value <= 68
 
         candle_ok = candle_quality(
@@ -546,9 +721,7 @@ def analyze_candles(candles, payout):
         ):
             direction = "CALL"
 
-    # --------------------------------------------------------
-    # PUT
-    # --------------------------------------------------------
+    # ---------------- PUT ----------------
 
     elif ema9 < ema21 < ema50:
 
@@ -560,7 +733,6 @@ def analyze_candles(candles, payout):
         )
 
         pullback_ok = near_ema <= atr_value * 0.40
-
         rsi_ok = 32 <= rsi_value <= 50
 
         candle_ok = candle_quality(
@@ -586,17 +758,16 @@ def analyze_candles(candles, payout):
     if direction is None:
         return None
 
-    # Score is a technical filter score, not win probability.
-    score = 100
-
-    reasons = [
-        "EMA trend aligned",
-        "Pullback confirmed",
-        "RSI momentum confirmed",
-        "Closed candle confirmed",
-        "ATR volatility valid",
-        "Payout passed"
-    ]
+    score = calculate_quality_score(
+        direction,
+        ema9,
+        ema21,
+        ema50,
+        rsi_value,
+        atr_value,
+        near_ema,
+        body_ratio
+    )
 
     if score < MIN_SCORE:
         return None
@@ -610,7 +781,15 @@ def analyze_candles(candles, payout):
         "ema50": ema50,
         "atr": atr_value,
         "candle": current,
-        "reasons": reasons
+        "close_time": current["close_time"],
+        "reasons": [
+            "EMA trend aligned",
+            "Pullback confirmed",
+            "RSI momentum confirmed",
+            "Closed candle confirmed",
+            "ATR volatility valid",
+            "Payout passed"
+        ]
     }
 
 
@@ -618,9 +797,8 @@ def analyze_candles(candles, payout):
 # SIGNAL LOG
 # ============================================================
 
-def save_signal(symbol, payout, analysis, entry_time):
+def save_signal(symbol, payout, analysis, sent_time, entry_time):
     filename = "signals_log.csv"
-
     file_exists = os.path.isfile(filename)
 
     with open(
@@ -634,7 +812,7 @@ def save_signal(symbol, payout, analysis, entry_time):
 
         if not file_exists:
             writer.writerow([
-                "time",
+                "signal_sent",
                 "symbol",
                 "direction",
                 "payout",
@@ -645,7 +823,7 @@ def save_signal(symbol, payout, analysis, entry_time):
             ])
 
         writer.writerow([
-            datetime.now(TZ).isoformat(),
+            sent_time.isoformat(),
             symbol,
             analysis["direction"],
             payout,
@@ -661,40 +839,49 @@ def save_signal(symbol, payout, analysis, entry_time):
 # ============================================================
 
 def build_signal(symbol, payout, analysis):
-    now = datetime.now(TZ)
+    sent_time = now_et()
 
-    entry_time = now + timedelta(
+    candle_close = analysis["close_time"].astimezone(TZ)
+
+    # Entry is 15 seconds after the confirmed candle closes.
+    entry_time = candle_close + timedelta(
         seconds=ENTRY_DELAY
     )
 
-    expiry_time = entry_time + timedelta(
-        seconds=EXPIRATION
-    )
+    if entry_time <= sent_time + timedelta(
+        seconds=MIN_ENTRY_LEAD
+    ):
+        logging.warning(
+            "%s: entry time is too close or already passed.",
+            symbol
+        )
+        return None, None, None
 
     if analysis["direction"] == "CALL":
         direction_text = "🟢 CALL"
     else:
         direction_text = "🔴 PUT"
 
-    if analysis["score"] >= 90:
-        quality = "HIGH"
-    else:
-        quality = "GOOD"
+    quality = (
+        "HIGH"
+        if analysis["score"] >= 85
+        else "GOOD"
+    )
 
     message = (
         "🤖 ROMARIO TRADER\n\n"
-        f"{direction_text} | {symbol}\n"
-        f"⭐ QUALITY: {quality} ({analysis['score']}/100)\n"
+        f"{direction_text} | #{symbol}\n"
+        f"⭐ QUALITY: {quality}\n"
         "⏱ TIMEFRAME: 1M\n"
         "⌛ EXPIRATION: 1M\n"
         f"💰 PAYOUT: {payout:.1f}%\n"
-        f"🎯 ENTRY: {entry_time.strftime('%H:%M:%S')} ET\n"
-        f"🏁 EXPIRY: {expiry_time.strftime('%H:%M:%S')} ET\n\n"
+        f"📩 SIGNAL SENT: {sent_time.strftime('%H:%M:%S')} ET\n"
+        f"🎯 ENTRY: {entry_time.strftime('%H:%M:%S')} ET\n\n"
         "EMA + PULLBACK + RSI CONFIRMED\n"
-        "⚠️ Technical score is not a win probability."
+        "⚠️ Quality is a technical score, not win probability."
     )
 
-    return message, entry_time
+    return message, sent_time, entry_time
 
 
 # ============================================================
@@ -708,10 +895,10 @@ def main():
     logging.info("EXPIRATION: %s seconds", EXPIRATION)
     logging.info("MIN PAYOUT: %s%%", MIN_PAYOUT)
     logging.info("MIN SCORE: %s", MIN_SCORE)
+    logging.info("ENTRY DELAY: %s seconds after candle close", ENTRY_DELAY)
     logging.info("MAX SIGNALS PER RUN: 1")
     logging.info("=" * 55)
 
-    # Load markets
     try:
         markets = get_symbols()
 
@@ -725,7 +912,6 @@ def main():
             "ROMARIO TRADER\n"
             "OTCharts pa kapab chaje mache yo."
         )
-
         return
 
     if not markets:
@@ -737,13 +923,9 @@ def main():
             "ROMARIO TRADER\n"
             "Pa gen mache OTC ki pase filtè 85% la."
         )
-
         return
 
-    logging.info(
-        "Markets selected: %s",
-        len(markets)
-    )
+    logging.info("Markets selected: %s", len(markets))
 
     for market in markets:
         logging.info(
@@ -755,11 +937,9 @@ def main():
     start_time = time.time()
     scanned_candles = {}
 
-    # Scan for up to two minutes.
     while time.time() - start_time < MAX_SCAN_SECONDS:
 
         for market in markets:
-
             symbol = market["symbol"]
             payout = market["payout"]
 
@@ -774,18 +954,20 @@ def main():
                     )
                     continue
 
-                # Use timestamp to avoid analyzing the same
-                # closed candle repeatedly.
-                closed_candle = candles[-2]
-                candle_key = closed_candle["timestamp"]
+                closed = get_closed_candles(candles)
 
-                if candle_key is None:
-                    candle_key = (
-                        str(closed_candle["open"])
-                        + str(closed_candle["close"])
+                if len(closed) < MIN_CANDLES:
+                    logging.info(
+                        "%s: not enough confirmed closed candles (%s)",
+                        symbol,
+                        len(closed)
                     )
+                    continue
 
-                candle_key = str(candle_key)
+                current_closed = closed[-1]
+                candle_key = str(
+                    current_closed["timestamp"]
+                )
 
                 if scanned_candles.get(symbol) == candle_key:
                     continue
@@ -793,7 +975,7 @@ def main():
                 scanned_candles[symbol] = candle_key
 
                 analysis = analyze_candles(
-                    candles,
+                    closed,
                     payout
                 )
 
@@ -804,11 +986,18 @@ def main():
                     )
                     continue
 
-                message, entry_time = build_signal(
+                message, sent_time, entry_time = build_signal(
                     symbol,
                     payout,
                     analysis
                 )
+
+                if message is None:
+                    logging.info(
+                        "%s: signal too late for planned entry",
+                        symbol
+                    )
+                    continue
 
                 logging.info(
                     "VALID SIGNAL: %s %s SCORE=%s",
@@ -817,18 +1006,18 @@ def main():
                     analysis["score"]
                 )
 
-                # Send one signal only.
                 telegram_send(message)
 
                 save_signal(
                     symbol,
                     payout,
                     analysis,
+                    sent_time,
                     entry_time
                 )
 
                 logging.info(
-                    "Telegram signal sent. Stopping this run."
+                    "Telegram signal sent successfully. Stopping run."
                 )
 
                 return
@@ -866,10 +1055,10 @@ def main():
         )
 
     logging.info(
-        "Scan ended: no setup passed the filter."
+        "Scan ended: no valid setup found."
     )
 
-    # No signal and no false WIN/LOSS message.
+    # No fabricated WIN/LOSS message.
     return
 
 
