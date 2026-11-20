@@ -387,9 +387,13 @@ def run_live_stream(monitored, histories, current_bars, deadline):
         for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
             now = time.time()
 
+            if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
+                log("Single signal completed. Stopping bot.")
+                return "stop"
+
             if pending is None and now >= deadline:
                 log("Scan window ended with no signal.")
-                return "done"
+                return "stop"
 
             if not raw_line:
                 event_name = ""
@@ -449,11 +453,12 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                             send_telegram_fn
                         )
                         log(f"{symbol}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
-                        return "done"
+                        return "stop"
                 continue
 
             if signals_sent >= MAX_SIGNALS_PER_RUN:
-                return "done"
+                log("Single signal limit reached. Stopping bot.")
+                return "stop"
 
             bucket = (feed_time // TIMEFRAME) * TIMEFRAME
 
@@ -490,7 +495,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "expiry_time": entry_ts + EXPIRATION,
                                 "entry_price": None
                             }
-                            log(f"{symbol}: Signal sent ({signal_data['direction']}) -> Entry {entry_time_str}")
+                            log(f"{symbol}: Single signal sent ({signal_data['direction']}) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
 
             if bucket > current["time"]:
                 clean_bar = {
@@ -514,7 +519,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     finally:
         response.close()
 
-    return "reconnect"
+    return "stop" if signals_sent >= MAX_SIGNALS_PER_RUN else "reconnect"
 
 
 def main():
@@ -542,7 +547,7 @@ def main():
         stream_subset = ranked[:active_limit]
         try:
             status = run_live_stream(stream_subset, histories, current_bars, deadline)
-            if status == "done":
+            if status in ("done", "stop"):
                 break
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
