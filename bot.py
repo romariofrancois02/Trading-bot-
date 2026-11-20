@@ -22,6 +22,7 @@ MIN_PAYOUT = 85.0         # Mache 85% ou plis
 ENTRY_LEAD = 12           # Avèti w 12 segonn anvan bouji a louvri (10-15s)
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
+MAX_STREAM_PAIRS = 4      # Limit ki pi stab pou /v1/stream
 
 CANDLE_LIMIT = 80
 MIN_CANDLES = 35
@@ -59,6 +60,10 @@ class StreamRateLimitError(Exception):
     def __init__(self, message, retry_after=30):
         super().__init__(message)
         self.retry_after = retry_after
+
+
+class StreamBadRequestError(Exception):
+    pass
 
 
 def log(message):
@@ -102,6 +107,15 @@ def api_get(path, params=None, stream=False):
                 stream=stream
             )
 
+            if response.status_code == 400 and stream:
+                body = ""
+                try:
+                    body = response.text[:160]
+                except Exception:
+                    pass
+                response.close()
+                raise StreamBadRequestError(f"400 Bad Request: {body}")
+
             if response.status_code == 429:
                 retry_hdr = response.headers.get("Retry-After", "30")
                 try:
@@ -122,7 +136,7 @@ def api_get(path, params=None, stream=False):
                 return response
             return response.json()
 
-        except StreamRateLimitError:
+        except (StreamRateLimitError, StreamBadRequestError):
             raise
         except Exception:
             if response is not None:
@@ -229,28 +243,21 @@ def evaluate_real_market(candles):
     if any(v is None for v in (ema9, ema21, rsi)):
         return None
 
-    prev = candles[-2]   # Bouji ki fèk fèmen an
-    curr = candles[-1]   # Bouji ki fèk fòme / aktyèl la
+    prev = candles[-2]
+    curr = candles[-1]
 
-    # Evite mache ki plat nèt (ADX < 18)
     if adx < 18:
         return None
 
     direction = None
 
     # ---------------- CALL (TANDANS MONTE + REBOND) ----------------
-    # 1. Tandans monte reyèl (EMA 9 > EMA 21)
-    # 2. Bouji anvan an te rale dèyè (wouj) vin touche EMA 9
-    # 3. Bouji aktyèl la rekòmanse monte (vèt) ak RSI ki gen fòs (48-66)
     if (ema9 > ema21 and prev["close"] < prev["open"] and prev["low"] <= ema9
             and curr["close"] > curr["open"] and curr["close"] > ema9
             and 48 <= rsi <= 66):
         direction = "CALL"
 
     # ---------------- PUT (TANDANS DESANN + REBOND) ----------------
-    # 1. Tandans desann reyèl (EMA 9 < EMA 21)
-    # 2. Bouji anvan an te rale dèyè (vèt) vin touche EMA 9
-    # 3. Bouji aktyèl la rekòmanse desann (wouj) ak RSI ki gen fòs (34-52)
     elif (ema9 < ema21 and prev["close"] > prev["open"] and prev["high"] >= ema9
             and curr["close"] < curr["open"] and curr["close"] < ema9
             and 34 <= rsi <= 52):
@@ -259,7 +266,6 @@ def evaluate_real_market(candles):
     if direction is None:
         return None
 
-    # Evalyasyon Nivo Konfyans (Reyèl, pa o aza)
     if adx >= 24 and ((direction == "CALL" and 52 <= rsi <= 62) or (direction == "PUT" and 38 <= rsi <= 48)):
         confidence = "🟢 TRÈ SOLID (Bon anpil)"
         score = 6
@@ -292,7 +298,6 @@ def format_signal_message(pair, payout, entry_time_str, signal_data):
 
 
 def handle_trade_result(pair, payout, is_win, send_fn):
-    # Règ #3: Voye mesaj SÈLMAN si trade la WIN. Si l LOSS, pa voye anyen.
     if is_win:
         msg = f"✅ REZILTA: WIN | {pair} (+{payout:.0f}%)"
         send_fn(msg)
@@ -361,6 +366,8 @@ def download_all_histories(eligible):
                     ranked.append(item)
             except Exception:
                 pass
+
+    ranked.sort(key=lambda x: (-x["payout"], x["symbol"]))
     return histories, ranked
 
 
@@ -424,7 +431,6 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             now = time.time()
 
-            # Siveye trade ki voye a sou ekspirasyon 60s
             if pending is not None:
                 if symbol == pending["symbol"]:
                     if pending["entry_price"] is None and now >= pending["entry_time"]:
@@ -460,7 +466,6 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             current = current_bars[symbol]
 
-            # Alèt `ENTRY_LEAD` segonn anvan bouji M1 k ap fòme a fèmen
             seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
             if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
                 current["evaluated_preclose"] = True
@@ -471,7 +476,6 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     if signal_data:
                         pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
-                        # Antre lè pwochen bouji M1 lan louvri (apre ~ENTRY_LEAD segonn)
                         entry_ts = current["time"] + TIMEFRAME
                         entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
 
@@ -529,13 +533,15 @@ def main():
         log("No candle history available.")
         return
 
+    active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     current_bars = {}
     deadline = time.time() + MAX_WAIT_SECONDS
 
     reconnects = 0
     while time.time() < deadline:
+        stream_subset = ranked[:active_limit]
         try:
-            status = run_live_stream(ranked, histories, current_bars, deadline)
+            status = run_live_stream(stream_subset, histories, current_bars, deadline)
             if status == "done":
                 break
             reconnects += 1
@@ -544,6 +550,14 @@ def main():
             wait_sec = min(4.0, max(1.0, deadline - time.time()))
             log(f"Reconnecting in {wait_sec:.1f}s...")
             time.sleep(wait_sec)
+        except StreamBadRequestError as e:
+            log(f"Stream error: {e}")
+            if active_limit > 1:
+                active_limit -= 1
+                log(f"Reducing stream batch to {active_limit} pairs and retrying...")
+                time.sleep(1.0)
+                continue
+            break
         except StreamRateLimitError as e:
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
