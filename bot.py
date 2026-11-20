@@ -246,27 +246,27 @@ def evaluate_real_market(candles):
     prev = candles[-2]
     curr = candles[-1]
 
-    if adx < 18:
+    if adx < 13:
         return None
 
     direction = None
 
     # ---------------- CALL (TANDANS MONTE + REBOND) ----------------
-    if (ema9 > ema21 and prev["close"] < prev["open"] and prev["low"] <= ema9
+    if (ema9 > ema21 and prev["low"] <= ema9
             and curr["close"] > curr["open"] and curr["close"] > ema9
-            and 48 <= rsi <= 66):
+            and 42 <= rsi <= 72):
         direction = "CALL"
 
     # ---------------- PUT (TANDANS DESANN + REBOND) ----------------
-    elif (ema9 < ema21 and prev["close"] > prev["open"] and prev["high"] >= ema9
+    elif (ema9 < ema21 and prev["high"] >= ema9
             and curr["close"] < curr["open"] and curr["close"] < ema9
-            and 34 <= rsi <= 52):
+            and 28 <= rsi <= 58):
         direction = "PUT"
 
     if direction is None:
         return None
 
-    if adx >= 24 and ((direction == "CALL" and 52 <= rsi <= 62) or (direction == "PUT" and 38 <= rsi <= 48)):
+    if adx >= 20 and ((direction == "CALL" and 48 <= rsi <= 66) or (direction == "PUT" and 34 <= rsi <= 52)):
         confidence = "🟢 TRÈ SOLID (Bon anpil)"
         score = 6
     else:
