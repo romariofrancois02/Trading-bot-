@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import time
 import logging
@@ -448,7 +449,7 @@ def download_all_histories(eligible):
 
 def finalize_pending_trade(pending, last_prices):
     sym = pending["symbol"]
-    entry_price = pending["entry_price"]
+    entry_price = pending["entry_price"] if pending["entry_price"] is not None else pending["last_price"]
     exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
 
     if entry_price is not None and exit_price is not None:
@@ -627,17 +628,17 @@ def main():
     log(f"{VERSION} starting...")
     if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Credentials missing!")
-        return
+        sys.exit(1)
 
     eligible = get_eligible_symbols()
     if not eligible:
         log("No pairs >= 85% open right now.")
-        return
+        sys.exit(0)
 
     histories, ranked = download_all_histories(eligible)
     if not ranked:
         log("No candle history available.")
-        return
+        sys.exit(0)
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     current_bars = {}
@@ -649,7 +650,9 @@ def main():
         try:
             status = run_live_stream(stream_subset, histories, current_bars, deadline)
             if status in ("done", "stop"):
-                break
+                log(f"{VERSION} finished.")
+                sys.stdout.flush()
+                os._exit(0)
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 break
@@ -684,6 +687,8 @@ def main():
             time.sleep(wait_sec)
 
     log(f"{VERSION} finished.")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
