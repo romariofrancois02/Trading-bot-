@@ -11,28 +11,25 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# ROMARIO TRADER PRO - TREND LINE ADVANCED ONLY
-# M1 | EXP 1M | 85%+ PAYOUT | 1 SIGNAL / RUN
+# 1. PARAMÈT JENERAL (M1, EXP 1M, PAYOUT >= 85%, 1 SIGNAL/RUN)
 # =====================================================
-
-VERSION = "ROMARIO PRO M1 TREND LINE ADV 2.0"
+VERSION = "ROMARIO PRO M1 - TRENDLINE ADV"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-
-TIMEFRAME = 60
-EXPIRATION = 60
-MIN_PAYOUT = 85.0
-
-ENTRY_LEAD = 12
-MAX_SIGNALS_PER_RUN = 1
-MAX_WAIT_SECONDS = 180
-MAX_STREAM_PAIRS = 4
+TIMEFRAME = 60            # Bouji 1 minit
+EXPIRATION = 60           # Ekspirasyon 1 minit
+MIN_PAYOUT = 85.0         # Mache 85% ou plis
+ENTRY_LEAD = 12           # Avèti w 12 segonn anvan bouji a louvri (10-15s)
+MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
+MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
+MAX_STREAM_PAIRS = 4      # Limit ki pi stab pou /v1/stream
 
 CANDLE_LIMIT = 80
 MIN_CANDLES = 30
 MAX_RECONNECTS = 4
 
+# Pè klasik ki pi estab (evite pè ekzotik ki manipile)
 VALID_PAIRS = {
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
     "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
@@ -44,7 +41,7 @@ API_CONNECT_TIMEOUT = 4
 API_READ_TIMEOUT = 10
 
 TELEGRAM_ATTEMPTS = 3
-TELEGRAM_TIMEOUT = (3, 5)
+TELEGRAM_TIMEOUT = (1, 2)
 
 TIMEZONE = ZoneInfo("America/New_York")
 
@@ -84,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioTrendLineAdv/2.0",
+            "User-Agent": "RomarioTrendLineAdv/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -94,17 +91,12 @@ def format_price(value):
     return f"{float(value):.8f}".rstrip("0").rstrip(".")
 
 
-# =====================================================
-# API
-# =====================================================
-
 def api_get(path, params=None, stream=False):
     url = BASE_URL + path
     attempts = 1 if stream else 2
 
     for attempt in range(1, attempts + 1):
         response = None
-
         try:
             response = get_session().get(
                 url,
@@ -117,9 +109,13 @@ def api_get(path, params=None, stream=False):
             )
 
             if response.status_code == 400 and stream:
-                body = response.text[:160]
+                body = ""
+                try:
+                    body = response.text[:160]
+                except Exception:
+                    pass
                 response.close()
-                raise StreamBadRequestError(body)
+                raise StreamBadRequestError(f"400 Bad Request: {body}")
 
             if response.status_code == 429:
                 retry_hdr = response.headers.get("Retry-After", "30")
@@ -127,130 +123,81 @@ def api_get(path, params=None, stream=False):
                     retry_after = max(25, int(float(retry_hdr)))
                 except (TypeError, ValueError):
                     retry_after = 30
-
                 response.close()
-                raise StreamRateLimitError(
-                    "Rate limit", retry_after
-                )
+                raise StreamRateLimitError("Rate limit", retry_after)
 
             if response.status_code in (401, 402, 403, 500, 502, 503, 504):
                 if attempt < attempts:
                     response.close()
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     continue
 
             response.raise_for_status()
-
             if stream:
                 return response
-
             return response.json()
 
         except (StreamRateLimitError, StreamBadRequestError):
             raise
-
         except Exception:
             if response is not None:
                 response.close()
-
             if attempt >= attempts:
                 raise
+            time.sleep(0.3)
 
-            time.sleep(0.5)
+    raise RuntimeError("Request failed.")
 
-    raise RuntimeError("API request failed")
-
-
-# =====================================================
-# TELEGRAM
-# =====================================================
 
 def send_telegram_fn(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Telegram credentials missing.")
         return False
 
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendMessage"
-    )
-
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
         response = None
-
         try:
             response = requests.post(
                 url,
-                json={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "text": message
-                },
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
                 timeout=TELEGRAM_TIMEOUT
             )
-
             if response.ok:
                 return True
-
-            log(f"Telegram HTTP error: {response.status_code}")
-
-        except Exception as e:
-            log(f"Telegram attempt {attempt}: {e}")
-
+        except Exception:
+            pass
         finally:
             if response is not None:
                 response.close()
-
-        time.sleep(0.5)
-
+        time.sleep(0.2)
     return False
 
 
 # =====================================================
-# RSI 7
+# 2. KALKIL RSI AK TREND LINE ADVANCED
 # =====================================================
-
 def calc_rsi(closes, period=7):
     if len(closes) < period + 1:
         return None
-
-    gains = []
-    losses = []
-
+    gains, losses = [], []
     for i in range(1, len(closes)):
         diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0.0))
-        losses.append(max(-diff, 0.0))
-
+        gains.append(max(diff, 0))
+        losses.append(max(-diff, 0))
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
-
     for i in range(period, len(gains)):
-        avg_gain = (
-            (avg_gain * (period - 1)) + gains[i]
-        ) / period
-
-        avg_loss = (
-            (avg_loss * (period - 1)) + losses[i]
-        ) / period
-
-    if avg_gain == 0 and avg_loss == 0:
-        return 50.0
-
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
     if avg_loss == 0:
         return 100.0
-
     rs = avg_gain / avg_loss
-
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-# =====================================================
-# TRENDLINE MATHEMATICS
-# =====================================================
-
 def fit_trendline(points):
     n = len(points)
-
     if n < 2:
         return None
 
@@ -260,24 +207,16 @@ def fit_trendline(points):
     sum_xx = sum(p[0] * p[0] for p in points)
 
     denom = (n * sum_xx) - (sum_x * sum_x)
-
     if denom == 0:
         return None
 
-    slope = (
-        (n * sum_xy) - (sum_x * sum_y)
-    ) / denom
-
+    slope = ((n * sum_xy) - (sum_x * sum_y)) / denom
     intercept = (sum_y - (slope * sum_x)) / n
-
     return slope, intercept
 
 
 def build_trendlines(window):
-    # Dènye bouji a se bouji k ap fòme.
-    # Nou pa sèvi avè l pou jwenn pivot.
     base = window[:-1]
-
     if len(base) < 12:
         return None, None
 
@@ -285,95 +224,48 @@ def build_trendlines(window):
     high_pivots = []
 
     for i in range(1, len(base) - 1):
+        if base[i]["low"] <= base[i - 1]["low"] and base[i]["low"] <= base[i + 1]["low"]:
+            low_pivots.append((i, base[i]["low"]))
+        if base[i]["high"] >= base[i - 1]["high"] and base[i]["high"] >= base[i + 1]["high"]:
+            high_pivots.append((i, base[i]["high"]))
 
-        if (
-            base[i]["low"] <= base[i - 1]["low"]
-            and base[i]["low"] <= base[i + 1]["low"]
-        ):
-            low_pivots.append(
-                (i, base[i]["low"])
-            )
-
-        if (
-            base[i]["high"] >= base[i - 1]["high"]
-            and base[i]["high"] >= base[i + 1]["high"]
-        ):
-            high_pivots.append(
-                (i, base[i]["high"])
-            )
-
-    # Fallback pou jwenn 2 pivot low
     if len(low_pivots) < 2:
-
-        start = max(0, len(base) - 16)
-
         sorted_lows = sorted(
-            [
-                (i, base[i]["low"])
-                for i in range(start, len(base))
-            ],
+            [(i, base[i]["low"]) for i in range(max(0, len(base) - 16), len(base))],
             key=lambda t: t[1]
         )[:2]
-
-        low_pivots = sorted(
-            sorted_lows,
-            key=lambda t: t[0]
-        )
-
+        low_pivots = sorted(sorted_lows, key=lambda t: t[0])
     else:
         low_pivots = low_pivots[-3:]
 
-    # Fallback pou jwenn 2 pivot high
     if len(high_pivots) < 2:
-
-        start = max(0, len(base) - 16)
-
         sorted_highs = sorted(
-            [
-                (i, base[i]["high"])
-                for i in range(start, len(base))
-            ],
+            [(i, base[i]["high"]) for i in range(max(0, len(base) - 16), len(base))],
             key=lambda t: t[1],
             reverse=True
         )[:2]
-
-        high_pivots = sorted(
-            sorted_highs,
-            key=lambda t: t[0]
-        )
-
+        high_pivots = sorted(sorted_highs, key=lambda t: t[0])
     else:
         high_pivots = high_pivots[-3:]
 
     last_idx = len(window) - 1
-
     support_line = None
     resistance_line = None
 
-    # SUPPORT
     fit_sup = fit_trendline(low_pivots)
-
     if fit_sup is not None:
         sup_slope, sup_intercept = fit_sup
-        sup_val = (
-            sup_slope * last_idx
-        ) + sup_intercept
-
+        sup_val = (sup_slope * last_idx) + sup_intercept
         support_line = {
             "slope": sup_slope,
             "value": sup_val,
             "pivots": len(low_pivots)
         }
 
-    # RESISTANCE
     fit_res = fit_trendline(high_pivots)
-
     if fit_res is not None:
         res_slope, res_intercept = fit_res
-        res_val = (
-            res_slope * last_idx
-        ) + res_intercept
-
+        res_val = (res_slope * last_idx) + res_intercept
         resistance_line = {
             "slope": res_slope,
             "value": res_val,
@@ -384,88 +276,44 @@ def build_trendlines(window):
 
 
 # =====================================================
-# TREND LINE ADVANCED — SÈL STRATEJI
+# 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN
 # =====================================================
-
 def evaluate_real_market(candles):
-
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
     window = candles[-25:]
-
-    closes = [
-        c["close"] for c in window
-    ]
-
+    closes = [c["close"] for c in window]
     rsi = calc_rsi(closes, 7)
-
     if rsi is None:
-        return None, "RSI unavailable"
+        return None, "rsi unavailable"
 
     support_line, resistance_line = build_trendlines(window)
-
     prev = window[-2]
     curr = window[-1]
 
-    avg_range = sum(
-        max(c["high"] - c["low"], 1e-12)
-        for c in window[-10:]
-    ) / 10.0
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    tol = avg_range * 0.65
 
-    tolerance = avg_range * 0.65
-
-    sup_slope = (
-        support_line["slope"]
-        if support_line else 0.0
-    )
-
-    res_slope = (
-        resistance_line["slope"]
-        if resistance_line else 0.0
-    )
-
-    diag = (
-        f"RSI={rsi:.1f} "
-        f"SUP={sup_slope:.3e} "
-        f"RES={res_slope:.3e}"
-    )
+    sup_slope = support_line["slope"] if support_line else 0.0
+    res_slope = resistance_line["slope"] if resistance_line else 0.0
+    diag = f"RSI={rsi:.1f} sup_m={sup_slope:.2e} res_m={res_slope:.2e}"
 
     direction = None
     solid_hit = False
 
-    # -------------------------------------------------
-    # CALL — SUPPORT TRENDLINE
-    # -------------------------------------------------
-
-    if (
-        support_line is not None
-        and support_line["slope"] >= 0
-    ):
-
+    # ---------------- CALL: TREND LINE SIPÒ ----------------
+    if support_line is not None and support_line["slope"] >= 0:
         sup_val = support_line["value"]
-
-        near_support = (
-            prev["low"] <= sup_val + tolerance
-            or prev["close"] <= sup_val + tolerance
-            or curr["low"] <= sup_val + tolerance
+        near_sup = (
+            prev["low"] <= sup_val + tol
+            or prev["close"] <= sup_val + tol
+            or curr["low"] <= sup_val + tol
         )
+        bullish_move = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.5))
 
-        bullish_move = (
-            curr["close"] > curr["open"]
-            and curr["close"] >= (
-                sup_val - (tolerance * 0.5)
-            )
-        )
-
-        if (
-            near_support
-            and bullish_move
-            and 15 <= rsi <= 75
-        ):
-
+        if near_sup and bullish_move and 15 <= rsi <= 75:
             direction = "CALL"
-
             solid_hit = (
                 support_line["slope"] > 0
                 and support_line["pivots"] >= 2
@@ -473,39 +321,18 @@ def evaluate_real_market(candles):
                 and 35 <= rsi <= 68
             )
 
-    # -------------------------------------------------
-    # PUT — RESISTANCE TRENDLINE
-    # -------------------------------------------------
-
-    if (
-        direction is None
-        and resistance_line is not None
-        and resistance_line["slope"] <= 0
-    ):
-
+    # ---------------- PUT: TREND LINE REZISTANS ----------------
+    if direction is None and resistance_line is not None and resistance_line["slope"] <= 0:
         res_val = resistance_line["value"]
-
-        near_resistance = (
-            prev["high"] >= res_val - tolerance
-            or prev["close"] >= res_val - tolerance
-            or curr["high"] >= res_val - tolerance
+        near_res = (
+            prev["high"] >= res_val - tol
+            or prev["close"] >= res_val - tol
+            or curr["high"] >= res_val - tol
         )
+        bearish_move = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.5))
 
-        bearish_move = (
-            curr["close"] < curr["open"]
-            and curr["close"] <= (
-                res_val + (tolerance * 0.5)
-            )
-        )
-
-        if (
-            near_resistance
-            and bearish_move
-            and 25 <= rsi <= 85
-        ):
-
+        if near_res and bearish_move and 25 <= rsi <= 85:
             direction = "PUT"
-
             solid_hit = (
                 resistance_line["slope"] < 0
                 and resistance_line["pivots"] >= 2
@@ -513,22 +340,14 @@ def evaluate_real_market(candles):
                 and 32 <= rsi <= 65
             )
 
-    # -------------------------------------------------
-    # NO SIGNAL
-    # -------------------------------------------------
-
     if direction is None:
         return None, diag
 
-    # -------------------------------------------------
-    # SIGNAL CLASSIFICATION
-    # -------------------------------------------------
-
     if solid_hit:
-        confidence = "🟢 TRÈ SOLID"
+        confidence = "🟢 TRÈ SOLID (Bon anpil)"
         score = 6
     else:
-        confidence = "🟡 RISKE"
+        confidence = "🟡 RISKE (Fè pridan)"
         score = 5
 
     return {
@@ -542,337 +361,152 @@ def evaluate_real_market(candles):
 
 
 # =====================================================
-# TELEGRAM SIGNAL FORMAT
+# 4. FORMAT MESAJ TELEGRAM SENP & RÈG WIN SÈLMAN
 # =====================================================
-
-def format_signal_message(
-    pair,
-    payout,
-    entry_time_str,
-    signal_data
-):
-
-    emoji = (
-        "🟢"
-        if signal_data["direction"] == "CALL"
-        else "🔴"
-    )
-
+def format_signal_message(pair, payout, entry_time_str, signal_data):
+    emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
     return (
-        f"🤖 ROMARIO TRADER PRO TREND LINE ADV\n\n"
-        f"{emoji} {signal_data['direction']}\n"
-        f"💱 PAIR: {pair}\n"
-        f"⭐ SCORE: {signal_data['score']}/6\n"
-        f"🛡️ STATUS: {signal_data['confidence']}\n"
-        f"📊 RSI 7: {signal_data['rsi']}\n"
-        f"💰 PAYOUT: {payout:.1f}%\n"
-        f"⏱ TIMEFRAME: 1M\n"
-        f"⌛ EXPIRATION: 1M\n"
-        f"🎯 ENTRY: {entry_time_str}\n\n"
-        f"📈 TRENDLINE SUPPORT/RESISTANCE\n"
-        f"⚠️ Score is not win probability.\n"
-        f"Manual entry only. Demo recommended."
+        f"🤖 ROMARIO PRO M1\n\n"
+        f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
+        f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
+        f"🛡️ Konfyans: {signal_data['confidence']}"
     )
 
 
-# =====================================================
-# MARKET LIST
-# =====================================================
+def handle_trade_result(pair, payout, is_win, send_fn):
+    if is_win:
+        msg = f"✅ REZILTA: WIN | {pair} (+{payout:.0f}%)"
+        send_fn(msg)
+
 
 def get_eligible_symbols():
-
-    data = api_get(
-        "/v1/symbols",
-        params={"venue": VENUE}
-    )
-
+    data = api_get("/v1/symbols", params={"venue": VENUE})
     eligible = []
     seen = set()
 
     for item in data.get("symbols", []):
-
         symbol = item.get("symbol")
-
-        if symbol not in VALID_PAIRS:
+        if symbol not in VALID_PAIRS or symbol in seen:
             continue
-
-        if symbol in seen:
-            continue
-
         if item.get("open") is False:
             continue
-
         try:
-            payout = float(
-                item.get("payout", 0.0)
-            )
+            payout = float(item.get("payout", 0.0))
         except (TypeError, ValueError):
             payout = 0.0
-
         if payout < MIN_PAYOUT:
             continue
-
         seen.add(symbol)
+        eligible.append({"symbol": symbol, "payout": payout})
 
-        eligible.append({
-            "symbol": symbol,
-            "payout": payout
-        })
-
-    eligible.sort(
-        key=lambda x: (-x["payout"], x["symbol"])
-    )
-
+    eligible.sort(key=lambda x: (-x["payout"], x["symbol"]))
     return eligible
 
 
-# =====================================================
-# CANDLE HISTORY
-# =====================================================
-
 def get_candles(symbol):
-
     data = api_get(
         "/v1/candles",
-        params={
-            "venue": VENUE,
-            "symbol": symbol,
-            "tf": TIMEFRAME,
-            "limit": CANDLE_LIMIT
-        }
+        params={"venue": VENUE, "symbol": symbol, "tf": TIMEFRAME, "limit": CANDLE_LIMIT}
     )
-
     candles = data.get("candles", [])
     parsed = []
-
-    for candle in candles:
-
+    for c in candles:
         try:
             parsed.append({
-                "time": normalize_ts(candle["time"]),
-                "open": float(candle["open"]),
-                "high": float(candle["high"]),
-                "low": float(candle["low"]),
-                "close": float(candle["close"])
+                "time": normalize_ts(c["time"]),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"])
             })
-
         except (KeyError, TypeError, ValueError):
             continue
-
-    parsed.sort(
-        key=lambda x: x["time"]
-    )
-
-    if len(parsed) >= MIN_CANDLES:
-        return parsed[-CANDLE_LIMIT:]
-
-    return []
+    parsed.sort(key=lambda x: x["time"])
+    return parsed[-CANDLE_LIMIT:] if len(parsed) >= MIN_CANDLES else []
 
 
 def download_all_histories(eligible):
-
-    histories = {}
-    ranked = []
+    histories, ranked = {}, []
 
     def fetch_history(item):
         return item, get_candles(item["symbol"])
 
     with ThreadPoolExecutor(max_workers=5) as executor:
-
-        futures = {
-            executor.submit(fetch_history, item): item
-            for item in eligible
-        }
-
+        futures = {executor.submit(fetch_history, item): item for item in eligible}
         for future in as_completed(futures):
-
             item = futures[future]
-
             try:
                 _, candles = future.result()
-
                 if candles:
                     histories[item["symbol"]] = candles
                     ranked.append(item)
+            except Exception:
+                pass
 
-            except Exception as e:
-                log(
-                    f"History failed {item['symbol']}: {e}"
-                )
-
-    ranked.sort(
-        key=lambda x: (-x["payout"], x["symbol"])
-    )
-
+    ranked.sort(key=lambda x: (-x["payout"], x["symbol"]))
     return histories, ranked
 
 
-# =====================================================
-# TRADE RESULT
-# =====================================================
-
-def handle_trade_result(
-    pair,
-    payout,
-    is_win,
-    send_fn
-):
-
-    if is_win:
-        message = (
-            f"✅ REZILTA: WIN | {pair} "
-            f"(Payout {payout:.0f}%)"
-        )
-    else:
-        message = (
-            f"❌ REZILTA: LOSS | {pair}"
-        )
-
-    send_fn(message)
-
-
 def finalize_pending_trade(pending, last_prices):
-
-    symbol = pending["symbol"]
-
-    entry_price = pending.get("entry_price")
-
-    exit_price = pending.get("last_price")
-
-    if exit_price is None:
-        exit_price = last_prices.get(symbol)
+    sym = pending["symbol"]
+    entry_price = pending["entry_price"] if pending["entry_price"] is not None else pending["last_price"]
+    exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
 
     if entry_price is not None and exit_price is not None:
-
-        if pending["direction"] == "CALL":
-            is_win = exit_price > entry_price
-        else:
-            is_win = exit_price < entry_price
-
+        is_win = (
+            (pending["direction"] == "CALL" and exit_price > entry_price) or
+            (pending["direction"] == "PUT" and exit_price < entry_price)
+        )
         handle_trade_result(
-            symbol,
+            sym,
             pending["payout"],
             is_win,
             send_telegram_fn
         )
-
-        log(
-            f"{symbol}: Trade ended "
-            f"{'WIN' if is_win else 'LOSS'}"
-        )
-
+        log(f"{sym}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
     else:
-        log(
-            f"{symbol}: Unable to determine result "
-            f"from available ticks."
-        )
+        log(f"{sym}: Trade window ended. Stopping bot.")
 
 
-# =====================================================
-# LIVE STREAM
-# =====================================================
+def run_live_stream(monitored, histories, current_bars, deadline):
+    symbols = [item["symbol"] for item in monitored]
+    params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-def run_live_stream(
-    monitored,
-    histories,
-    current_bars,
-    deadline
-):
-
-    symbols = [
-        item["symbol"] for item in monitored
-    ]
-
-    params = {
-        "venue": VENUE,
-        "symbol": ",".join(symbols)
-    }
-
-    log(
-        f"Opening stream for {len(symbols)} pairs."
-    )
-
-    response = api_get(
-        "/v1/stream",
-        params=params,
-        stream=True
-    )
+    log(f"Opening M1 stream for {len(symbols)} pairs (>= {MIN_PAYOUT:.0f}%).")
+    response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
     last_prices = {}
-
     signals_sent = 0
     pending = None
     event_name = ""
 
     try:
-
-        for raw_line in response.iter_lines(
-            decode_unicode=True,
-            chunk_size=1
-        ):
-
+        for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
             now = time.time()
 
-            # -----------------------------
-            # MONITOR PENDING TRADE
-            # -----------------------------
-
             if pending is not None:
-
-                if (
-                    pending["entry_price"] is None
-                    and now >= pending["entry_time"]
-                    and pending["last_price"] is not None
-                ):
-
-                    pending["entry_price"] = (
-                        pending["last_price"]
-                    )
-
-                    log(
-                        f"{pending['symbol']} entry price: "
-                        f"{format_price(pending['entry_price'])}"
-                    )
+                if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
+                    pending["entry_price"] = pending["last_price"]
+                    log(f"{pending['symbol']}: Entry set at {format_price(pending['entry_price'])}")
 
                 if now >= pending["expiry_time"]:
-                    finalize_pending_trade(
-                        pending,
-                        last_prices
-                    )
+                    finalize_pending_trade(pending, last_prices)
                     return "stop"
 
-            # -----------------------------
-            # ONE SIGNAL MAX
-            # -----------------------------
-
-            if (
-                signals_sent >= MAX_SIGNALS_PER_RUN
-                and pending is None
-            ):
-                log("Signal limit reached.")
+            if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
+                log("Single signal completed. Stopping bot.")
                 return "stop"
 
-            if (
-                pending is None
-                and now >= deadline
-            ):
-                log("Scan window ended. No signal.")
+            if pending is None and now >= deadline:
+                log("Scan window ended with no signal.")
                 return "stop"
 
             if not raw_line:
                 event_name = ""
                 continue
 
-            line = (
-                raw_line.decode(
-                    "utf-8",
-                    errors="replace"
-                ).strip()
-                if isinstance(raw_line, bytes)
-                else raw_line.strip()
-            )
-
+            line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
             if not line or line.startswith(":"):
                 continue
 
@@ -884,221 +518,88 @@ def run_live_stream(
                 continue
 
             try:
-                data = json.loads(
-                    line[5:].strip()
-                )
+                data = json.loads(line[5:].strip())
             except json.JSONDecodeError:
                 continue
 
-            # -----------------------------
-            # CONNECTION EVENT
-            # -----------------------------
-
             if event_name == "connected":
-
-                connected_symbols = set(
-                    data.get("symbols", [])
-                )
-
-                log(
-                    "Connected: "
-                    + ", ".join(
-                        sorted(connected_symbols)
-                    )
-                )
-
+                connected_symbols = set(data.get("symbols", []))
+                log("Connected: " + ", ".join(sorted(connected_symbols)))
                 continue
 
             if event_name != "tick":
                 continue
 
             symbol = data.get("symbol")
-
-            if (
-                connected_symbols
-                and symbol not in connected_symbols
-            ):
+            if connected_symbols and symbol not in connected_symbols:
                 continue
 
             try:
                 price = float(data["price"])
                 feed_time = normalize_ts(data["time"])
-
             except (KeyError, TypeError, ValueError):
                 continue
 
             last_prices[symbol] = price
-
             now = time.time()
 
-            # -----------------------------
-            # UPDATE ACTIVE TRADE
-            # -----------------------------
-
             if pending is not None:
-
                 if symbol == pending["symbol"]:
-
                     pending["last_price"] = price
-
-                    if (
-                        pending["entry_price"] is None
-                        and now >= pending["entry_time"]
-                    ):
-
+                    if pending["entry_price"] is None and now >= pending["entry_time"]:
                         pending["entry_price"] = price
-
-                        log(
-                            f"{symbol}: Entry captured "
-                            f"{format_price(price)}"
-                        )
+                        log(f"{symbol}: Entry set at {format_price(price)}")
 
                 if now >= pending["expiry_time"]:
-
-                    finalize_pending_trade(
-                        pending,
-                        last_prices
-                    )
-
+                    finalize_pending_trade(pending, last_prices)
                     return "stop"
-
                 continue
 
-            if (
-                signals_sent >= MAX_SIGNALS_PER_RUN
-            ):
+            if signals_sent >= MAX_SIGNALS_PER_RUN:
+                log("Single signal limit reached. Stopping bot.")
                 return "stop"
 
-            # -----------------------------
-            # BUILD CURRENT M1 BAR
-            # -----------------------------
-
-            bucket = (
-                feed_time // TIMEFRAME
-            ) * TIMEFRAME
+            bucket = (feed_time // TIMEFRAME) * TIMEFRAME
 
             if symbol not in current_bars:
-
-                histories[symbol] = [
-                    candle
-                    for candle in histories.get(
-                        symbol, []
-                    )
-                    if candle["time"] < bucket
-                ]
-
+                histories[symbol] = [c for c in histories.get(symbol, []) if c["time"] < bucket]
                 current_bars[symbol] = {
-                    "time": bucket,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price
+                    "time": bucket, "open": price, "high": price, "low": price, "close": price
                 }
-
                 continue
 
             current = current_bars[symbol]
 
-            seconds_left = (
-                current["time"] + TIMEFRAME
-            ) - feed_time
-
-            # -----------------------------
-            # EVALUATE BEFORE CLOSE
-            # -----------------------------
-
-            if (
-                0 < seconds_left <= ENTRY_LEAD
-                and not current.get(
-                    "evaluated_preclose", False
-                )
-            ):
-
+            seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
+            if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
                 current["evaluated_preclose"] = True
-
-                history = histories.get(
-                    symbol, []
-                )
-
-                if (
-                    len(history) >= 1
-                    and len(history) + 1 >= MIN_CANDLES
-                ):
-
-                    window = (
-                        history[-(MIN_CANDLES - 1):]
-                        + [current]
-                    )
-
-                    signal_data, diag = (
-                        evaluate_real_market(window)
-                    )
-
+                hist = histories.get(symbol, [])
+                if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
+                    window = hist[-(MIN_CANDLES - 1):] + [current]
+                    signal_data, diag = evaluate_real_market(window)
                     if signal_data:
-
-                        pair_info = next(
-                            (
-                                item
-                                for item in monitored
-                                if item["symbol"] == symbol
-                            ),
-                            {"payout": MIN_PAYOUT}
-                        )
-
+                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
+                        entry_ts = current["time"] + TIMEFRAME
+                        entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
 
-                        entry_ts = (
-                            current["time"] + TIMEFRAME
-                        )
-
-                        entry_time_str = (
-                            datetime.fromtimestamp(
-                                entry_ts,
-                                TIMEZONE
-                            ).strftime("%I:%M:%S %p")
-                        )
-
-                        message = format_signal_message(
-                            symbol,
-                            payout,
-                            entry_time_str,
-                            signal_data
-                        )
-
-                        if send_telegram_fn(message):
-
+                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data)
+                        if send_telegram_fn(msg):
                             signals_sent += 1
-
                             pending = {
                                 "symbol": symbol,
                                 "payout": payout,
                                 "direction": signal_data["direction"],
                                 "entry_time": entry_ts,
-                                "expiry_time": (
-                                    entry_ts + EXPIRATION
-                                ),
+                                "expiry_time": entry_ts + EXPIRATION,
                                 "entry_price": None,
                                 "last_price": price
                             }
-
-                            log(
-                                f"{symbol}: Signal sent "
-                                f"{signal_data['direction']} "
-                                f"| {signal_data['confidence']} "
-                                f"| ENTRY {entry_time_str}"
-                            )
-
+                            log(f"{symbol}: Single signal sent ({signal_data['direction']}) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
                     else:
-                        log(
-                            f"{symbol}: No setup | {diag}"
-                        )
-
-            # -----------------------------
-            # UPDATE / CLOSE BAR
-            # -----------------------------
+                        log(f"{symbol}: no setup ({diag})")
 
             if bucket > current["time"]:
-
                 clean_bar = {
                     "time": current["time"],
                     "open": current["open"],
@@ -1106,197 +607,83 @@ def run_live_stream(
                     "low": current["low"],
                     "close": current["close"]
                 }
-
-                histories.setdefault(
-                    symbol, []
-                ).append(clean_bar)
-
-                histories[symbol] = (
-                    histories[symbol][-CANDLE_LIMIT:]
-                )
+                histories.setdefault(symbol, []).append(clean_bar)
+                histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
 
                 current_bars[symbol] = {
-                    "time": bucket,
-                    "open": price,
-                    "high": price,
-                    "low": price,
-                    "close": price
+                    "time": bucket, "open": price, "high": price, "low": price, "close": price
                 }
-
             else:
-
-                current["high"] = max(
-                    current["high"], price
-                )
-
-                current["low"] = min(
-                    current["low"], price
-                )
-
+                current["high"] = max(current["high"], price)
+                current["low"] = min(current["low"], price)
                 current["close"] = price
 
     finally:
         response.close()
 
-    return (
-        "stop"
-        if signals_sent >= MAX_SIGNALS_PER_RUN
-        else "reconnect"
-    )
+    return "stop" if signals_sent >= MAX_SIGNALS_PER_RUN else "reconnect"
 
-
-# =====================================================
-# MAIN
-# =====================================================
 
 def main():
-
     log(f"{VERSION} starting...")
-
-    if (
-        not API_KEY
-        or not TELEGRAM_TOKEN
-        or not TELEGRAM_CHAT_ID
-    ):
-
+    if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Credentials missing!")
         sys.exit(1)
 
-    try:
-
-        eligible = get_eligible_symbols()
-
-    except Exception as e:
-
-        log(f"Failed loading symbols: {e}")
-        sys.exit(1)
-
+    eligible = get_eligible_symbols()
     if not eligible:
-
-        log(
-            f"No OTC pairs with payout >= "
-            f"{MIN_PAYOUT:.0f}% available."
-        )
-
+        log("No pairs >= 85% open right now.")
         sys.exit(0)
 
-    log(
-        f"Eligible pairs: {len(eligible)}"
-    )
-
-    histories, ranked = (
-        download_all_histories(eligible)
-    )
-
+    histories, ranked = download_all_histories(eligible)
     if not ranked:
-
-        log("No candle histories available.")
+        log("No candle history available.")
         sys.exit(0)
 
-    active_limit = min(
-        MAX_STREAM_PAIRS,
-        len(ranked)
-    )
-
+    active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     current_bars = {}
-    deadline = (
-        time.time() + MAX_WAIT_SECONDS
-    )
+    deadline = time.time() + MAX_WAIT_SECONDS
 
     reconnects = 0
-
     while time.time() < deadline:
-
         stream_subset = ranked[:active_limit]
-
         try:
-
-            status = run_live_stream(
-                stream_subset,
-                histories,
-                current_bars,
-                deadline
-            )
-
+            status = run_live_stream(stream_subset, histories, current_bars, deadline)
             if status in ("done", "stop"):
-
                 log(f"{VERSION} finished.")
                 sys.stdout.flush()
                 os._exit(0)
-
             reconnects += 1
-
             if reconnects > MAX_RECONNECTS:
                 break
-
-            wait_sec = min(
-                4.0,
-                max(1.0, deadline - time.time())
-            )
-
-            log(
-                f"Reconnecting in {wait_sec:.1f}s..."
-            )
-
+            wait_sec = min(4.0, max(1.0, deadline - time.time()))
+            log(f"Reconnecting in {wait_sec:.1f}s...")
             time.sleep(wait_sec)
-
         except StreamBadRequestError as e:
-
-            log(f"Stream bad request: {e}")
-
+            log(f"Stream error: {e}")
             if active_limit > 1:
-
                 active_limit -= 1
-
-                log(
-                    f"Reducing stream to "
-                    f"{active_limit} pairs."
-                )
-
-                time.sleep(1)
+                log(f"Reducing stream batch to {active_limit} pairs and retrying...")
+                time.sleep(1.0)
                 continue
-
             break
-
         except StreamRateLimitError as e:
-
             reconnects += 1
-
             if reconnects > MAX_RECONNECTS:
                 break
-
-            wait_sec = min(
-                e.retry_after,
-                max(0.0, deadline - time.time())
-            )
-
+            wait_sec = min(e.retry_after, max(0.0, deadline - time.time()))
             if wait_sec <= 2:
                 break
-
-            log(
-                f"Rate limited. Waiting "
-                f"{wait_sec:.1f}s..."
-            )
-
+            log(f"Rate limit. Waiting {wait_sec:.1f}s...")
             time.sleep(wait_sec)
-
         except Exception as e:
-
             log(f"Stream error: {e}")
-
             reconnects += 1
-
             if reconnects > MAX_RECONNECTS:
                 break
-
-            wait_sec = min(
-                4.0,
-                max(1.0, deadline - time.time())
-            )
-
+            wait_sec = min(4.0, max(1.0, deadline - time.time()))
             if wait_sec <= 1:
                 break
-
             time.sleep(wait_sec)
 
     log(f"{VERSION} finished.")
