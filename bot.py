@@ -275,6 +275,40 @@ def build_trendlines(window):
     return support_line, resistance_line
 
 
+def calc_win_probability(direction, rsi, line_info, curr, line_val):
+    prob = 50.0
+
+    if line_info is not None:
+        if direction == "CALL" and line_info["slope"] > 0:
+            prob += 12.0
+        elif direction == "PUT" and line_info["slope"] < 0:
+            prob += 12.0
+        else:
+            prob += 4.0
+
+        if line_info.get("pivots", 0) >= 2:
+            prob += 10.0
+
+    if direction == "CALL" and curr["close"] > line_val:
+        prob += 12.0
+    elif direction == "PUT" and curr["close"] < line_val:
+        prob += 12.0
+
+    if direction == "CALL":
+        if 45 <= rsi <= 68:
+            prob += 14.0
+        else:
+            prob += 6.0
+    else:
+        if 32 <= rsi <= 55:
+            prob += 14.0
+        else:
+            prob += 6.0
+
+    prob = max(50.0, min(98.0, prob))
+    return int(round(prob))
+
+
 # =====================================================
 # 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN
 # =====================================================
@@ -300,7 +334,7 @@ def evaluate_real_market(candles):
     diag = f"RSI={rsi:.1f} sup_m={sup_slope:.2e} res_m={res_slope:.2e}"
 
     direction = None
-    solid_hit = False
+    win_prob = 50
 
     # ---------------- CALL: TREND LINE SIPÒ ----------------
     if support_line is not None and support_line["slope"] >= 0:
@@ -314,12 +348,7 @@ def evaluate_real_market(candles):
 
         if near_sup and bullish_move and 15 <= rsi <= 75:
             direction = "CALL"
-            solid_hit = (
-                support_line["slope"] > 0
-                and support_line["pivots"] >= 2
-                and curr["close"] > sup_val
-                and 35 <= rsi <= 68
-            )
+            win_prob = calc_win_probability("CALL", rsi, support_line, curr, sup_val)
 
     # ---------------- PUT: TREND LINE REZISTANS ----------------
     if direction is None and resistance_line is not None and resistance_line["slope"] <= 0:
@@ -333,17 +362,12 @@ def evaluate_real_market(candles):
 
         if near_res and bearish_move and 25 <= rsi <= 85:
             direction = "PUT"
-            solid_hit = (
-                resistance_line["slope"] < 0
-                and resistance_line["pivots"] >= 2
-                and curr["close"] < res_val
-                and 32 <= rsi <= 65
-            )
+            win_prob = calc_win_probability("PUT", rsi, resistance_line, curr, res_val)
 
     if direction is None:
         return None, diag
 
-    if solid_hit:
+    if win_prob >= 75:
         confidence = "🟢 TRÈ SOLID (Bon anpil)"
         score = 6
     else:
@@ -353,6 +377,7 @@ def evaluate_real_market(candles):
     return {
         "direction": direction,
         "confidence": confidence,
+        "win_prob": win_prob,
         "score": score,
         "rsi": round(rsi, 2),
         "close": curr["close"],
@@ -368,6 +393,7 @@ def format_signal_message(pair, payout, entry_time_str, signal_data):
     return (
         f"🤖 ROMARIO PRO M1\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
+        f"📊 Nivo: {signal_data['win_prob']}%\n"
         f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
         f"🛡️ Konfyans: {signal_data['confidence']}"
     )
@@ -595,7 +621,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None,
                                 "last_price": price
                             }
-                            log(f"{symbol}: Single signal sent ({signal_data['direction']}) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
+                            log(f"{symbol}: Single signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
                     else:
                         log(f"{symbol}: no setup ({diag})")
 
