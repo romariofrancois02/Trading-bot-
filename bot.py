@@ -196,10 +196,6 @@ def calc_rsi(closes, period=7):
 
 
 def fit_trendline(points):
-    """
-    Kalkile liy tandans lineyè y = m*x + b sou yon lis pwen (x_index, price).
-    Retounen (slope, line_at_last_x, touches) oswa None.
-    """
     n = len(points)
     if n < 2:
         return None
@@ -219,11 +215,6 @@ def fit_trendline(points):
 
 
 def build_trendlines(window):
-    """
-    Detekte pwen pivot ba (swing lows) pou liy sipò ap monte
-    ak pwen pivot wo (swing highs) pou liy rezistans ap desann.
-    """
-    # Pa pran dènye bouji k ap fòme a pou bati liy estriktirèl la
     base = window[:-1]
     if len(base) < 12:
         return None, None
@@ -237,7 +228,6 @@ def build_trendlines(window):
         if base[i]["high"] >= base[i - 1]["high"] and base[i]["high"] >= base[i + 1]["high"]:
             high_pivots.append((i, base[i]["high"]))
 
-    # Si pa gen ase pivot strik, pran dènye pwen ba/wo yo nan fenèt la
     if len(low_pivots) < 2:
         sorted_lows = sorted(
             [(i, base[i]["low"]) for i in range(max(0, len(base) - 16), len(base))],
@@ -289,21 +279,24 @@ def build_trendlines(window):
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
-        return None
+        return None, "not enough candles"
 
     window = candles[-25:]
     closes = [c["close"] for c in window]
     rsi = calc_rsi(closes, 7)
     if rsi is None:
-        return None
+        return None, "rsi unavailable"
 
     support_line, resistance_line = build_trendlines(window)
     prev = window[-2]
     curr = window[-1]
 
-    # Kalkile mwayèn amplitid bouji pou tolerans manyen liy trend line nan
     avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    tol = avg_range * 0.35
+    tol = avg_range * 0.45
+
+    sup_slope = support_line["slope"] if support_line else 0.0
+    res_slope = resistance_line["slope"] if resistance_line else 0.0
+    diag = f"RSI={rsi:.1f} sup_m={sup_slope:.2e} res_m={res_slope:.2e}"
 
     direction = None
     solid_hit = False
@@ -312,9 +305,9 @@ def evaluate_real_market(candles):
     if support_line is not None and support_line["slope"] > 0:
         sup_val = support_line["value"]
         prev_touched_sup = (prev["low"] <= sup_val + tol) or (prev["close"] <= sup_val + tol)
-        curr_bouncing_up = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.25))
+        curr_bouncing_up = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.35))
 
-        if prev_touched_sup and curr_bouncing_up and 42 <= rsi <= 72:
+        if prev_touched_sup and curr_bouncing_up and 40 <= rsi <= 75:
             direction = "CALL"
             solid_hit = (support_line["pivots"] >= 2) and (curr["close"] > sup_val) and (48 <= rsi <= 66)
 
@@ -322,14 +315,14 @@ def evaluate_real_market(candles):
     if direction is None and resistance_line is not None and resistance_line["slope"] < 0:
         res_val = resistance_line["value"]
         prev_touched_res = (prev["high"] >= res_val - tol) or (prev["close"] >= res_val - tol)
-        curr_rejecting_down = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.25))
+        curr_rejecting_down = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.35))
 
-        if prev_touched_res and curr_rejecting_down and 28 <= rsi <= 58:
+        if prev_touched_res and curr_rejecting_down and 25 <= rsi <= 60:
             direction = "PUT"
             solid_hit = (resistance_line["pivots"] >= 2) and (curr["close"] < res_val) and (34 <= rsi <= 52)
 
     if direction is None:
-        return None
+        return None, diag
 
     if solid_hit:
         confidence = "🟢 TRÈ SOLID (Bon anpil)"
@@ -345,7 +338,7 @@ def evaluate_real_market(candles):
         "rsi": round(rsi, 2),
         "close": curr["close"],
         "candle_time": curr["time"]
-    }
+    }, diag
 
 
 # =====================================================
@@ -541,7 +534,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 hist = histories.get(symbol, [])
                 if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
                     window = hist[-(MIN_CANDLES - 1):] + [current]
-                    signal_data = evaluate_real_market(window)
+                    signal_data, diag = evaluate_real_market(window)
                     if signal_data:
                         pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
@@ -560,6 +553,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None
                             }
                             log(f"{symbol}: Single signal sent ({signal_data['direction']}) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
+                    else:
+                        log(f"{symbol}: no setup ({diag})")
 
             if bucket > current["time"]:
                 clean_bar = {
