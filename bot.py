@@ -292,7 +292,7 @@ def evaluate_real_market(candles):
     curr = window[-1]
 
     avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    tol = avg_range * 0.45
+    tol = avg_range * 0.65
 
     sup_slope = support_line["slope"] if support_line else 0.0
     res_slope = resistance_line["slope"] if resistance_line else 0.0
@@ -301,25 +301,43 @@ def evaluate_real_market(candles):
     direction = None
     solid_hit = False
 
-    # ---------------- CALL: TREND LINE SIPÒ AP MONTE ----------------
-    if support_line is not None and support_line["slope"] > 0:
+    # ---------------- CALL: TREND LINE SIPÒ ----------------
+    if support_line is not None and support_line["slope"] >= 0:
         sup_val = support_line["value"]
-        prev_touched_sup = (prev["low"] <= sup_val + tol) or (prev["close"] <= sup_val + tol)
-        curr_bouncing_up = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.35))
+        near_sup = (
+            prev["low"] <= sup_val + tol
+            or prev["close"] <= sup_val + tol
+            or curr["low"] <= sup_val + tol
+        )
+        bullish_move = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.5))
 
-        if prev_touched_sup and curr_bouncing_up and 40 <= rsi <= 75:
+        if near_sup and bullish_move and 15 <= rsi <= 75:
             direction = "CALL"
-            solid_hit = (support_line["pivots"] >= 2) and (curr["close"] > sup_val) and (48 <= rsi <= 66)
+            solid_hit = (
+                support_line["slope"] > 0
+                and support_line["pivots"] >= 2
+                and curr["close"] > sup_val
+                and 35 <= rsi <= 68
+            )
 
-    # ---------------- PUT: TREND LINE REZISTANS AP DESANN ----------------
-    if direction is None and resistance_line is not None and resistance_line["slope"] < 0:
+    # ---------------- PUT: TREND LINE REZISTANS ----------------
+    if direction is None and resistance_line is not None and resistance_line["slope"] <= 0:
         res_val = resistance_line["value"]
-        prev_touched_res = (prev["high"] >= res_val - tol) or (prev["close"] >= res_val - tol)
-        curr_rejecting_down = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.35))
+        near_res = (
+            prev["high"] >= res_val - tol
+            or prev["close"] >= res_val - tol
+            or curr["high"] >= res_val - tol
+        )
+        bearish_move = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.5))
 
-        if prev_touched_res and curr_rejecting_down and 25 <= rsi <= 60:
+        if near_res and bearish_move and 25 <= rsi <= 85:
             direction = "PUT"
-            solid_hit = (resistance_line["pivots"] >= 2) and (curr["close"] < res_val) and (34 <= rsi <= 52)
+            solid_hit = (
+                resistance_line["slope"] < 0
+                and resistance_line["pivots"] >= 2
+                and curr["close"] < res_val
+                and 32 <= rsi <= 65
+            )
 
     if direction is None:
         return None, diag
@@ -428,6 +446,27 @@ def download_all_histories(eligible):
     return histories, ranked
 
 
+def finalize_pending_trade(pending, last_prices):
+    sym = pending["symbol"]
+    entry_price = pending["entry_price"]
+    exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
+
+    if entry_price is not None and exit_price is not None:
+        is_win = (
+            (pending["direction"] == "CALL" and exit_price > entry_price) or
+            (pending["direction"] == "PUT" and exit_price < entry_price)
+        )
+        handle_trade_result(
+            sym,
+            pending["payout"],
+            is_win,
+            send_telegram_fn
+        )
+        log(f"{sym}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
+    else:
+        log(f"{sym}: Trade window ended. Stopping bot.")
+
+
 def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
@@ -436,6 +475,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
+    last_prices = {}
     signals_sent = 0
     pending = None
     event_name = ""
@@ -443,6 +483,15 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     try:
         for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
             now = time.time()
+
+            if pending is not None:
+                if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
+                    pending["entry_price"] = pending["last_price"]
+                    log(f"{pending['symbol']}: Entry set at {format_price(pending['entry_price'])}")
+
+                if now >= pending["expiry_time"]:
+                    finalize_pending_trade(pending, last_prices)
+                    return "stop"
 
             if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
                 log("Single signal completed. Stopping bot.")
@@ -490,27 +539,19 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             except (KeyError, TypeError, ValueError):
                 continue
 
+            last_prices[symbol] = price
             now = time.time()
 
             if pending is not None:
                 if symbol == pending["symbol"]:
+                    pending["last_price"] = price
                     if pending["entry_price"] is None and now >= pending["entry_time"]:
                         pending["entry_price"] = price
                         log(f"{symbol}: Entry set at {format_price(price)}")
 
-                    if pending["entry_price"] is not None and now >= pending["expiry_time"]:
-                        is_win = (
-                            (pending["direction"] == "CALL" and price > pending["entry_price"]) or
-                            (pending["direction"] == "PUT" and price < pending["entry_price"])
-                        )
-                        handle_trade_result(
-                            symbol,
-                            pending["payout"],
-                            is_win,
-                            send_telegram_fn
-                        )
-                        log(f"{symbol}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
-                        return "stop"
+                if now >= pending["expiry_time"]:
+                    finalize_pending_trade(pending, last_prices)
+                    return "stop"
                 continue
 
             if signals_sent >= MAX_SIGNALS_PER_RUN:
@@ -550,7 +591,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "direction": signal_data["direction"],
                                 "entry_time": entry_ts,
                                 "expiry_time": entry_ts + EXPIRATION,
-                                "entry_price": None
+                                "entry_price": None,
+                                "last_price": price
                             }
                             log(f"{symbol}: Single signal sent ({signal_data['direction']}) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
                     else:
