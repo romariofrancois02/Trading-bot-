@@ -23,19 +23,11 @@ MIN_PAYOUT = 85.0         # Mache 85% ou plis
 ENTRY_LEAD = 12           # Avèti w 12 segonn anvan bouji a louvri (10-15s)
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
-MAX_STREAM_PAIRS = 4      # Limit ki pi stab pou /v1/stream
+MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
 
 CANDLE_LIMIT = 80
 MIN_CANDLES = 30
 MAX_RECONNECTS = 4
-
-# Pè klasik ki pi estab (evite pè ekzotik ki manipile)
-VALID_PAIRS = {
-    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
-    "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
-    "EURJPY_otc", "GBPJPY_otc", "AUDCHF_otc", "EURCHF_otc",
-    "AUDCAD_otc", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"
-}
 
 API_CONNECT_TIMEOUT = 4
 API_READ_TIMEOUT = 10
@@ -309,6 +301,47 @@ def calc_win_probability(direction, rsi, line_info, curr, line_val):
     return int(round(prob))
 
 
+def score_trendline_structure(candles):
+    """Kalkile yon nòt estrikti (0 a 100) pou klase pi bon pè yo apre lekòt tout mache yo."""
+    if len(candles) < MIN_CANDLES:
+        return 0.0
+
+    window = candles[-25:]
+    closes = [c["close"] for c in window]
+    rsi = calc_rsi(closes, 7)
+    support_line, resistance_line = build_trendlines(window)
+    curr = window[-1]
+    prev = window[-2]
+
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    tol = avg_range * 0.65
+
+    score = 0.0
+    if support_line is not None:
+        score += 15.0 + (support_line.get("pivots", 0) * 5.0)
+        if support_line["slope"] > 0:
+            score += 12.0
+        dist_sup = abs(curr["close"] - support_line["value"])
+        if dist_sup <= tol * 1.5:
+            score += 10.0
+
+    if resistance_line is not None:
+        score += 15.0 + (resistance_line.get("pivots", 0) * 5.0)
+        if resistance_line["slope"] < 0:
+            score += 12.0
+        dist_res = abs(curr["close"] - resistance_line["value"])
+        if dist_res <= tol * 1.5:
+            score += 10.0
+
+    if rsi is not None and 25 <= rsi <= 75:
+        score += 8.0
+
+    if prev["close"] != prev["open"]:
+        score += 3.0
+
+    return round(score, 2)
+
+
 # =====================================================
 # 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN
 # =====================================================
@@ -411,8 +444,8 @@ def get_eligible_symbols():
     seen = set()
 
     for item in data.get("symbols", []):
-        symbol = item.get("symbol")
-        if symbol not in VALID_PAIRS or symbol in seen:
+        symbol = str(item.get("symbol") or "").strip()
+        if not symbol or symbol in seen:
             continue
         if item.get("open") is False:
             continue
@@ -453,23 +486,28 @@ def get_candles(symbol):
 
 def download_all_histories(eligible):
     histories, ranked = {}, []
+    log(f"Scanning {len(eligible)} open OTC pairs (>= {MIN_PAYOUT:.0f}%)...")
 
-    def fetch_history(item):
-        return item, get_candles(item["symbol"])
+    def fetch_and_score(item):
+        candles = get_candles(item["symbol"])
+        setup_score = score_trendline_structure(candles) if candles else 0.0
+        enriched = dict(item)
+        enriched["setup_score"] = setup_score
+        return enriched, candles
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(fetch_history, item): item for item in eligible}
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_and_score, item): item for item in eligible}
         for future in as_completed(futures):
             item = futures[future]
             try:
-                _, candles = future.result()
+                enriched, candles = future.result()
                 if candles:
-                    histories[item["symbol"]] = candles
-                    ranked.append(item)
+                    histories[enriched["symbol"]] = candles
+                    ranked.append(enriched)
             except Exception:
                 pass
 
-    ranked.sort(key=lambda x: (-x["payout"], x["symbol"]))
+    ranked.sort(key=lambda x: (-x["setup_score"], -x["payout"], x["symbol"]))
     return histories, ranked
 
 
@@ -498,7 +536,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening M1 stream for {len(symbols)} pairs (>= {MIN_PAYOUT:.0f}%).")
+    log(f"Opening M1 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
@@ -667,6 +705,9 @@ def main():
         sys.exit(0)
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
+    top_pairs = ranked[:active_limit]
+    log("Top selected pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
+
     current_bars = {}
     deadline = time.time() + MAX_WAIT_SECONDS
 
