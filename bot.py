@@ -11,16 +11,16 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (S30, EXP 30S, PAYOUT >= 85%, 1 SIGNAL/RUN)
+# 1. PARAMÈT JENERAL (M1, EXP 1M, PAYOUT >= 85%, 1 SIGNAL/RUN)
 # =====================================================
-VERSION = "ROMARIO PRO S30 - TRENDLINE ADV"
+VERSION = "ROMARIO PRO M1 - TRENDLINE ADV"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 30            # Bouji 30 segonn
-EXPIRATION = 30           # Ekspirasyon 30 segonn
+TIMEFRAME = 60            # Bouji 1 minit
+EXPIRATION = 60           # Ekspirasyon 1 minit
 MIN_PAYOUT = 85.0         # Mache 85% ou plis
-ENTRY_LEAD = 6            # Avèti w 6 segonn anvan bouji 30s lan fèmen
+ENTRY_LEAD = 10           # Avèti w 10 segonn anvan bouji 1m lan fèmen
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
 MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
@@ -81,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioTrendLineAdvS30/1.0",
+            "User-Agent": "RomarioTrendLineAdvM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -175,7 +175,7 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL RSI AK TREND LINE ADVANCED (AJISTE 30S)
+# 2. KALKIL RSI AK TREND LINE ADVANCED (M1)
 # =====================================================
 def calc_rsi(closes, period=7):
     if len(closes) < period + 1:
@@ -295,12 +295,12 @@ def calc_win_probability(direction, rsi, line_info, curr, line_val):
         prob += 12.0
 
     if direction == "CALL":
-        if 42 <= rsi <= 65:
+        if 45 <= rsi <= 68:
             prob += 14.0
         else:
             prob += 6.0
     else:
-        if 35 <= rsi <= 58:
+        if 32 <= rsi <= 55:
             prob += 14.0
         else:
             prob += 6.0
@@ -313,15 +313,15 @@ def score_trendline_structure(candles):
     if len(candles) < MIN_CANDLES:
         return 0.0
 
-    window = candles[-40:] if len(candles) >= 40 else candles[-25:]
+    window = candles[-30:] if len(candles) >= 30 else candles[-25:]
     closes = [c["close"] for c in window]
     rsi = calc_rsi(closes, 7)
     support_line, resistance_line = build_trendlines(window)
     curr = window[-1]
     prev = window[-2]
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-12:]) / 12.0
-    tol = avg_range * 0.50
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    tol = avg_range * 0.65
 
     score = 0.0
     if support_line is not None:
@@ -348,13 +348,13 @@ def score_trendline_structure(candles):
 
 
 # =====================================================
-# 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN (30S)
+# 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN (M1)
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
-    window = candles[-40:] if len(candles) >= 40 else candles[-25:]
+    window = candles[-30:] if len(candles) >= 30 else candles[-25:]
     closes = [c["close"] for c in window]
     rsi = calc_rsi(closes, 7)
     if rsi is None:
@@ -364,8 +364,8 @@ def evaluate_real_market(candles):
     prev = window[-2]
     curr = window[-1]
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-12:]) / 12.0
-    tol = avg_range * 0.50
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    tol = avg_range * 0.65
 
     sup_slope = support_line["slope"] if support_line else 0.0
     res_slope = resistance_line["slope"] if resistance_line else 0.0
@@ -374,7 +374,7 @@ def evaluate_real_market(candles):
     direction = None
     win_prob = 50
 
-    # ---------------- CALL: TREND LINE SIPÒ (30S) ----------------
+    # ---------------- CALL: TREND LINE SIPÒ ----------------
     if support_line is not None and support_line["slope"] >= 0:
         sup_val = support_line["value"]
         near_sup = (
@@ -382,13 +382,13 @@ def evaluate_real_market(candles):
             or prev["close"] <= sup_val + tol
             or curr["low"] <= sup_val + tol
         )
-        bullish_move = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.4))
+        bullish_move = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.5))
 
-        if near_sup and bullish_move and 20 <= rsi <= 72:
+        if near_sup and bullish_move and 15 <= rsi <= 75:
             direction = "CALL"
             win_prob = calc_win_probability("CALL", rsi, support_line, curr, sup_val)
 
-    # ---------------- PUT: TREND LINE REZISTANS (30S) ----------------
+    # ---------------- PUT: TREND LINE REZISTANS ----------------
     if direction is None and resistance_line is not None and resistance_line["slope"] <= 0:
         res_val = resistance_line["value"]
         near_res = (
@@ -396,9 +396,9 @@ def evaluate_real_market(candles):
             or prev["close"] >= res_val - tol
             or curr["high"] >= res_val - tol
         )
-        bearish_move = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.4))
+        bearish_move = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.5))
 
-        if near_res and bearish_move and 28 <= rsi <= 80:
+        if near_res and bearish_move and 25 <= rsi <= 85:
             direction = "PUT"
             win_prob = calc_win_probability("PUT", rsi, resistance_line, curr, res_val)
 
@@ -429,10 +429,10 @@ def evaluate_real_market(candles):
 def format_signal_message(pair, payout, entry_time_str, signal_data):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
     return (
-        f"🤖 ROMARIO PRO S30\n\n"
+        f"🤖 ROMARIO PRO M1\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
         f"📊 Nivo: {signal_data['win_prob']}%\n"
-        f"🎯 Antre: {entry_time_str} (Exp: 30s)\n"
+        f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
         f"🛡️ Konfyans: {signal_data['confidence']}"
     )
 
@@ -541,7 +541,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening S30 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    log(f"Opening M1 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
