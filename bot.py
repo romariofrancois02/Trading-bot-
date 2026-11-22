@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 # =====================================================
 # 1. PARAMÈT JENERAL (M1, EXP 1M, PAYOUT >= 85%, 1 SIGNAL/RUN)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - TRENDLINE ADV"
+VERSION = "ROMARIO PRO M1 - BREAKOUT RETEST CONF"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -81,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioTrendLineAdvM1/1.0",
+            "User-Agent": "RomarioBreakoutRetestM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -175,7 +175,7 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL RSI AK TREND LINE ADVANCED (M1)
+# 2. KALKIL RSI AK TREND LINE ADVANCED (BREAKOUT + RETEST)
 # =====================================================
 def calc_rsi(closes, period=7):
     if len(closes) < period + 1:
@@ -275,13 +275,13 @@ def build_trendlines(window):
     return support_line, resistance_line
 
 
-def calc_win_probability(direction, rsi, line_info, curr, line_val):
-    prob = 50.0
+def calc_win_probability(direction, rsi, line_info, curr, line_val, has_retest_conf=True):
+    prob = 54.0 if has_retest_conf else 50.0
 
     if line_info is not None:
-        if direction == "CALL" and line_info["slope"] > 0:
+        if direction == "CALL" and line_info["slope"] >= 0:
             prob += 12.0
-        elif direction == "PUT" and line_info["slope"] < 0:
+        elif direction == "PUT" and line_info["slope"] <= 0:
             prob += 12.0
         else:
             prob += 4.0
@@ -296,14 +296,14 @@ def calc_win_probability(direction, rsi, line_info, curr, line_val):
 
     if direction == "CALL":
         if 45 <= rsi <= 68:
-            prob += 14.0
+            prob += 10.0
         else:
-            prob += 6.0
+            prob += 4.0
     else:
         if 32 <= rsi <= 55:
-            prob += 14.0
+            prob += 10.0
         else:
-            prob += 6.0
+            prob += 4.0
 
     prob = max(50.0, min(98.0, prob))
     return int(round(prob))
@@ -326,17 +326,13 @@ def score_trendline_structure(candles):
     score = 0.0
     if support_line is not None:
         score += 15.0 + (support_line.get("pivots", 0) * 5.0)
-        if support_line["slope"] > 0:
-            score += 12.0
         if abs(curr["close"] - support_line["value"]) <= tol * 1.5:
-            score += 10.0
+            score += 12.0
 
     if resistance_line is not None:
         score += 15.0 + (resistance_line.get("pivots", 0) * 5.0)
-        if resistance_line["slope"] < 0:
-            score += 12.0
         if abs(curr["close"] - resistance_line["value"]) <= tol * 1.5:
-            score += 10.0
+            score += 12.0
 
     if rsi is not None and 25 <= rsi <= 75:
         score += 8.0
@@ -348,7 +344,7 @@ def score_trendline_structure(candles):
 
 
 # =====================================================
-# 3. ESTRATEJI "TREND LINE ADVANCED" SÈLMAN (M1)
+# 3. ESTRATEJI BREAKOUT -> RETEST -> KONFIMASYON (M1)
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
@@ -361,6 +357,7 @@ def evaluate_real_market(candles):
         return None, "rsi unavailable"
 
     support_line, resistance_line = build_trendlines(window)
+    recent = window[-6:-1]  # 5 bouji anvan bouji aktyèl la pou chèche breakout
     prev = window[-2]
     curr = window[-1]
 
@@ -373,37 +370,56 @@ def evaluate_real_market(candles):
 
     direction = None
     win_prob = 50
+    setup_tag = ""
 
-    # ---------------- CALL: TREND LINE SIPÒ ----------------
-    if support_line is not None and support_line["slope"] >= 0:
-        sup_val = support_line["value"]
-        near_sup = (
-            prev["low"] <= sup_val + tol
-            or prev["close"] <= sup_val + tol
-            or curr["low"] <= sup_val + tol
-        )
-        bullish_move = (curr["close"] > curr["open"]) and (curr["close"] >= sup_val - (tol * 0.5))
-
-        if near_sup and bullish_move and 15 <= rsi <= 75:
-            direction = "CALL"
-            win_prob = calc_win_probability("CALL", rsi, support_line, curr, sup_val)
-
-    # ---------------- PUT: TREND LINE REZISTANS ----------------
-    if direction is None and resistance_line is not None and resistance_line["slope"] <= 0:
+    # ---------------- CALL: BREAKOUT REZISTANS -> RETEST -> KONFIMASYON ----------------
+    if resistance_line is not None:
         res_val = resistance_line["value"]
-        near_res = (
-            prev["high"] >= res_val - tol
-            or prev["close"] >= res_val - tol
-            or curr["high"] >= res_val - tol
+        broke_above = any(
+            (b["close"] > res_val + (tol * 0.15)) or (b["high"] > res_val + tol)
+            for b in recent
         )
-        bearish_move = (curr["close"] < curr["open"]) and (curr["close"] <= res_val + (tol * 0.5))
+        retested_res = (
+            prev["low"] <= res_val + tol
+            or prev["close"] <= res_val + tol
+            or curr["low"] <= res_val + tol
+        )
+        confirmed_call = (
+            (curr["close"] > curr["open"])
+            and (curr["close"] >= res_val - (tol * 0.4))
+            and (curr["close"] >= prev["close"])
+        )
 
-        if near_res and bearish_move and 25 <= rsi <= 85:
+        if broke_above and retested_res and confirmed_call and 20 <= rsi <= 75:
+            direction = "CALL"
+            setup_tag = "BRK+RET+CONF"
+            win_prob = calc_win_probability("CALL", rsi, resistance_line, curr, res_val, True)
+
+    # ---------------- PUT: BREAKOUT SIPÒ -> RETEST -> KONFIMASYON ----------------
+    if direction is None and support_line is not None:
+        sup_val = support_line["value"]
+        broke_below = any(
+            (b["close"] < sup_val - (tol * 0.15)) or (b["low"] < sup_val - tol)
+            for b in recent
+        )
+        retested_sup = (
+            prev["high"] >= sup_val - tol
+            or prev["close"] >= sup_val - tol
+            or curr["high"] >= sup_val - tol
+        )
+        confirmed_put = (
+            (curr["close"] < curr["open"])
+            and (curr["close"] <= sup_val + (tol * 0.4))
+            and (curr["close"] <= prev["close"])
+        )
+
+        if broke_below and retested_sup and confirmed_put and 25 <= rsi <= 80:
             direction = "PUT"
-            win_prob = calc_win_probability("PUT", rsi, resistance_line, curr, res_val)
+            setup_tag = "BRK+RET+CONF"
+            win_prob = calc_win_probability("PUT", rsi, support_line, curr, sup_val, True)
 
     if direction is None:
-        return None, diag
+        return None, f"{diag} no_brk_ret_conf"
 
     if win_prob >= 75:
         confidence = "🟢 TRÈ SOLID (Bon anpil)"
@@ -417,10 +433,11 @@ def evaluate_real_market(candles):
         "confidence": confidence,
         "win_prob": win_prob,
         "score": score,
+        "setup_tag": setup_tag,
         "rsi": round(rsi, 2),
         "close": curr["close"],
         "candle_time": curr["time"]
-    }, diag
+    }, f"{diag} {setup_tag}"
 
 
 # =====================================================
