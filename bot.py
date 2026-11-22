@@ -11,9 +11,9 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (M1, EXP 1M, PAYOUT >= 85%, 1 SIGNAL/RUN)
+# 1. PARAMÈT JENERAL (M1, EXP 1M, CALL + PUT, PAYOUT >= 85%, 1 SIGNAL/RUN)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - BREAKOUT RETEST CONF"
+VERSION = "ROMARIO PRO M1 - CALL & PUT BRK+RET+CONF"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -81,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioBreakoutRetestM1/1.0",
+            "User-Agent": "RomarioCallPutM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -175,7 +175,7 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL RSI AK TREND LINE ADVANCED (BREAKOUT + RETEST)
+# 2. KALKIL RSI AK TREND LINE ADVANCED (CALL + PUT)
 # =====================================================
 def calc_rsi(closes, period=7):
     if len(closes) < period + 1:
@@ -344,7 +344,7 @@ def score_trendline_structure(candles):
 
 
 # =====================================================
-# 3. ESTRATEJI BREAKOUT -> RETEST -> KONFIMASYON (M1)
+# 3. ESTRATEJI CALL & PUT: BREAKOUT -> RETEST -> KONFIMASYON
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
@@ -357,7 +357,7 @@ def evaluate_real_market(candles):
         return None, "rsi unavailable"
 
     support_line, resistance_line = build_trendlines(window)
-    recent = window[-6:-1]  # 5 bouji anvan bouji aktyèl la pou chèche breakout
+    recent = window[-6:-1]
     prev = window[-2]
     curr = window[-1]
 
@@ -372,11 +372,13 @@ def evaluate_real_market(candles):
     win_prob = 50
     setup_tag = ""
 
+    body_size = abs(curr["close"] - curr["open"])
+
     # ---------------- CALL: BREAKOUT REZISTANS -> RETEST -> KONFIMASYON ----------------
     if resistance_line is not None:
         res_val = resistance_line["value"]
         broke_above = any(
-            (b["close"] > res_val + (tol * 0.15)) or (b["high"] > res_val + tol)
+            (b["close"] > res_val + (tol * 0.20)) or (b["high"] > res_val + (tol * 1.05))
             for b in recent
         )
         retested_res = (
@@ -384,22 +386,26 @@ def evaluate_real_market(candles):
             or prev["close"] <= res_val + tol
             or curr["low"] <= res_val + tol
         )
+        upper_wick = max(0.0, curr["high"] - max(curr["open"], curr["close"]))
+        no_heavy_seller_wick = upper_wick <= (body_size * 1.15)
+
         confirmed_call = (
             (curr["close"] > curr["open"])
-            and (curr["close"] >= res_val - (tol * 0.4))
+            and (curr["close"] >= res_val - (tol * 0.25))
             and (curr["close"] >= prev["close"])
+            and no_heavy_seller_wick
         )
 
-        if broke_above and retested_res and confirmed_call and 20 <= rsi <= 75:
+        if broke_above and retested_res and confirmed_call and 25 <= rsi <= 72:
             direction = "CALL"
-            setup_tag = "BRK+RET+CONF"
+            setup_tag = "CALL_BRK_RET_CONF"
             win_prob = calc_win_probability("CALL", rsi, resistance_line, curr, res_val, True)
 
     # ---------------- PUT: BREAKOUT SIPÒ -> RETEST -> KONFIMASYON ----------------
     if direction is None and support_line is not None:
         sup_val = support_line["value"]
         broke_below = any(
-            (b["close"] < sup_val - (tol * 0.15)) or (b["low"] < sup_val - tol)
+            (b["close"] < sup_val - (tol * 0.25)) or (b["low"] < sup_val - (tol * 1.1))
             for b in recent
         )
         retested_sup = (
@@ -407,15 +413,19 @@ def evaluate_real_market(candles):
             or prev["close"] >= sup_val - tol
             or curr["high"] >= sup_val - tol
         )
+        lower_wick = max(0.0, min(curr["open"], curr["close"]) - curr["low"])
+        no_heavy_buyer_wick = lower_wick <= (body_size * 1.15)
+
         confirmed_put = (
             (curr["close"] < curr["open"])
-            and (curr["close"] <= sup_val + (tol * 0.4))
+            and (curr["close"] <= sup_val + (tol * 0.25))
             and (curr["close"] <= prev["close"])
+            and no_heavy_buyer_wick
         )
 
-        if broke_below and retested_sup and confirmed_put and 25 <= rsi <= 80:
+        if broke_below and retested_sup and confirmed_put and 30 <= rsi <= 75:
             direction = "PUT"
-            setup_tag = "BRK+RET+CONF"
+            setup_tag = "PUT_BRK_RET_CONF"
             win_prob = calc_win_probability("PUT", rsi, support_line, curr, sup_val, True)
 
     if direction is None:
