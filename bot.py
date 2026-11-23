@@ -11,31 +11,23 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (M1, EXP 60S, MOMENTUM SNAP, PAYOUT >= 90%)
+# 1. PARAMÈT JENERAL (ALL ELIGIBLE OTC PAIRS -> TOP 4 SNAP 60S)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - MOMENTUM SNAP (60S)"
+VERSION = "ROMARIO PRO M1 - ALL OTC TOP 4 SNAP 60S"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 TIMEFRAME = 60            # Graf 1 minit (M1)
 EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
-MIN_PAYOUT = 90.0         # Minimòm 90% payout sou OTC
+MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
 ENTRY_LEAD = 3            # Avèti w 3 segonn anvan ouvèti nouvo bouji a
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
-MAX_WAIT_SECONDS = 180    # Chèche yon opòtinite nan 1 a 3 minit
+MAX_WAIT_SECONDS = 240    # Chèche yon bon opòtinite nan 4 minit max
 MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
 
 CANDLE_LIMIT = 90
 MIN_CANDLES = 50
 MAX_RECONNECTS = 4
-
-# Pè klasik ki pi estab
-VALID_PAIRS = {
-    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
-    "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
-    "EURJPY_otc", "GBPJPY_otc", "AUDCHF_otc", "EURCHF_otc",
-    "AUDCAD_otc", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"
-}
 
 API_CONNECT_TIMEOUT = 4
 API_READ_TIMEOUT = 10
@@ -81,7 +73,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioMomentumSnapM1/1.0",
+            "User-Agent": "RomarioAllOtcSnapM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -332,20 +324,14 @@ def evaluate_real_market(candles):
         f"body_r={body_ratio:.2f} bull={info['bull_snap_trend']} bear={info['bear_snap_trend']}"
     )
 
-    # Rule 4: Skip Doji / tiny candles with dead volume
     if range_curr < avg_r * 0.55 or body_ratio < 0.25:
         return None, f"{diag} doji_or_tiny_candle"
 
-    # Rule 3: Avoid overextended entry far from EMA 9
     if abs(curr["close"] - e9_now) > avg_r * 1.8:
         return None, f"{diag} overextended"
 
-    # ---------------- CALL: SHALLOW TOUCH EMA 9 + REJECTION WICK ----------------
     if info["bull_snap_trend"] and curr["close"] > e9_now > e20_now > e40_now:
-        # Rule 2: Never touch or drop to EMA 20 / EMA 40
         no_deep_pullback = curr["low"] > e20_now and curr["close"] > e20_now
-
-        # Rule 1 & 2 & 3: Shallow touch/pierce of EMA 9 + bottom rejection wick
         shallow_touch_e9 = curr["low"] <= e9_now + (avg_r * 0.25)
         lower_wick = max(0.0, min(curr["open"], curr["close"]) - curr["low"])
         has_bottom_rejection = lower_wick >= (range_curr * 0.22) and (lower_wick >= body_curr * 0.45)
@@ -362,12 +348,8 @@ def evaluate_real_market(candles):
                 "candle_time": curr["time"]
             }, f"{diag} CALL_SNAP_60S"
 
-    # ---------------- PUT: SHALLOW TOUCH EMA 9 + REJECTION WICK ----------------
     if info["bear_snap_trend"] and curr["close"] < e9_now < e20_now < e40_now:
-        # Rule 2: Never push up to EMA 20 / EMA 40
         no_deep_pullback = curr["high"] < e20_now and curr["close"] < e20_now
-
-        # Rule 1 & 2 & 3: Shallow touch/pierce of EMA 9 + top rejection wick
         shallow_touch_e9 = curr["high"] >= e9_now - (avg_r * 0.25)
         upper_wick = max(0.0, curr["high"] - max(curr["open"], curr["close"]))
         has_top_rejection = upper_wick >= (range_curr * 0.22) and (upper_wick >= body_curr * 0.45)
@@ -413,8 +395,8 @@ def get_eligible_symbols():
     seen = set()
 
     for item in data.get("symbols", []):
-        symbol = item.get("symbol")
-        if symbol not in VALID_PAIRS or symbol in seen:
+        symbol = (item.get("symbol") or "").strip()
+        if not symbol or symbol in seen:
             continue
         if item.get("open") is False:
             continue
@@ -665,7 +647,7 @@ def main():
 
     eligible = get_eligible_symbols()
     if not eligible:
-        log("No pairs >= 90% open right now.")
+        log("No pairs >= 85% open right now.")
         sys.exit(0)
 
     histories, ranked = download_all_histories(eligible)
