@@ -11,22 +11,22 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (M1, EXP 1M, EMA FAN & PULLBACK, PAYOUT >= 85%)
+# 1. PARAMÈT JENERAL (M1, EXP 60S, MOMENTUM SNAP, PAYOUT >= 90%)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - EMA 9/20/40 FAN+PULLBACK"
+VERSION = "ROMARIO PRO M1 - MOMENTUM SNAP (60S)"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 60            # Bouji 1 minit
-EXPIRATION = 60           # Ekspirasyon 1 minit (antre nan ouvèti pwochen bouji a)
-MIN_PAYOUT = 85.0         # Mache 85% ou plis
-ENTRY_LEAD = 10           # Avèti w 10 segonn anvan bouji 1m lan fèmen
+TIMEFRAME = 60            # Graf 1 minit (M1)
+EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
+MIN_PAYOUT = 90.0         # Minimòm 90% payout sou OTC
+ENTRY_LEAD = 3            # Avèti w 3 segonn anvan ouvèti nouvo bouji a
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
-MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
+MAX_WAIT_SECONDS = 180    # Chèche yon opòtinite nan 1 a 3 minit
 MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
 
 CANDLE_LIMIT = 90
-MIN_CANDLES = 50          # Nesesè pou EMA 40 + pullback + konfimasyon
+MIN_CANDLES = 50
 MAX_RECONNECTS = 4
 
 # Pè klasik ki pi estab
@@ -81,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioEmaFanPullbackM1/1.0",
+            "User-Agent": "RomarioMomentumSnapM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -175,7 +175,7 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL EMA 9, EMA 20, EMA 40 ("FAN & PULLBACK")
+# 2. KALKIL EMA 9, EMA 20, EMA 40 ("MOMENTUM SNAP")
 # =====================================================
 def calc_ema_series(closes, period):
     if len(closes) < period:
@@ -197,77 +197,71 @@ def align_ema_series(closes, period):
     return ([None] * pad_len) + raw
 
 
-def calc_win_probability_ema(direction, ema9, ema20, ema40, curr, avg_range):
-    prob = 55.0
+def calc_win_probability_snap(direction, ema9, ema20, ema40, curr, avg_range):
+    prob = 56.0
 
-    spread_9_20 = abs(ema9[-1] - ema20[-1])
-    spread_20_40 = abs(ema20[-1] - ema40[-1])
-    min_sep = max(avg_range * 0.25, 1e-12)
-
-    if spread_9_20 >= min_sep and spread_20_40 >= min_sep:
-        prob += 14.0
+    spread_now = abs(ema9[-1] - ema20[-1])
+    spread_prev = abs(ema9[-2] - ema20[-2])
+    if spread_now > spread_prev:
+        prob += 12.0
     else:
-        prob += 6.0
+        prob += 4.0
 
     if direction == "CALL":
-        if ema9[-1] > ema9[-2] and ema20[-1] > ema20[-2] and ema40[-1] > ema40[-2]:
+        if ema9[-1] > ema9[-2] > ema9[-3] and ema20[-1] > ema20[-2] and ema40[-1] > ema40[-2]:
             prob += 14.0
         else:
             prob += 6.0
-        if curr["close"] > ema9[-1]:
+        if curr["close"] >= ema9[-1]:
             prob += 10.0
     else:
-        if ema9[-1] < ema9[-2] and ema20[-1] < ema20[-2] and ema40[-1] < ema40[-2]:
+        if ema9[-1] < ema9[-2] < ema9[-3] and ema20[-1] < ema20[-2] and ema40[-1] < ema40[-2]:
             prob += 14.0
         else:
             prob += 6.0
-        if curr["close"] < ema9[-1]:
+        if curr["close"] <= ema9[-1]:
             prob += 10.0
 
     prob = max(50.0, min(98.0, prob))
     return int(round(prob))
 
 
-def check_fan_and_emas(window):
+def check_snap_structure(window):
     closes = [c["close"] for c in window]
     ema9 = align_ema_series(closes, 9)
     ema20 = align_ema_series(closes, 20)
     ema40 = align_ema_series(closes, 40)
 
-    if ema9[-1] is None or ema20[-1] is None or ema40[-1] is None:
-        return None
-    if ema9[-4] is None or ema20[-4] is None or ema40[-4] is None:
+    if any(x is None for x in (ema9[-1], ema9[-2], ema9[-3], ema20[-1], ema20[-2], ema40[-1], ema40[-2])):
         return None
 
     avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    min_sep = max(avg_range * 0.22, 1e-12)
+    min_gap = max(avg_range * 0.25, 1e-12)
 
-    # Verify EMAs are not flat / tangled over recent bars
-    e9_delta = abs(ema9[-1] - ema9[-4])
-    e20_delta = abs(ema20[-1] - ema20[-4])
-    e40_delta = abs(ema40[-1] - ema40[-4])
+    gap_9_20_now = abs(ema9[-1] - ema20[-1])
+    gap_20_40_now = abs(ema20[-1] - ema40[-1])
+    gap_9_20_prev = abs(ema9[-2] - ema20[-2])
 
-    sep_9_20 = abs(ema9[-1] - ema20[-1])
-    sep_20_40 = abs(ema20[-1] - ema40[-1])
+    expanding_9_20 = gap_9_20_now > gap_9_20_prev
 
-    bull_fan = (
+    bull_snap_trend = (
         ema9[-1] > ema20[-1] > ema40[-1]
-        and sep_9_20 >= min_sep
-        and sep_20_40 >= min_sep
-        and ema9[-1] > ema9[-3]
-        and ema20[-1] > ema20[-3]
-        and ema40[-1] > ema40[-3]
-        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+        and gap_9_20_now >= min_gap
+        and gap_20_40_now >= min_gap
+        and expanding_9_20
+        and ema9[-1] > ema9[-2] > ema9[-3]
+        and ema20[-1] > ema20[-2]
+        and ema40[-1] > ema40[-2]
     )
 
-    bear_fan = (
+    bear_snap_trend = (
         ema9[-1] < ema20[-1] < ema40[-1]
-        and sep_9_20 >= min_sep
-        and sep_20_40 >= min_sep
-        and ema9[-1] < ema9[-3]
-        and ema20[-1] < ema20[-3]
-        and ema40[-1] < ema40[-3]
-        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+        and gap_9_20_now >= min_gap
+        and gap_20_40_now >= min_gap
+        and expanding_9_20
+        and ema9[-1] < ema9[-2] < ema9[-3]
+        and ema20[-1] < ema20[-2]
+        and ema40[-1] < ema40[-2]
     )
 
     return {
@@ -275,51 +269,47 @@ def check_fan_and_emas(window):
         "ema20": ema20,
         "ema40": ema40,
         "avg_range": avg_range,
-        "bull_fan": bull_fan,
-        "bear_fan": bear_fan
+        "bull_snap_trend": bull_snap_trend,
+        "bear_snap_trend": bear_snap_trend
     }
 
 
-def score_ema_structure(candles):
+def score_snap_structure(candles):
     if len(candles) < MIN_CANDLES:
         return 0.0
 
     window = candles[-60:] if len(candles) >= 60 else candles
-    info = check_fan_and_emas(window)
+    info = check_snap_structure(window)
     if info is None:
         return 0.0
 
     curr = window[-1]
     e9 = info["ema9"][-1]
-    e20 = info["ema20"][-1]
-    e40 = info["ema40"][-1]
     avg_r = info["avg_range"]
 
     score = 20.0
-    if info["bull_fan"] or info["bear_fan"]:
-        score += 35.0
-    else:
-        if (e9 > e20 > e40) or (e9 < e20 < e40):
-            score += 15.0
-
-    dist_e9 = abs(curr["close"] - e9)
-    if dist_e9 <= avg_r * 2.5:
+    if info["bull_snap_trend"] or info["bear_snap_trend"]:
+        score += 40.0
+    elif (info["ema9"][-1] > info["ema20"][-1] > info["ema40"][-1]) or (
+        info["ema9"][-1] < info["ema20"][-1] < info["ema40"][-1]
+    ):
         score += 15.0
-    if abs(e9 - e20) >= avg_r * 0.25 and abs(e20 - e40) >= avg_r * 0.25:
-        score += 10.0
+
+    if abs(curr["close"] - e9) <= avg_r * 1.6:
+        score += 15.0
 
     return round(score, 2)
 
 
 # =====================================================
-# 3. ESTRATEJI "FAN & PULLBACK" (CALL & PUT)
+# 3. ESTRATEJI "MOMENTUM SNAP" 60S (CALL & PUT)
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
     window = candles[-60:] if len(candles) >= 60 else candles
-    info = check_fan_and_emas(window)
+    info = check_snap_structure(window)
     if info is None:
         return None, "ema unavailable"
 
@@ -328,53 +318,40 @@ def evaluate_real_market(candles):
     ema40 = info["ema40"]
     avg_r = info["avg_range"]
 
-    # Check pullback on recent 1-3 candles before confirmation bar
-    pullback_bars = window[-4:-1]
-    pullback_e9 = ema9[-4:-1]
-    pullback_e20 = ema20[-4:-1]
-    pullback_e40 = ema40[-4:-1]
-
     curr = window[-1]
     e9_now = ema9[-1]
     e20_now = ema20[-1]
     e40_now = ema40[-1]
 
+    range_curr = max(curr["high"] - curr["low"], 1e-12)
+    body_curr = abs(curr["close"] - curr["open"])
+    body_ratio = body_curr / range_curr
+
     diag = (
         f"e9={format_price(e9_now)} e20={format_price(e20_now)} "
-        f"e40={format_price(e40_now)} bull={info['bull_fan']} bear={info['bear_fan']}"
+        f"body_r={body_ratio:.2f} bull={info['bull_snap_trend']} bear={info['bear_snap_trend']}"
     )
 
-    # Filter: Overextended price far from EMA 9
-    if abs(curr["close"] - e9_now) > avg_r * 2.8:
+    # Rule 4: Skip Doji / tiny candles with dead volume
+    if range_curr < avg_r * 0.55 or body_ratio < 0.25:
+        return None, f"{diag} doji_or_tiny_candle"
+
+    # Rule 3: Avoid overextended entry far from EMA 9
+    if abs(curr["close"] - e9_now) > avg_r * 1.8:
         return None, f"{diag} overextended"
 
-    # ---------------- BUY (CALL) RULES ----------------
-    if info["bull_fan"] and curr["close"] > e9_now > e20_now > e40_now:
-        # Filter: EMA 40 breach check on pullback candles
-        no_ema40_breach = all(
-            c["close"] > e40_v and min(c["open"], c["close"]) > e40_v - (avg_r * 0.35)
-            for c, e40_v in zip(pullback_bars, pullback_e40)
-        )
-        # Pullback: red candle(s) dip to touch/pierce EMA 9 or EMA 20
-        had_red_pullback = any(
-            (c["close"] < c["open"])
-            and (
-                c["low"] <= e9_v + (avg_r * 0.25)
-                or c["low"] <= e20_v + (avg_r * 0.25)
-            )
-            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
-        )
-        # Confirmation: green candle rejects EMA zone and closes firmly above EMA 9
-        body_curr = curr["close"] - curr["open"]
-        range_curr = max(curr["high"] - curr["low"], 1e-12)
-        confirmed_call = (
-            curr["close"] > curr["open"]
-            and curr["close"] > e9_now + (avg_r * 0.12)
-            and body_curr >= range_curr * 0.35
-        )
+    # ---------------- CALL: SHALLOW TOUCH EMA 9 + REJECTION WICK ----------------
+    if info["bull_snap_trend"] and curr["close"] > e9_now > e20_now > e40_now:
+        # Rule 2: Never touch or drop to EMA 20 / EMA 40
+        no_deep_pullback = curr["low"] > e20_now and curr["close"] > e20_now
 
-        if no_ema40_breach and had_red_pullback and confirmed_call:
-            win_prob = calc_win_probability_ema("CALL", ema9, ema20, ema40, curr, avg_r)
+        # Rule 1 & 2 & 3: Shallow touch/pierce of EMA 9 + bottom rejection wick
+        shallow_touch_e9 = curr["low"] <= e9_now + (avg_r * 0.25)
+        lower_wick = max(0.0, min(curr["open"], curr["close"]) - curr["low"])
+        has_bottom_rejection = lower_wick >= (range_curr * 0.22) and (lower_wick >= body_curr * 0.45)
+
+        if no_deep_pullback and shallow_touch_e9 and has_bottom_rejection:
+            win_prob = calc_win_probability_snap("CALL", ema9, ema20, ema40, curr, avg_r)
             confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
             return {
                 "direction": "CALL",
@@ -383,35 +360,20 @@ def evaluate_real_market(candles):
                 "score": 6 if win_prob >= 75 else 5,
                 "close": curr["close"],
                 "candle_time": curr["time"]
-            }, f"{diag} CALL_FAN_PULLBACK"
+            }, f"{diag} CALL_SNAP_60S"
 
-    # ---------------- SELL (PUT) RULES ----------------
-    if info["bear_fan"] and curr["close"] < e9_now < e20_now < e40_now:
-        # Filter: EMA 40 breach check on pullback candles
-        no_ema40_breach = all(
-            c["close"] < e40_v and max(c["open"], c["close"]) < e40_v + (avg_r * 0.35)
-            for c, e40_v in zip(pullback_bars, pullback_e40)
-        )
-        # Pullback: green candle(s) bounce to touch EMA 9 or EMA 20
-        had_green_pullback = any(
-            (c["close"] > c["open"])
-            and (
-                c["high"] >= e9_v - (avg_r * 0.25)
-                or c["high"] >= e20_v - (avg_r * 0.25)
-            )
-            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
-        )
-        # Confirmation: red candle rejects EMA zone and closes firmly below EMA 9
-        body_curr = curr["open"] - curr["close"]
-        range_curr = max(curr["high"] - curr["low"], 1e-12)
-        confirmed_put = (
-            curr["close"] < curr["open"]
-            and curr["close"] < e9_now - (avg_r * 0.12)
-            and body_curr >= range_curr * 0.35
-        )
+    # ---------------- PUT: SHALLOW TOUCH EMA 9 + REJECTION WICK ----------------
+    if info["bear_snap_trend"] and curr["close"] < e9_now < e20_now < e40_now:
+        # Rule 2: Never push up to EMA 20 / EMA 40
+        no_deep_pullback = curr["high"] < e20_now and curr["close"] < e20_now
 
-        if no_ema40_breach and had_green_pullback and confirmed_put:
-            win_prob = calc_win_probability_ema("PUT", ema9, ema20, ema40, curr, avg_r)
+        # Rule 1 & 2 & 3: Shallow touch/pierce of EMA 9 + top rejection wick
+        shallow_touch_e9 = curr["high"] >= e9_now - (avg_r * 0.25)
+        upper_wick = max(0.0, curr["high"] - max(curr["open"], curr["close"]))
+        has_top_rejection = upper_wick >= (range_curr * 0.22) and (upper_wick >= body_curr * 0.45)
+
+        if no_deep_pullback and shallow_touch_e9 and has_top_rejection:
+            win_prob = calc_win_probability_snap("PUT", ema9, ema20, ema40, curr, avg_r)
             confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
             return {
                 "direction": "PUT",
@@ -420,9 +382,9 @@ def evaluate_real_market(candles):
                 "score": 6 if win_prob >= 75 else 5,
                 "close": curr["close"],
                 "candle_time": curr["time"]
-            }, f"{diag} PUT_FAN_PULLBACK"
+            }, f"{diag} PUT_SNAP_60S"
 
-    return None, f"{diag} no_fan_pullback"
+    return None, f"{diag} no_momentum_snap"
 
 
 # =====================================================
@@ -431,10 +393,10 @@ def evaluate_real_market(candles):
 def format_signal_message(pair, payout, entry_time_str, signal_data):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
     return (
-        f"🤖 ROMARIO PRO M1 (EMA 9/20/40)\n\n"
+        f"🤖 ROMARIO PRO M1 (SNAP 60S)\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
         f"📊 Nivo: {signal_data['win_prob']}%\n"
-        f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
+        f"🎯 Antre: {entry_time_str} (Exp: 60s)\n"
         f"🛡️ Konfyans: {signal_data['confidence']}"
     )
 
@@ -497,7 +459,7 @@ def download_all_histories(eligible):
 
     def fetch_and_score(item):
         candles = get_candles(item["symbol"])
-        setup_score = score_ema_structure(candles) if candles else 0.0
+        setup_score = score_snap_structure(candles) if candles else 0.0
         enriched = dict(item)
         enriched["setup_score"] = setup_score
         return enriched, candles
@@ -534,7 +496,7 @@ def finalize_pending_trade(pending, last_prices):
             is_win,
             send_telegram_fn
         )
-        log(f"{sym}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
+        log(f"{sym}: 60s trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
     else:
         log(f"{sym}: Trade window ended. Stopping bot.")
 
@@ -543,7 +505,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening M1 EMA stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    log(f"Opening M1 Momentum Snap stream for top {len(symbols)} pairs: {', '.join(symbols)}")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
@@ -666,7 +628,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None,
                                 "last_price": price
                             }
-                            log(f"{symbol}: Single EMA signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
+                            log(f"{symbol}: Single 60s snap signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
                     else:
                         log(f"{symbol}: no setup ({diag})")
 
@@ -703,7 +665,7 @@ def main():
 
     eligible = get_eligible_symbols()
     if not eligible:
-        log("No pairs >= 85% open right now.")
+        log("No pairs >= 90% open right now.")
         sys.exit(0)
 
     histories, ranked = download_all_histories(eligible)
@@ -713,7 +675,7 @@ def main():
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     top_pairs = ranked[:active_limit]
-    log("Top selected EMA pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
+    log("Top selected snap pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
     deadline = time.time() + MAX_WAIT_SECONDS
