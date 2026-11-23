@@ -7,10 +7,10 @@ import threading
 import requests
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (M1, EXP 60S, 10S LEAD)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (M1, EXP 60S, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -21,12 +21,12 @@ EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
 MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
 ENTRY_LEAD = 10           # Avèti w 10 segonn anvan nouvo bouji a ouvè
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
-MAX_WAIT_SECONDS = 240    # Chèche yon opòtinite nan 4 minit max
+MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
 
 CANDLE_LIMIT = 90
 MIN_CANDLES = 50
-MAX_RECONNECTS = 4
+MAX_RECONNECTS = 5
 
 # Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
 TOXIC_CURRENCIES = ("TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB", "HUF", "SEK", "NOK")
@@ -37,7 +37,8 @@ API_READ_TIMEOUT = 10
 TELEGRAM_ATTEMPTS = 3
 TELEGRAM_TIMEOUT = (1, 2)
 
-LOCAL_TZ = datetime.now().astimezone().tzinfo
+# Lè egzak itilizatè a: UTC-5
+USER_TZ = timezone(timedelta(hours=-5))
 
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -75,7 +76,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/2.4",
+            "User-Agent": "RomarioProM1/2.5",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -90,18 +91,16 @@ def is_clean_pair(symbol):
     return not any(code in up for code in TOXIC_CURRENCIES)
 
 
-def compute_real_entry_timestamp(seconds_left_in_bar):
+def compute_utc5_entry_timestamp(seconds_left_in_bar):
     """
-    Kalkile lè egzak antre a apati revèy lokal sistèm nan (time.time())
-    plis segonn ki rete anvan nouvo bouji 60s lan ouvè.
+    Kalkile timestamp pwochen ouvèti bouji 60s la apati lè UTC-5 aktyèl la.
     """
     rem = max(1, min(TIMEFRAME, int(round(seconds_left_in_bar))))
-    now_local = time.time()
-    # Awondi sou pwochen minit plen dapre lè lokal aktyèl la
-    next_minute_local = ((int(now_local) // TIMEFRAME) + 1) * TIMEFRAME
-    if abs(next_minute_local - (now_local + rem)) <= 3:
-        return next_minute_local
-    return int(round(now_local + rem))
+    now_utc5_epoch = datetime.now(USER_TZ).timestamp()
+    next_minute_utc5 = ((int(now_utc5_epoch) // TIMEFRAME) + 1) * TIMEFRAME
+    if abs(next_minute_utc5 - (now_utc5_epoch + rem)) <= 3:
+        return next_minute_utc5
+    return int(round(now_utc5_epoch + rem))
 
 
 def api_get(path, params=None, stream=False):
@@ -568,7 +567,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
     try:
         for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
-            now = time.time()
+            now = datetime.now(USER_TZ).timestamp()
 
             if pending is not None:
                 if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
@@ -626,7 +625,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 continue
 
             last_prices[symbol] = price
-            now = time.time()
+            now = datetime.now(USER_TZ).timestamp()
 
             if pending is not None:
                 if symbol == pending["symbol"]:
@@ -665,8 +664,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     if signal_data:
                         pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
-                        entry_ts = compute_real_entry_timestamp(seconds_left_in_bar)
-                        entry_time_str = datetime.fromtimestamp(entry_ts, tz=LOCAL_TZ).strftime("%I:%M:%S %p")
+                        entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
+                        entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
 
                         msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=price)
                         if send_telegram_fn(msg):
@@ -680,7 +679,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None,
                                 "last_price": price
                             }
-                            log(f"{symbol}: Signal sent ({signal_data['direction']}, win={signal_data['win_prob']}%) -> Entry {entry_time_str}.")
+                            log(f"{symbol}: Signal sent ({signal_data['direction']}, win={signal_data['win_prob']}%) -> Entry {entry_time_str} (UTC-5).")
                     else:
                         log(f"{symbol}: no setup ({diag})")
 
@@ -714,7 +713,7 @@ def fetch_eligible_with_retry(deadline):
         try:
             return get_eligible_symbols()
         except Exception as e:
-            remaining = deadline - time.time()
+            remaining = deadline - datetime.now(USER_TZ).timestamp()
             if remaining <= 3.0:
                 raise
             wait_sec = min(4.0, max(1.0, remaining - 1.0))
@@ -728,7 +727,7 @@ def main():
         log("Credentials missing!")
         sys.exit(1)
 
-    deadline = time.time() + MAX_WAIT_SECONDS
+    deadline = datetime.now(USER_TZ).timestamp() + MAX_WAIT_SECONDS
 
     try:
         eligible = fetch_eligible_with_retry(deadline)
@@ -752,7 +751,7 @@ def main():
     current_bars = {}
 
     reconnects = 0
-    while time.time() < deadline:
+    while datetime.now(USER_TZ).timestamp() < deadline:
         stream_subset = ranked[:active_limit]
         try:
             status = run_live_stream(stream_subset, histories, current_bars, deadline)
@@ -763,7 +762,8 @@ def main():
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 break
-            wait_sec = min(4.0, max(1.0, deadline - time.time()))
+            rem = deadline - datetime.now(USER_TZ).timestamp()
+            wait_sec = min(7.0, max(2.0, rem))
             log(f"Reconnecting in {wait_sec:.1f}s...")
             time.sleep(wait_sec)
         except StreamBadRequestError as e:
@@ -771,14 +771,15 @@ def main():
             if active_limit > 1:
                 active_limit -= 1
                 log(f"Reducing stream batch to {active_limit} pairs and retrying...")
-                time.sleep(1.0)
+                time.sleep(1.5)
                 continue
             break
         except StreamRateLimitError as e:
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 break
-            wait_sec = min(e.retry_after, max(0.0, deadline - time.time()))
+            rem = deadline - datetime.now(USER_TZ).timestamp()
+            wait_sec = min(e.retry_after, max(0.0, rem))
             if wait_sec <= 2:
                 break
             log(f"Rate limit. Waiting {wait_sec:.1f}s...")
@@ -788,7 +789,8 @@ def main():
             reconnects += 1
             if reconnects > MAX_RECONNECTS:
                 break
-            wait_sec = min(4.0, max(1.0, deadline - time.time()))
+            rem = deadline - datetime.now(USER_TZ).timestamp()
+            wait_sec = min(7.0, max(2.0, rem))
             if wait_sec <= 1:
                 break
             time.sleep(wait_sec)
