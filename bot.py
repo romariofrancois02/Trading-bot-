@@ -1,466 +1,769 @@
-import asyncio
+import os
+import sys
+import json
+import time
 import logging
-import math
-import random
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import threading
+import requests
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+# =====================================================
+# 1. PARAMÈT JENERAL (M1, EXP 1M, EMA FAN & PULLBACK, PAYOUT >= 85%)
+# =====================================================
+VERSION = "ROMARIO PRO M1 - EMA 9/20/40 FAN+PULLBACK"
+
+BASE_URL = "https://otcharts.com"
+VENUE = "otc"
+TIMEFRAME = 60            # Bouji 1 minit
+EXPIRATION = 60           # Ekspirasyon 1 minit (antre nan ouvèti pwochen bouji a)
+MIN_PAYOUT = 85.0         # Mache 85% ou plis
+ENTRY_LEAD = 10           # Avèti w 10 segonn anvan bouji 1m lan fèmen
+MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
+MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
+MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
+
+CANDLE_LIMIT = 90
+MIN_CANDLES = 50          # Nesesè pou EMA 40 + pullback + konfimasyon
+MAX_RECONNECTS = 4
+
+# Pè klasik ki pi estab
+VALID_PAIRS = {
+    "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
+    "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
+    "EURJPY_otc", "GBPJPY_otc", "AUDCHF_otc", "EURCHF_otc",
+    "AUDCAD_otc", "EURUSD", "GBPUSD", "USDJPY", "AUDUSD"
+}
+
+API_CONNECT_TIMEOUT = 4
+API_READ_TIMEOUT = 10
+
+TELEGRAM_ATTEMPTS = 3
+TELEGRAM_TIMEOUT = (1, 2)
+
+TIMEZONE = ZoneInfo("America/New_York")
+
+API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s"
 )
-logger = logging.getLogger("ROMARIO_PRO")
-
-
-# =====================================================================
-# 1. KONFIGIRASYON BOT LA
-# =====================================================================
-CONFIG = {
-    "pairs": ["PLTR_otc", "MARA_otc", "USDCHF_otc", "EURUSD_otc"],
-    "timeframe_sec": 60,           # M1 (60 segonn)
-    "expiry_sec": 60,              # Ekspirasyon 60 segonn (1m)
-    "min_payout": 85.0,            # Filtè payout minimòm (>= 85%)
-    "base_amount": 1.0,            # Montan baz (PA GEN MARTINGALE OTOMATIK)
-    "eval_sec_start": 55,          # Evalye apati segonn :55
-    "eval_sec_end": 58,            # Jiska segonn :58
-    "entry_sec": 0,                # Pase lòd nan segonn :00
-    "min_adx": 25.0,               # Fòs tandans ADX >= 25
-    "min_di_diff": 4.0,            # Diferans DI+ ak DI- >= 4
-    "min_body_ratio": 0.55,        # Kò bouji >= 55% gwosè total bouji a
-    "candle_lookback": 120,        # 120 bouji M1 pou EMA40, ATR14, ADX14, Stoch
-    "poll_interval": 0.25,         # Frekans tcheke revèy la
-    "use_mock_fallback": True,     # True = si API broker pa konekte, li bay bouji tès pou voye siyal
-    "force_test_signal": None,     # Mete "CALL" oswa "PUT" sèlman si w vle fòse yon tès lòd nan :00; otreman None
-}
-
-
-# =====================================================================
-# 2. BROKER ADAPTER (KONEKTE API BROKER OU A ISIT LA)
-# =====================================================================
-class BrokerClient:
-    def __init__(self, pairs: List[str], cfg: Dict[str, Any]):
-        self.pairs = pairs
-        self.cfg = cfg
-        self.connected = False
-
-    async def connect(self) -> None:
-        logger.info(f"Connecting stream for pairs: {', '.join(self.pairs)}...")
-        # TODO: Konekte API broker ou a isit la si w genyen l
-        await asyncio.sleep(0.2)
-        self.connected = True
-        logger.info(f"Connected: {', '.join(sorted(self.pairs))}")
-
-    async def get_payout(self, pair: str) -> float:
-        # TODO: Ranplase avèk payout reyèl pè a soti nan broker la
-        return 88.0
-
-    def _generate_mock_trending_candles(self, pair: str, count: int = 120, bull: bool = True) -> List[Dict[str, float]]:
-        """
-        Jenere 120 bouji M1 ki gen tandans klè, pullback sou EMA9/EMA20,
-        bon kò bouji, ak kwazman Stochastic nan zòn 20-65 (pou CALL) oswa 35-80 (pou PUT).
-        """
-        base_map = {
-            "EURUSD_otc": 1.0870,
-            "USDCHF_otc": 0.8285,
-            "MARA_otc": 7.9500,
-            "PLTR_otc": 135.5500,
-        }
-        price = base_map.get(pair, 100.0)
-        step = max(price * 0.00045, 0.00025)
-        direction = 1.0 if bull else -1.0
-
-        candles: List[Dict[str, float]] = []
-        for i in range(count):
-            open_p = price
-
-            # Fè dènye bouji yo fòme pullback + bon bouji siyal
-            if i == count - 2:
-                # Bouji anvan (prev): ti retrace / pullback anvè EMA9/EMA20
-                delta = -direction * step * 0.65
-                close_p = open_p + delta
-                high_p = max(open_p, close_p) + step * 0.25
-                low_p = min(open_p, close_p) - step * 0.45
-            elif i == count - 1:
-                # Bouji aktyèl (curr): bon kò bouji (body_r ~ 0.72) nan direksyon tandans lan
-                delta = direction * step * 1.15
-                close_p = open_p + delta
-                if bull:
-                    low_p = min(open_p, close_p) - step * 0.15
-                    high_p = max(open_p, close_p) + step * 0.25
-                else:
-                    high_p = max(open_p, close_p) + step * 0.15
-                    low_p = min(open_p, close_p) - step * 0.25
-            else:
-                # Ti osilasyon ki kenbe tandans lan solid (ADX wo, DI separe)
-                wave = math.sin(i * 0.35) * step * 0.35
-                delta = (direction * step * 0.85) + wave
-                close_p = open_p + delta
-                high_p = max(open_p, close_p) + step * 0.22
-                low_p = min(open_p, close_p) - step * 0.22
-
-            candles.append({
-                "open": float(open_p),
-                "high": float(high_p),
-                "low": float(low_p),
-                "close": float(close_p),
-            })
-            price = close_p
-
-        return candles
-
-    async def fetch_candles(self, pair: str, count: int = 120) -> List[Dict[str, float]]:
-        # TODO: Ranplase avèk apèl bouji M1 reyèl broker ou a:
-        # raw = await api.get_candles(pair, timeframe=60, count=count)
-        raw: List[Dict[str, float]] = []
-
-        if raw:
-            return [
-                {
-                    "open": float(c["open"]),
-                    "high": float(c["high"]),
-                    "low": float(c["low"]),
-                    "close": float(c["close"]),
-                }
-                for c in raw[-count:]
-            ]
-
-        if self.cfg.get("use_mock_fallback", False):
-            # Alterné CALL ak PUT pa minit pou tès la montre siyal klè
-            minute_bucket = int(datetime.now(timezone.utc).timestamp()) // 60
-            bull = (minute_bucket % 2 == 0)
-            return self._generate_mock_trending_candles(pair, count=count, bull=bull)
-
-        return []
-
-    async def place_order(
-        self,
-        pair: str,
-        direction: str,
-        amount: float,
-        expiry_sec: int = 60,
-    ) -> Dict[str, Any]:
-        # TODO: Ranplase avèk fonksyon acha reyèl broker ou a
-        logger.info(
-            f"ORDER EXECUTED -> pair={pair} | dir={direction} | amount={amount:.2f} | expiry={expiry_sec}s"
-        )
-        return {"status": "filled", "pair": pair, "direction": direction, "amount": amount}
-
-
-# =====================================================================
-# 3. KALKIL ENDIKATÈ MATEMATIK (EMA, ATR, ADX/DMI, STOCHASTIC)
-# =====================================================================
-def calc_ema(values: List[float], period: int) -> List[float]:
-    if len(values) < period:
-        return []
-    k = 2.0 / (period + 1.0)
-    ema_vals: List[float] = [sum(values[:period]) / period]
-    for price in values[period:]:
-        ema_vals.append((price * k) + (ema_vals[-1] * (1.0 - k)))
-    return ema_vals
-
-
-def calc_atr_and_dmi(candles: List[Dict[str, float]], period: int = 14) -> Optional[Dict[str, float]]:
-    n = len(candles)
-    if n < (period * 2) + 2:
-        return None
-
-    tr_list: List[float] = []
-    plus_dm_list: List[float] = []
-    minus_dm_list: List[float] = []
-
-    for i in range(1, n):
-        high = float(candles[i]["high"])
-        low = float(candles[i]["low"])
-        prev_close = float(candles[i - 1]["close"])
-        prev_high = float(candles[i - 1]["high"])
-        prev_low = float(candles[i - 1]["low"])
-
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        up_move = high - prev_high
-        down_move = prev_low - low
-
-        plus_dm = up_move if (up_move > down_move and up_move > 0.0) else 0.0
-        minus_dm = down_move if (down_move > up_move and down_move > 0.0) else 0.0
-
-        tr_list.append(tr)
-        plus_dm_list.append(plus_dm)
-        minus_dm_list.append(minus_dm)
-
-    atr = sum(tr_list[:period])
-    smooth_plus_dm = sum(plus_dm_list[:period])
-    smooth_minus_dm = sum(minus_dm_list[:period])
-
-    dx_list: List[float] = []
-
-    di_plus = (100.0 * smooth_plus_dm / atr) if atr > 0 else 0.0
-    di_minus = (100.0 * smooth_minus_dm / atr) if atr > 0 else 0.0
-    if (di_plus + di_minus) > 0:
-        dx_list.append(100.0 * abs(di_plus - di_minus) / (di_plus + di_minus))
-
-    atr_avg = atr / period
-
-    for i in range(period, len(tr_list)):
-        atr = atr - (atr / period) + tr_list[i]
-        smooth_plus_dm = smooth_plus_dm - (smooth_plus_dm / period) + plus_dm_list[i]
-        smooth_minus_dm = smooth_minus_dm - (smooth_minus_dm / period) + minus_dm_list[i]
-
-        atr_avg = atr / period
-        di_plus = (100.0 * smooth_plus_dm / atr) if atr > 0 else 0.0
-        di_minus = (100.0 * smooth_minus_dm / atr) if atr > 0 else 0.0
-
-        if (di_plus + di_minus) > 0:
-            dx_list.append(100.0 * abs(di_plus - di_minus) / (di_plus + di_minus))
-
-    if len(dx_list) < period:
-        return None
-
-    adx = sum(dx_list[:period]) / period
-    for dx in dx_list[period:]:
-        adx = ((adx * (period - 1)) + dx) / period
-
-    return {
-        "atr": atr_avg,
-        "adx": adx,
-        "di_plus": di_plus,
-        "di_minus": di_minus,
-    }
-
-
-def calc_stochastic(
-    candles: List[Dict[str, float]],
-    k_period: int = 14,
-    smooth_k: int = 3,
-    d_period: int = 3,
-) -> Optional[Dict[str, float]]:
-    needed = k_period + smooth_k + d_period + 2
-    if len(candles) < needed:
-        return None
-
-    raw_k: List[float] = []
-    for i in range(k_period - 1, len(candles)):
-        window = candles[i - k_period + 1 : i + 1]
-        highest_high = max(float(c["high"]) for c in window)
-        lowest_low = min(float(c["low"]) for c in window)
-        close = float(candles[i]["close"])
-        span = highest_high - lowest_low
-        raw_k.append(50.0 if span <= 0 else (100.0 * (close - lowest_low) / span))
-
-    if len(raw_k) < smooth_k:
-        return None
-
-    k_line = [
-        sum(raw_k[i - smooth_k + 1 : i + 1]) / smooth_k
-        for i in range(smooth_k - 1, len(raw_k))
-    ]
-
-    if len(k_line) < d_period + 1:
-        return None
-
-    d_line = [
-        sum(k_line[i - d_period + 1 : i + 1]) / d_period
-        for i in range(d_period - 1, len(k_line))
-    ]
-
-    if len(d_line) < 2:
-        return None
-
-    return {
-        "k_prev": k_line[-2],
-        "k_curr": k_line[-1],
-        "d_prev": d_line[-2],
-        "d_curr": d_line[-1],
-    }
-
-
-# =====================================================================
-# 4. EVALUASYON SIYAL LA
-# =====================================================================
-def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
-    forced = cfg.get("force_test_signal")
-    if forced in ("CALL", "PUT"):
-        return {"signal": forced, "reason": f"FORCED_TEST_{forced}"}
-
-    min_payout = float(cfg["min_payout"])
-    min_adx = float(cfg["min_adx"])
-    min_di_diff = float(cfg["min_di_diff"])
-    min_body_ratio = float(cfg["min_body_ratio"])
-
-    if payout < min_payout:
-        return {"signal": None, "reason": f"low_payout({payout:.1f}<{min_payout:.1f})"}
-
-    if len(candles) < 60:
-        return {"signal": None, "reason": "not_enough_candles"}
-
-    closes = [float(c["close"]) for c in candles]
-    ema9_list = calc_ema(closes, 9)
-    ema20_list = calc_ema(closes, 20)
-    ema40_list = calc_ema(closes, 40)
-
-    if not ema9_list or not ema20_list or not ema40_list:
-        return {"signal": None, "reason": "ema_not_ready"}
-
-    dmi = calc_atr_and_dmi(candles, period=14)
-    stoch = calc_stochastic(candles, k_period=14, smooth_k=3, d_period=3)
-
-    if dmi is None or stoch is None:
-        return {"signal": None, "reason": "indicators_not_ready"}
-
-    atr = dmi["atr"]
-    adx = dmi["adx"]
-    di_plus = dmi["di_plus"]
-    di_minus = dmi["di_minus"]
-
-    if atr <= 0 or math.isnan(atr):
-        return {"signal": None, "reason": "invalid_atr"}
-
-    ema9 = ema9_list[-1]
-    ema20 = ema20_list[-1]
-    ema40 = ema40_list[-1]
-
-    ema_spread = abs(ema9 - ema20)
-    if ema_spread <= (0.2 * atr):
-        return {"signal": None, "reason": f"ema_flat_spread({ema_spread:.6f}<={0.2*atr:.6f})"}
-
-    curr = candles[-1]
-    prev = candles[-2]
-    curr_open = float(curr["open"])
-    curr_high = float(curr["high"])
-    curr_low = float(curr["low"])
-    curr_close = float(curr["close"])
-
-    price_extension = abs(curr_close - ema9)
-    if price_extension > (1.0 * atr):
-        return {"signal": None, "reason": f"overextended({price_extension:.6f}>{1.0*atr:.6f})"}
-
-    if adx < min_adx:
-        return {"signal": None, "reason": f"weak_adx({adx:.2f}<{min_adx:.2f})"}
-
-    candle_range = curr_high - curr_low
-    if candle_range <= 0:
-        return {"signal": None, "reason": "zero_range_candle"}
-
-    body_size = abs(curr_close - curr_open)
-    body_ratio = body_size / candle_range
-    if body_ratio < min_body_ratio:
-        return {"signal": None, "reason": f"weak_body_ratio({body_ratio:.2f}<{min_body_ratio:.2f})"}
-
-    ema9_prev = ema9_list[-2] if len(ema9_list) >= 2 else ema9
-    ema20_prev = ema20_list[-2] if len(ema20_list) >= 2 else ema20
-    pullback_tol = 0.25 * atr
-
-    prev_low = float(prev["low"])
-    prev_high = float(prev["high"])
-
-    touched_ema_zone = (
-        (prev_low <= ema9_prev + pullback_tol and prev_high >= ema9_prev - pullback_tol)
-        or (prev_low <= ema20_prev + pullback_tol and prev_high >= ema20_prev - pullback_tol)
-    )
-
-    k_prev, k_curr = stoch["k_prev"], stoch["k_curr"]
-    d_prev, d_curr = stoch["d_prev"], stoch["d_curr"]
-
-    bull_ema_stack = (ema9 > ema20) and (ema20 > ema40)
-    bull_di = (di_plus > di_minus) and ((di_plus - di_minus) >= min_di_diff)
-    bull_candle_ok = (curr_close > curr_open) and (curr_close > ema9)
-    bull_stoch_ok = (k_prev <= d_prev) and (k_curr > d_curr) and (20.0 <= k_curr <= 65.0)
-
-    if bull_ema_stack and bull_di and touched_ema_zone and bull_candle_ok and bull_stoch_ok:
-        return {
-            "signal": "CALL",
-            "reason": f"CALL_CONFIRMED(adx={adx:.1f}, di+={di_plus:.1f}, di-={di_minus:.1f}, body_r={body_ratio:.2f}, k={k_curr:.1f})",
-        }
-
-    bear_ema_stack = (ema9 < ema20) and (ema20 < ema40)
-    bear_di = (di_minus > di_plus) and ((di_minus - di_plus) >= min_di_diff)
-    bear_candle_ok = (curr_close < curr_open) and (curr_close < ema9)
-    bear_stoch_ok = (k_prev >= d_prev) and (k_curr < d_curr) and (35.0 <= k_curr <= 80.0)
-
-    if bear_ema_stack and bear_di and touched_ema_zone and bear_candle_ok and bear_stoch_ok:
-        return {
-            "signal": "PUT",
-            "reason": f"PUT_CONFIRMED(adx={adx:.1f}, di-={di_minus:.1f}, di+={di_plus:.1f}, body_r={body_ratio:.2f}, k={k_curr:.1f})",
-        }
-
-    return {
-        "signal": None,
-        "reason": f"no_setup(adx={adx:.1f}, di+={di_plus:.1f}, di-={di_minus:.1f}, body_r={body_ratio:.2f}, pull={touched_ema_zone}, k={k_curr:.1f}/d={d_curr:.1f})",
-    }
-
-
-# =====================================================================
-# 5. BOUK PRENSIPAL (EVALYE :55-:58, ANTREFÈ :00, SAN MARTINGALE)
-# =====================================================================
-async def run_bot() -> None:
-    logger.info("ROMARIO PRO starting...")
-    client = BrokerClient(CONFIG["pairs"], CONFIG)
-    await client.connect()
-
-    last_eval_minute_key: Optional[int] = None
-    pending_signals: List[Dict[str, Any]] = []
-    last_entry_minute_key: Optional[int] = None
-
-    while True:
-        now = datetime.now(timezone.utc)
-        minute_key = int(now.timestamp()) // 60
-        sec = now.second
-
-        # Evalye ant :55 ak :58 segonn
-        if (
-            CONFIG["eval_sec_start"] <= sec <= CONFIG["eval_sec_end"]
-            and minute_key != last_eval_minute_key
-        ):
-            last_eval_minute_key = minute_key
-            pending_signals.clear()
-
-            for pair in CONFIG["pairs"]:
+
+_thread_local = threading.local()
+
+
+class StreamRateLimitError(Exception):
+    def __init__(self, message, retry_after=30):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+class StreamBadRequestError(Exception):
+    pass
+
+
+def log(message):
+    logging.info(message)
+
+
+def normalize_ts(ts):
+    ts = int(ts)
+    return ts // 1000 if ts > 10_000_000_000 else ts
+
+
+def get_session():
+    if not hasattr(_thread_local, "session"):
+        _thread_local.session = requests.Session()
+        _thread_local.session.headers.update({
+            "Authorization": f"Bearer {API_KEY}",
+            "User-Agent": "RomarioEmaFanPullbackM1/1.0",
+            "Accept": "application/json"
+        })
+    return _thread_local.session
+
+
+def format_price(value):
+    return f"{float(value):.8f}".rstrip("0").rstrip(".")
+
+
+def api_get(path, params=None, stream=False):
+    url = BASE_URL + path
+    attempts = 1 if stream else 2
+
+    for attempt in range(1, attempts + 1):
+        response = None
+        try:
+            response = get_session().get(
+                url,
+                params=params,
+                timeout=(
+                    API_CONNECT_TIMEOUT,
+                    None if stream else API_READ_TIMEOUT
+                ),
+                stream=stream
+            )
+
+            if response.status_code == 400 and stream:
+                body = ""
                 try:
-                    payout = await client.get_payout(pair)
-                    candles = await client.fetch_candles(pair, count=CONFIG["candle_lookback"])
-                    res = evaluate_signal(candles, payout=payout, cfg=CONFIG)
+                    body = response.text[:160]
+                except Exception:
+                    pass
+                response.close()
+                raise StreamBadRequestError(f"400 Bad Request: {body}")
 
-                    if res["signal"] in ("CALL", "PUT"):
-                        pending_signals.append({
-                            "pair": pair,
-                            "direction": res["signal"],
-                            "payout": payout,
-                            "reason": res["reason"],
-                        })
-                        logger.info(f"SIGNAL READY [{pair}] -> {res['reason']} (payout={payout:.1f}%)")
-                    else:
-                        logger.info(f"{pair}: no setup ({res['reason']})")
-                except Exception as exc:
-                    logger.error(f"Error evaluating {pair}: {exc}")
+            if response.status_code == 429:
+                retry_hdr = response.headers.get("Retry-After", "30")
+                try:
+                    retry_after = max(25, int(float(retry_hdr)))
+                except (TypeError, ValueError):
+                    retry_after = 30
+                response.close()
+                raise StreamRateLimitError("Rate limit", retry_after)
 
-        # Pase lòd egzakteman nan segonn :00 pou 60s
-        if (
-            sec == CONFIG["entry_sec"]
-            and pending_signals
-            and minute_key != last_entry_minute_key
-        ):
-            last_entry_minute_key = minute_key
-            signals_to_fire = list(pending_signals)
-            pending_signals.clear()
-
-            for sig in signals_to_fire:
-                payout = await client.get_payout(sig["pair"])
-                if payout < CONFIG["min_payout"]:
-                    logger.info(f"Skipped {sig['pair']}: payout dropped to {payout:.1f}%")
+            if response.status_code in (401, 402, 403, 500, 502, 503, 504):
+                if attempt < attempts:
+                    response.close()
+                    time.sleep(0.3)
                     continue
 
-                # Toujou base_amount — pa gen Martingale otomatik
-                stake = float(CONFIG["base_amount"])
-                await client.place_order(
-                    pair=sig["pair"],
-                    direction=sig["direction"],
-                    amount=stake,
-                    expiry_sec=CONFIG["expiry_sec"],
-                )
+            response.raise_for_status()
+            if stream:
+                return response
+            return response.json()
 
-        await asyncio.sleep(CONFIG["poll_interval"])
+        except (StreamRateLimitError, StreamBadRequestError):
+            raise
+        except Exception:
+            if response is not None:
+                response.close()
+            if attempt >= attempts:
+                raise
+            time.sleep(0.3)
+
+    raise RuntimeError("Request failed.")
+
+
+def send_telegram_fn(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram credentials missing.")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
+        response = None
+        try:
+            response = requests.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+                timeout=TELEGRAM_TIMEOUT
+            )
+            if response.ok:
+                return True
+        except Exception:
+            pass
+        finally:
+            if response is not None:
+                response.close()
+        time.sleep(0.2)
+    return False
+
+
+# =====================================================
+# 2. KALKIL EMA 9, EMA 20, EMA 40 ("FAN & PULLBACK")
+# =====================================================
+def calc_ema_series(closes, period):
+    if len(closes) < period:
+        return []
+    multiplier = 2.0 / (period + 1.0)
+    ema_val = sum(closes[:period]) / period
+    series = [ema_val]
+    for price in closes[period:]:
+        ema_val = (price - ema_val) * multiplier + ema_val
+        series.append(ema_val)
+    return series
+
+
+def align_ema_series(closes, period):
+    raw = calc_ema_series(closes, period)
+    if not raw:
+        return [None] * len(closes)
+    pad_len = len(closes) - len(raw)
+    return ([None] * pad_len) + raw
+
+
+def calc_win_probability_ema(direction, ema9, ema20, ema40, curr, avg_range):
+    prob = 55.0
+
+    spread_9_20 = abs(ema9[-1] - ema20[-1])
+    spread_20_40 = abs(ema20[-1] - ema40[-1])
+    min_sep = max(avg_range * 0.25, 1e-12)
+
+    if spread_9_20 >= min_sep and spread_20_40 >= min_sep:
+        prob += 14.0
+    else:
+        prob += 6.0
+
+    if direction == "CALL":
+        if ema9[-1] > ema9[-2] and ema20[-1] > ema20[-2] and ema40[-1] > ema40[-2]:
+            prob += 14.0
+        else:
+            prob += 6.0
+        if curr["close"] > ema9[-1]:
+            prob += 10.0
+    else:
+        if ema9[-1] < ema9[-2] and ema20[-1] < ema20[-2] and ema40[-1] < ema40[-2]:
+            prob += 14.0
+        else:
+            prob += 6.0
+        if curr["close"] < ema9[-1]:
+            prob += 10.0
+
+    prob = max(50.0, min(98.0, prob))
+    return int(round(prob))
+
+
+def check_fan_and_emas(window):
+    closes = [c["close"] for c in window]
+    ema9 = align_ema_series(closes, 9)
+    ema20 = align_ema_series(closes, 20)
+    ema40 = align_ema_series(closes, 40)
+
+    if ema9[-1] is None or ema20[-1] is None or ema40[-1] is None:
+        return None
+    if ema9[-4] is None or ema20[-4] is None or ema40[-4] is None:
+        return None
+
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    min_sep = max(avg_range * 0.22, 1e-12)
+
+    # Verify EMAs are not flat / tangled over recent bars
+    e9_delta = abs(ema9[-1] - ema9[-4])
+    e20_delta = abs(ema20[-1] - ema20[-4])
+    e40_delta = abs(ema40[-1] - ema40[-4])
+
+    sep_9_20 = abs(ema9[-1] - ema20[-1])
+    sep_20_40 = abs(ema20[-1] - ema40[-1])
+
+    bull_fan = (
+        ema9[-1] > ema20[-1] > ema40[-1]
+        and sep_9_20 >= min_sep
+        and sep_20_40 >= min_sep
+        and ema9[-1] > ema9[-3]
+        and ema20[-1] > ema20[-3]
+        and ema40[-1] > ema40[-3]
+        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+    )
+
+    bear_fan = (
+        ema9[-1] < ema20[-1] < ema40[-1]
+        and sep_9_20 >= min_sep
+        and sep_20_40 >= min_sep
+        and ema9[-1] < ema9[-3]
+        and ema20[-1] < ema20[-3]
+        and ema40[-1] < ema40[-3]
+        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+    )
+
+    return {
+        "ema9": ema9,
+        "ema20": ema20,
+        "ema40": ema40,
+        "avg_range": avg_range,
+        "bull_fan": bull_fan,
+        "bear_fan": bear_fan
+    }
+
+
+def score_ema_structure(candles):
+    if len(candles) < MIN_CANDLES:
+        return 0.0
+
+    window = candles[-60:] if len(candles) >= 60 else candles
+    info = check_fan_and_emas(window)
+    if info is None:
+        return 0.0
+
+    curr = window[-1]
+    e9 = info["ema9"][-1]
+    e20 = info["ema20"][-1]
+    e40 = info["ema40"][-1]
+    avg_r = info["avg_range"]
+
+    score = 20.0
+    if info["bull_fan"] or info["bear_fan"]:
+        score += 35.0
+    else:
+        if (e9 > e20 > e40) or (e9 < e20 < e40):
+            score += 15.0
+
+    dist_e9 = abs(curr["close"] - e9)
+    if dist_e9 <= avg_r * 2.5:
+        score += 15.0
+    if abs(e9 - e20) >= avg_r * 0.25 and abs(e20 - e40) >= avg_r * 0.25:
+        score += 10.0
+
+    return round(score, 2)
+
+
+# =====================================================
+# 3. ESTRATEJI "FAN & PULLBACK" (CALL & PUT)
+# =====================================================
+def evaluate_real_market(candles):
+    if len(candles) < MIN_CANDLES:
+        return None, "not enough candles"
+
+    window = candles[-60:] if len(candles) >= 60 else candles
+    info = check_fan_and_emas(window)
+    if info is None:
+        return None, "ema unavailable"
+
+    ema9 = info["ema9"]
+    ema20 = info["ema20"]
+    ema40 = info["ema40"]
+    avg_r = info["avg_range"]
+
+    # Check pullback on recent 1-3 candles before confirmation bar
+    pullback_bars = window[-4:-1]
+    pullback_e9 = ema9[-4:-1]
+    pullback_e20 = ema20[-4:-1]
+    pullback_e40 = ema40[-4:-1]
+
+    curr = window[-1]
+    e9_now = ema9[-1]
+    e20_now = ema20[-1]
+    e40_now = ema40[-1]
+
+    diag = (
+        f"e9={format_price(e9_now)} e20={format_price(e20_now)} "
+        f"e40={format_price(e40_now)} bull={info['bull_fan']} bear={info['bear_fan']}"
+    )
+
+    # Filter: Overextended price far from EMA 9
+    if abs(curr["close"] - e9_now) > avg_r * 2.8:
+        return None, f"{diag} overextended"
+
+    # ---------------- BUY (CALL) RULES ----------------
+    if info["bull_fan"] and curr["close"] > e9_now > e20_now > e40_now:
+        # Filter: EMA 40 breach check on pullback candles
+        no_ema40_breach = all(
+            c["close"] > e40_v and min(c["open"], c["close"]) > e40_v - (avg_r * 0.35)
+            for c, e40_v in zip(pullback_bars, pullback_e40)
+        )
+        # Pullback: red candle(s) dip to touch/pierce EMA 9 or EMA 20
+        had_red_pullback = any(
+            (c["close"] < c["open"])
+            and (
+                c["low"] <= e9_v + (avg_r * 0.25)
+                or c["low"] <= e20_v + (avg_r * 0.25)
+            )
+            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
+        )
+        # Confirmation: green candle rejects EMA zone and closes firmly above EMA 9
+        body_curr = curr["close"] - curr["open"]
+        range_curr = max(curr["high"] - curr["low"], 1e-12)
+        confirmed_call = (
+            curr["close"] > curr["open"]
+            and curr["close"] > e9_now + (avg_r * 0.12)
+            and body_curr >= range_curr * 0.35
+        )
+
+        if no_ema40_breach and had_red_pullback and confirmed_call:
+            win_prob = calc_win_probability_ema("CALL", ema9, ema20, ema40, curr, avg_r)
+            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            return {
+                "direction": "CALL",
+                "confidence": confidence,
+                "win_prob": win_prob,
+                "score": 6 if win_prob >= 75 else 5,
+                "close": curr["close"],
+                "candle_time": curr["time"]
+            }, f"{diag} CALL_FAN_PULLBACK"
+
+    # ---------------- SELL (PUT) RULES ----------------
+    if info["bear_fan"] and curr["close"] < e9_now < e20_now < e40_now:
+        # Filter: EMA 40 breach check on pullback candles
+        no_ema40_breach = all(
+            c["close"] < e40_v and max(c["open"], c["close"]) < e40_v + (avg_r * 0.35)
+            for c, e40_v in zip(pullback_bars, pullback_e40)
+        )
+        # Pullback: green candle(s) bounce to touch EMA 9 or EMA 20
+        had_green_pullback = any(
+            (c["close"] > c["open"])
+            and (
+                c["high"] >= e9_v - (avg_r * 0.25)
+                or c["high"] >= e20_v - (avg_r * 0.25)
+            )
+            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
+        )
+        # Confirmation: red candle rejects EMA zone and closes firmly below EMA 9
+        body_curr = curr["open"] - curr["close"]
+        range_curr = max(curr["high"] - curr["low"], 1e-12)
+        confirmed_put = (
+            curr["close"] < curr["open"]
+            and curr["close"] < e9_now - (avg_r * 0.12)
+            and body_curr >= range_curr * 0.35
+        )
+
+        if no_ema40_breach and had_green_pullback and confirmed_put:
+            win_prob = calc_win_probability_ema("PUT", ema9, ema20, ema40, curr, avg_r)
+            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            return {
+                "direction": "PUT",
+                "confidence": confidence,
+                "win_prob": win_prob,
+                "score": 6 if win_prob >= 75 else 5,
+                "close": curr["close"],
+                "candle_time": curr["time"]
+            }, f"{diag} PUT_FAN_PULLBACK"
+
+    return None, f"{diag} no_fan_pullback"
+
+
+# =====================================================
+# 4. FORMAT MESAJ TELEGRAM SENP & RÈG WIN SÈLMAN
+# =====================================================
+def format_signal_message(pair, payout, entry_time_str, signal_data):
+    emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
+    return (
+        f"🤖 ROMARIO PRO M1 (EMA 9/20/40)\n\n"
+        f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
+        f"📊 Nivo: {signal_data['win_prob']}%\n"
+        f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
+        f"🛡️ Konfyans: {signal_data['confidence']}"
+    )
+
+
+def handle_trade_result(pair, payout, is_win, send_fn):
+    if is_win:
+        msg = f"✅ REZILTA: WIN | {pair} (+{payout:.0f}%)"
+        send_fn(msg)
+
+
+def get_eligible_symbols():
+    data = api_get("/v1/symbols", params={"venue": VENUE})
+    eligible = []
+    seen = set()
+
+    for item in data.get("symbols", []):
+        symbol = item.get("symbol")
+        if symbol not in VALID_PAIRS or symbol in seen:
+            continue
+        if item.get("open") is False:
+            continue
+        try:
+            payout = float(item.get("payout", 0.0))
+        except (TypeError, ValueError):
+            payout = 0.0
+        if payout < MIN_PAYOUT:
+            continue
+        seen.add(symbol)
+        eligible.append({"symbol": symbol, "payout": payout})
+
+    eligible.sort(key=lambda x: (-x["payout"], x["symbol"]))
+    return eligible
+
+
+def get_candles(symbol):
+    data = api_get(
+        "/v1/candles",
+        params={"venue": VENUE, "symbol": symbol, "tf": TIMEFRAME, "limit": CANDLE_LIMIT}
+    )
+    candles = data.get("candles", [])
+    parsed = []
+    for c in candles:
+        try:
+            parsed.append({
+                "time": normalize_ts(c["time"]),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"])
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    parsed.sort(key=lambda x: x["time"])
+    return parsed[-CANDLE_LIMIT:] if len(parsed) >= MIN_CANDLES else []
+
+
+def download_all_histories(eligible):
+    histories, ranked = {}, []
+    log(f"Scanning {len(eligible)} eligible OTC pairs (>= {MIN_PAYOUT:.0f}%)...")
+
+    def fetch_and_score(item):
+        candles = get_candles(item["symbol"])
+        setup_score = score_ema_structure(candles) if candles else 0.0
+        enriched = dict(item)
+        enriched["setup_score"] = setup_score
+        return enriched, candles
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_and_score, item): item for item in eligible}
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                enriched, candles = future.result()
+                if candles:
+                    histories[enriched["symbol"]] = candles
+                    ranked.append(enriched)
+            except Exception:
+                pass
+
+    ranked.sort(key=lambda x: (-x["setup_score"], -x["payout"], x["symbol"]))
+    return histories, ranked
+
+
+def finalize_pending_trade(pending, last_prices):
+    sym = pending["symbol"]
+    entry_price = pending["entry_price"] if pending["entry_price"] is not None else pending["last_price"]
+    exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
+
+    if entry_price is not None and exit_price is not None:
+        is_win = (
+            (pending["direction"] == "CALL" and exit_price > entry_price) or
+            (pending["direction"] == "PUT" and exit_price < entry_price)
+        )
+        handle_trade_result(
+            sym,
+            pending["payout"],
+            is_win,
+            send_telegram_fn
+        )
+        log(f"{sym}: Trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
+    else:
+        log(f"{sym}: Trade window ended. Stopping bot.")
+
+
+def run_live_stream(monitored, histories, current_bars, deadline):
+    symbols = [item["symbol"] for item in monitored]
+    params = {"venue": VENUE, "symbol": ",".join(symbols)}
+
+    log(f"Opening M1 EMA stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    response = api_get("/v1/stream", params=params, stream=True)
+
+    connected_symbols = set()
+    last_prices = {}
+    signals_sent = 0
+    pending = None
+    event_name = ""
+
+    try:
+        for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
+            now = time.time()
+
+            if pending is not None:
+                if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
+                    pending["entry_price"] = pending["last_price"]
+                    log(f"{pending['symbol']}: Entry set at {format_price(pending['entry_price'])}")
+
+                if now >= pending["expiry_time"]:
+                    finalize_pending_trade(pending, last_prices)
+                    return "stop"
+
+            if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
+                log("Single signal completed. Stopping bot.")
+                return "stop"
+
+            if pending is None and now >= deadline:
+                log("Scan window ended with no signal.")
+                return "stop"
+
+            if not raw_line:
+                event_name = ""
+                continue
+
+            line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
+            if not line or line.startswith(":"):
+                continue
+
+            if line.startswith("event:"):
+                event_name = line[6:].strip()
+                continue
+
+            if not line.startswith("data:"):
+                continue
+
+            try:
+                data = json.loads(line[5:].strip())
+            except json.JSONDecodeError:
+                continue
+
+            if event_name == "connected":
+                connected_symbols = set(data.get("symbols", []))
+                log("Connected: " + ", ".join(sorted(connected_symbols)))
+                continue
+
+            if event_name != "tick":
+                continue
+
+            symbol = data.get("symbol")
+            if connected_symbols and symbol not in connected_symbols:
+                continue
+
+            try:
+                price = float(data["price"])
+                feed_time = normalize_ts(data["time"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+            last_prices[symbol] = price
+            now = time.time()
+
+            if pending is not None:
+                if symbol == pending["symbol"]:
+                    pending["last_price"] = price
+                    if pending["entry_price"] is None and now >= pending["entry_time"]:
+                        pending["entry_price"] = price
+                        log(f"{symbol}: Entry set at {format_price(price)}")
+
+                if now >= pending["expiry_time"]:
+                    finalize_pending_trade(pending, last_prices)
+                    return "stop"
+                continue
+
+            if signals_sent >= MAX_SIGNALS_PER_RUN:
+                log("Single signal limit reached. Stopping bot.")
+                return "stop"
+
+            bucket = (feed_time // TIMEFRAME) * TIMEFRAME
+
+            if symbol not in current_bars:
+                histories[symbol] = [c for c in histories.get(symbol, []) if c["time"] < bucket]
+                current_bars[symbol] = {
+                    "time": bucket, "open": price, "high": price, "low": price, "close": price
+                }
+                continue
+
+            current = current_bars[symbol]
+
+            seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
+            if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
+                current["evaluated_preclose"] = True
+                hist = histories.get(symbol, [])
+                if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
+                    window = hist[-(MIN_CANDLES - 1):] + [current]
+                    signal_data, diag = evaluate_real_market(window)
+                    if signal_data:
+                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
+                        payout = pair_info["payout"]
+                        entry_ts = current["time"] + TIMEFRAME
+                        entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
+
+                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data)
+                        if send_telegram_fn(msg):
+                            signals_sent += 1
+                            pending = {
+                                "symbol": symbol,
+                                "payout": payout,
+                                "direction": signal_data["direction"],
+                                "entry_time": entry_ts,
+                                "expiry_time": entry_ts + EXPIRATION,
+                                "entry_price": None,
+                                "last_price": price
+                            }
+                            log(f"{symbol}: Single EMA signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
+                    else:
+                        log(f"{symbol}: no setup ({diag})")
+
+            if bucket > current["time"]:
+                clean_bar = {
+                    "time": current["time"],
+                    "open": current["open"],
+                    "high": current["high"],
+                    "low": current["low"],
+                    "close": current["close"]
+                }
+                histories.setdefault(symbol, []).append(clean_bar)
+                histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
+
+                current_bars[symbol] = {
+                    "time": bucket, "open": price, "high": price, "low": price, "close": price
+                }
+            else:
+                current["high"] = max(current["high"], price)
+                current["low"] = min(current["low"], price)
+                current["close"] = price
+
+    finally:
+        response.close()
+
+    return "stop" if signals_sent >= MAX_SIGNALS_PER_RUN else "reconnect"
+
+
+def main():
+    log(f"{VERSION} starting...")
+    if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Credentials missing!")
+        sys.exit(1)
+
+    eligible = get_eligible_symbols()
+    if not eligible:
+        log("No pairs >= 85% open right now.")
+        sys.exit(0)
+
+    histories, ranked = download_all_histories(eligible)
+    if not ranked:
+        log("No candle history available.")
+        sys.exit(0)
+
+    active_limit = min(MAX_STREAM_PAIRS, len(ranked))
+    top_pairs = ranked[:active_limit]
+    log("Top selected EMA pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
+
+    current_bars = {}
+    deadline = time.time() + MAX_WAIT_SECONDS
+
+    reconnects = 0
+    while time.time() < deadline:
+        stream_subset = ranked[:active_limit]
+        try:
+            status = run_live_stream(stream_subset, histories, current_bars, deadline)
+            if status in ("done", "stop"):
+                log(f"{VERSION} finished.")
+                sys.stdout.flush()
+                os._exit(0)
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                break
+            wait_sec = min(4.0, max(1.0, deadline - time.time()))
+            log(f"Reconnecting in {wait_sec:.1f}s...")
+            time.sleep(wait_sec)
+        except StreamBadRequestError as e:
+            log(f"Stream error: {e}")
+            if active_limit > 1:
+                active_limit -= 1
+                log(f"Reducing stream batch to {active_limit} pairs and retrying...")
+                time.sleep(1.0)
+                continue
+            break
+        except StreamRateLimitError as e:
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                break
+            wait_sec = min(e.retry_after, max(0.0, deadline - time.time()))
+            if wait_sec <= 2:
+                break
+            log(f"Rate limit. Waiting {wait_sec:.1f}s...")
+            time.sleep(wait_sec)
+        except Exception as e:
+            log(f"Stream error: {e}")
+            reconnects += 1
+            if reconnects > MAX_RECONNECTS:
+                break
+            wait_sec = min(4.0, max(1.0, deadline - time.time()))
+            if wait_sec <= 1:
+                break
+            time.sleep(wait_sec)
+
+    log(f"{VERSION} finished.")
+    sys.stdout.flush()
+    os._exit(0)
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_bot())
-    except KeyboardInterrupt:
-        logger.info("ROMARIO PRO stopped by user.")
+    main()
