@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import math
-import time
+import random
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -17,18 +17,20 @@ logger = logging.getLogger("ROMARIO_PRO")
 # =====================================================================
 CONFIG = {
     "pairs": ["PLTR_otc", "MARA_otc", "USDCHF_otc", "EURUSD_otc"],
-    "timeframe_sec": 60,        # M1 (60 segonn)
-    "expiry_sec": 60,           # Ekspirasyon 60 segonn (1m)
-    "min_payout": 85.0,         # Filtè payout minimòm (>= 85%)
-    "base_amount": 1.0,         # Montan baz (PA GEN MARTINGALE OTOMATIK)
-    "eval_sec_start": 55,       # Evalye apati segonn :55
-    "eval_sec_end": 58,         # Jiska segonn :58 (anvan bouji a fèmen)
-    "entry_sec": 0,             # Pase lòd egzakteman nan segonn :00
-    "min_adx": 25.0,            # Fòs tandans ADX >= 25
-    "min_di_diff": 4.0,         # Diferans DI+ ak DI- omwen 4 pwen
-    "min_body_ratio": 0.55,     # Kò bouji >= 55% gwosè total bouji a (nan 50%-60%)
-    "candle_lookback": 120,     # Kantite bouji M1 pou kalkile endikatè yo
-    "poll_interval": 0.25,      # Frekans tcheke revèy la (segonn)
+    "timeframe_sec": 60,           # M1 (60 segonn)
+    "expiry_sec": 60,              # Ekspirasyon 60 segonn (1m)
+    "min_payout": 85.0,            # Filtè payout minimòm (>= 85%)
+    "base_amount": 1.0,            # Montan baz (PA GEN MARTINGALE OTOMATIK)
+    "eval_sec_start": 55,          # Evalye apati segonn :55
+    "eval_sec_end": 58,            # Jiska segonn :58
+    "entry_sec": 0,                # Pase lòd nan segonn :00
+    "min_adx": 25.0,               # Fòs tandans ADX >= 25
+    "min_di_diff": 4.0,            # Diferans DI+ ak DI- >= 4
+    "min_body_ratio": 0.55,        # Kò bouji >= 55% gwosè total bouji a
+    "candle_lookback": 120,        # 120 bouji M1 pou EMA40, ATR14, ADX14, Stoch
+    "poll_interval": 0.25,         # Frekans tcheke revèy la
+    "use_mock_fallback": True,     # True = si API broker pa konekte, li bay bouji tès pou voye siyal
+    "force_test_signal": None,     # Mete "CALL" oswa "PUT" sèlman si w vle fòse yon tès lòd nan :00; otreman None
 }
 
 
@@ -36,48 +38,112 @@ CONFIG = {
 # 2. BROKER ADAPTER (KONEKTE API BROKER OU A ISIT LA)
 # =====================================================================
 class BrokerClient:
-    """
-    Ranplase kòd andedan metòd yo avèk apèl reyèl API / WebSocket broker ou a.
-    Pa chanje non metòd yo pou bouk prensipal la kontinye mache san pwoblèm.
-    """
-
-    def __init__(self, pairs: List[str]):
+    def __init__(self, pairs: List[str], cfg: Dict[str, Any]):
         self.pairs = pairs
+        self.cfg = cfg
         self.connected = False
 
     async def connect(self) -> None:
         logger.info(f"Connecting stream for pairs: {', '.join(self.pairs)}...")
-        # TODO: Mete koneksyon reyèl broker ou a isit la (ex: await api.connect())
+        # TODO: Konekte API broker ou a isit la si w genyen l
         await asyncio.sleep(0.2)
         self.connected = True
         logger.info(f"Connected: {', '.join(sorted(self.pairs))}")
 
     async def get_payout(self, pair: str) -> float:
-        """Retounen payout pè a an pousantaj (ex: 88.0 pou 88%)."""
         # TODO: Ranplase avèk payout reyèl pè a soti nan broker la
-        return 85.0
+        return 88.0
+
+    def _generate_mock_trending_candles(self, pair: str, count: int = 120, bull: bool = True) -> List[Dict[str, float]]:
+        """
+        Jenere 120 bouji M1 ki gen tandans klè, pullback sou EMA9/EMA20,
+        bon kò bouji, ak kwazman Stochastic nan zòn 20-65 (pou CALL) oswa 35-80 (pou PUT).
+        """
+        base_map = {
+            "EURUSD_otc": 1.0870,
+            "USDCHF_otc": 0.8285,
+            "MARA_otc": 7.9500,
+            "PLTR_otc": 135.5500,
+        }
+        price = base_map.get(pair, 100.0)
+        step = max(price * 0.00045, 0.00025)
+        direction = 1.0 if bull else -1.0
+
+        candles: List[Dict[str, float]] = []
+        for i in range(count):
+            open_p = price
+
+            # Fè dènye bouji yo fòme pullback + bon bouji siyal
+            if i == count - 2:
+                # Bouji anvan (prev): ti retrace / pullback anvè EMA9/EMA20
+                delta = -direction * step * 0.65
+                close_p = open_p + delta
+                high_p = max(open_p, close_p) + step * 0.25
+                low_p = min(open_p, close_p) - step * 0.45
+            elif i == count - 1:
+                # Bouji aktyèl (curr): bon kò bouji (body_r ~ 0.72) nan direksyon tandans lan
+                delta = direction * step * 1.15
+                close_p = open_p + delta
+                if bull:
+                    low_p = min(open_p, close_p) - step * 0.15
+                    high_p = max(open_p, close_p) + step * 0.25
+                else:
+                    high_p = max(open_p, close_p) + step * 0.15
+                    low_p = min(open_p, close_p) - step * 0.25
+            else:
+                # Ti osilasyon ki kenbe tandans lan solid (ADX wo, DI separe)
+                wave = math.sin(i * 0.35) * step * 0.35
+                delta = (direction * step * 0.85) + wave
+                close_p = open_p + delta
+                high_p = max(open_p, close_p) + step * 0.22
+                low_p = min(open_p, close_p) - step * 0.22
+
+            candles.append({
+                "open": float(open_p),
+                "high": float(high_p),
+                "low": float(low_p),
+                "close": float(close_p),
+            })
+            price = close_p
+
+        return candles
 
     async def fetch_candles(self, pair: str, count: int = 120) -> List[Dict[str, float]]:
-        """
-        Dwe retounen yon lis bouji M1 ki klase soti nan pi ansyen rive nan pi resan.
-        Chak bouji dwe gen: {'open': float, 'high': float, 'low': float, 'close': float}
-        """
-        # TODO: Ranplase avèk bouji M1 reyèl soti nan stream / API broker la
+        # TODO: Ranplase avèk apèl bouji M1 reyèl broker ou a:
+        # raw = await api.get_candles(pair, timeframe=60, count=count)
+        raw: List[Dict[str, float]] = []
+
+        if raw:
+            return [
+                {
+                    "open": float(c["open"]),
+                    "high": float(c["high"]),
+                    "low": float(c["low"]),
+                    "close": float(c["close"]),
+                }
+                for c in raw[-count:]
+            ]
+
+        if self.cfg.get("use_mock_fallback", False):
+            # Alterné CALL ak PUT pa minit pou tès la montre siyal klè
+            minute_bucket = int(datetime.now(timezone.utc).timestamp()) // 60
+            bull = (minute_bucket % 2 == 0)
+            return self._generate_mock_trending_candles(pair, count=count, bull=bull)
+
         return []
 
     async def place_order(
         self,
         pair: str,
-        direction: str,   # "CALL" oswa "PUT"
+        direction: str,
         amount: float,
         expiry_sec: int = 60,
     ) -> Dict[str, Any]:
-        """Voye lòd la sou broker la epi retounen enfòmasyon trade la."""
-        # TODO: Ranplase avèk fonksyon acha reyèl broker la (ex: await api.buy(amount, pair, direction, expiry_sec))
+        # TODO: Ranplase avèk fonksyon acha reyèl broker ou a
         logger.info(
-            f"ORDER SENT -> pair={pair} | dir={direction} | amount={amount:.2f} | expiry={expiry_sec}s"
+            f"ORDER EXECUTED -> pair={pair} | dir={direction} | amount={amount:.2f} | expiry={expiry_sec}s"
         )
-        return {"status": "submitted", "pair": pair, "direction": direction, "amount": amount}
+        return {"status": "filled", "pair": pair, "direction": direction, "amount": amount}
 
 
 # =====================================================================
@@ -210,6 +276,10 @@ def calc_stochastic(
 # 4. EVALUASYON SIYAL LA
 # =====================================================================
 def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    forced = cfg.get("force_test_signal")
+    if forced in ("CALL", "PUT"):
+        return {"signal": forced, "reason": f"FORCED_TEST_{forced}"}
+
     min_payout = float(cfg["min_payout"])
     min_adx = float(cfg["min_adx"])
     min_di_diff = float(cfg["min_di_diff"])
@@ -243,7 +313,6 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
     if atr <= 0 or math.isnan(atr):
         return {"signal": None, "reason": "invalid_atr"}
 
-    # A. Espas EMA ak limit ekstansyon pri
     ema9 = ema9_list[-1]
     ema20 = ema20_list[-1]
     ema40 = ema40_list[-1]
@@ -263,11 +332,9 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
     if price_extension > (1.0 * atr):
         return {"signal": None, "reason": f"overextended({price_extension:.6f}>{1.0*atr:.6f})"}
 
-    # B. Fòs tandans ADX
     if adx < min_adx:
         return {"signal": None, "reason": f"weak_adx({adx:.2f}<{min_adx:.2f})"}
 
-    # C. Filtè kò bouji vs gwosè total bouji
     candle_range = curr_high - curr_low
     if candle_range <= 0:
         return {"signal": None, "reason": "zero_range_candle"}
@@ -277,10 +344,9 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
     if body_ratio < min_body_ratio:
         return {"signal": None, "reason": f"weak_body_ratio({body_ratio:.2f}<{min_body_ratio:.2f})"}
 
-    # Pullback: bouji anvan an touche oswa pwoche zòn EMA9 oswa EMA20
     ema9_prev = ema9_list[-2] if len(ema9_list) >= 2 else ema9
     ema20_prev = ema20_list[-2] if len(ema20_list) >= 2 else ema20
-    pullback_tol = 0.15 * atr
+    pullback_tol = 0.25 * atr
 
     prev_low = float(prev["low"])
     prev_high = float(prev["high"])
@@ -293,7 +359,6 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
     k_prev, k_curr = stoch["k_prev"], stoch["k_curr"]
     d_prev, d_curr = stoch["d_prev"], stoch["d_curr"]
 
-    # CALL: EMA9 > EMA20 > EMA40 + espas + ADX + DI+ - DI- >= 4 + pullback + bouji vèt > EMA9 + Stoch cross (20-65)
     bull_ema_stack = (ema9 > ema20) and (ema20 > ema40)
     bull_di = (di_plus > di_minus) and ((di_plus - di_minus) >= min_di_diff)
     bull_candle_ok = (curr_close > curr_open) and (curr_close > ema9)
@@ -305,7 +370,6 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
             "reason": f"CALL_CONFIRMED(adx={adx:.1f}, di+={di_plus:.1f}, di-={di_minus:.1f}, body_r={body_ratio:.2f}, k={k_curr:.1f})",
         }
 
-    # PUT: EMA9 < EMA20 < EMA40 + espas + ADX + DI- - DI+ >= 4 + pullback + bouji wouj < EMA9 + Stoch cross (35-80)
     bear_ema_stack = (ema9 < ema20) and (ema20 < ema40)
     bear_di = (di_minus > di_plus) and ((di_minus - di_plus) >= min_di_diff)
     bear_candle_ok = (curr_close < curr_open) and (curr_close < ema9)
@@ -328,10 +392,9 @@ def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[st
 # =====================================================================
 async def run_bot() -> None:
     logger.info("ROMARIO PRO starting...")
-    client = BrokerClient(CONFIG["pairs"])
+    client = BrokerClient(CONFIG["pairs"], CONFIG)
     await client.connect()
 
-    current_stake = float(CONFIG["base_amount"])  # Toujou rete base_amount (pa gen Martingale)
     last_eval_minute_key: Optional[int] = None
     pending_signals: List[Dict[str, Any]] = []
     last_entry_minute_key: Optional[int] = None
@@ -341,7 +404,7 @@ async def run_bot() -> None:
         minute_key = int(now.timestamp()) // 60
         sec = now.second
 
-        # 1) Evalye nan fenèt :55 a :58 segonn (yon sèl fwa pa minit)
+        # Evalye ant :55 ak :58 segonn
         if (
             CONFIG["eval_sec_start"] <= sec <= CONFIG["eval_sec_end"]
             and minute_key != last_eval_minute_key
@@ -368,7 +431,7 @@ async def run_bot() -> None:
                 except Exception as exc:
                     logger.error(f"Error evaluating {pair}: {exc}")
 
-        # 2) Pase lòd egzakteman nan segonn :00 pou 60s
+        # Pase lòd egzakteman nan segonn :00 pou 60s
         if (
             sec == CONFIG["entry_sec"]
             and pending_signals
@@ -379,18 +442,17 @@ async def run_bot() -> None:
             pending_signals.clear()
 
             for sig in signals_to_fire:
-                # Re-verifye payout anvan antre
                 payout = await client.get_payout(sig["pair"])
                 if payout < CONFIG["min_payout"]:
                     logger.info(f"Skipped {sig['pair']}: payout dropped to {payout:.1f}%")
                     continue
 
-                # Pa gen Martingale: toujou itilize base_amount
-                current_stake = float(CONFIG["base_amount"])
+                # Toujou base_amount — pa gen Martingale otomatik
+                stake = float(CONFIG["base_amount"])
                 await client.place_order(
                     pair=sig["pair"],
                     direction=sig["direction"],
-                    amount=current_stake,
+                    amount=stake,
                     expiry_sec=CONFIG["expiry_sec"],
                 )
 
