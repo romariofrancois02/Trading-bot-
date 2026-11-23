@@ -75,7 +75,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/2.2",
+            "User-Agent": "RomarioProM1/2.3",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -92,7 +92,8 @@ def is_clean_pair(symbol):
 
 def api_get(path, params=None, stream=False):
     url = BASE_URL + path
-    attempts = 1 if stream else 2
+    attempts = 1 if stream else 4
+    backoffs = (0.8, 1.5, 2.5)
 
     for attempt in range(1, attempts + 1):
         response = None
@@ -125,11 +126,23 @@ def api_get(path, params=None, stream=False):
                 response.close()
                 raise StreamRateLimitError("Rate limit", retry_after)
 
-            if response.status_code in (401, 402, 403, 500, 502, 503, 504):
+            if response.status_code in (502, 503, 504):
+                status_code = response.status_code
+                response.close()
                 if attempt < attempts:
-                    response.close()
-                    time.sleep(0.3)
+                    delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                    log(f"HTTP {status_code} on {path}. Retrying in {delay:.1f}s ({attempt}/{attempts})...")
+                    time.sleep(delay)
                     continue
+                raise requests.HTTPError(f"{status_code} Server Error for url: {url}")
+
+            if response.status_code in (401, 402, 403, 500):
+                status_code = response.status_code
+                response.close()
+                if attempt < 2:
+                    time.sleep(0.4)
+                    continue
+                raise requests.HTTPError(f"{status_code} Server Error for url: {url}")
 
             response.raise_for_status()
             if stream:
@@ -143,7 +156,8 @@ def api_get(path, params=None, stream=False):
                 response.close()
             if attempt >= attempts:
                 raise
-            time.sleep(0.3)
+            delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+            time.sleep(delay)
 
     raise RuntimeError("Request failed.")
 
@@ -681,13 +695,33 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     return "stop" if signals_sent >= MAX_SIGNALS_PER_RUN else "reconnect"
 
 
+def fetch_eligible_with_retry(deadline):
+    while True:
+        try:
+            return get_eligible_symbols()
+        except Exception as e:
+            remaining = deadline - time.time()
+            if remaining <= 3.0:
+                raise
+            wait_sec = min(4.0, max(1.0, remaining - 1.0))
+            log(f"Symbols fetch failed ({e}). Retrying in {wait_sec:.1f}s...")
+            time.sleep(wait_sec)
+
+
 def main():
     log(f"{VERSION} starting...")
     if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log("Credentials missing!")
         sys.exit(1)
 
-    eligible = get_eligible_symbols()
+    deadline = time.time() + MAX_WAIT_SECONDS
+
+    try:
+        eligible = fetch_eligible_with_retry(deadline)
+    except Exception as e:
+        log(f"Unable to load eligible symbols: {e}")
+        sys.exit(0)
+
     if not eligible:
         log(f"No clean pairs >= {MIN_PAYOUT:.0f}% open right now.")
         sys.exit(0)
@@ -702,7 +736,6 @@ def main():
     log("Top selected pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
-    deadline = time.time() + MAX_WAIT_SECONDS
 
     reconnects = 0
     while time.time() < deadline:
