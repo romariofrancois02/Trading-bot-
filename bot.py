@@ -8,7 +8,6 @@ import requests
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from zoneinfo import ZoneInfo
 
 # =====================================================
 # 1. PARAMÈT JENERAL - ROMARIO PRO (M1, EXP 60S, 10S LEAD)
@@ -38,7 +37,7 @@ API_READ_TIMEOUT = 10
 TELEGRAM_ATTEMPTS = 3
 TELEGRAM_TIMEOUT = (1, 2)
 
-TIMEZONE = ZoneInfo("America/New_York")
+LOCAL_TZ = datetime.now().astimezone().tzinfo
 
 API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -76,7 +75,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/2.1",
+            "User-Agent": "RomarioProM1/2.2",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -328,7 +327,6 @@ def evaluate_real_market(candles):
     if abs(bar["close"] - e9_now) > avg_r * 1.9:
         return None, f"{diag} overextended"
 
-    # ---------------- CALL: SHALLOW TOUCH EMA 9 + BOTTOM REJECTION WICK ----------------
     if info["bull_snap_trend"] and bar["close"] > e9_now > e20_now > e40_now:
         no_deep_pullback = bar["low"] > e20_now and bar["close"] > e20_now
         shallow_touch_e9 = bar["low"] <= e9_now + (avg_r * 0.30)
@@ -351,7 +349,6 @@ def evaluate_real_market(candles):
                 "candle_time": bar["time"]
             }, f"{diag} CALL_SNAP_60S score={setup_score} win={win_prob}%"
 
-    # ---------------- PUT: SHALLOW TOUCH EMA 9 + TOP REJECTION WICK ----------------
     if info["bear_snap_trend"] and bar["close"] < e9_now < e20_now < e40_now:
         no_deep_pullback = bar["high"] < e20_now and bar["close"] < e20_now
         shallow_touch_e9 = bar["high"] >= e9_now - (avg_r * 0.30)
@@ -630,7 +627,6 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             current = current_bars[symbol]
 
-            # Evalye 10 segonn anvan bouji 1m lan fèmen pou w gen tan prepare w
             seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
             if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
                 current["evaluated_preclose"] = True
@@ -642,7 +638,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                         pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
                         entry_ts = current["time"] + TIMEFRAME
-                        entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
+                        entry_time_str = datetime.fromtimestamp(entry_ts, tz=LOCAL_TZ).strftime("%I:%M:%S %p")
 
                         msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=price)
                         if send_telegram_fn(msg):
