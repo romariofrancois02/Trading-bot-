@@ -11,25 +11,25 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (M1, EXP 1M, CALL + PUT, PAYOUT >= 85%, 1 SIGNAL/RUN)
+# 1. PARAMÈT JENERAL (M1, EXP 1M, EMA FAN & PULLBACK, PAYOUT >= 85%)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - CALL & PUT BRK+RET+CONF"
+VERSION = "ROMARIO PRO M1 - EMA 9/20/40 FAN+PULLBACK"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 TIMEFRAME = 60            # Bouji 1 minit
-EXPIRATION = 60           # Ekspirasyon 1 minit
+EXPIRATION = 60           # Ekspirasyon 1 minit (antre nan ouvèti pwochen bouji a)
 MIN_PAYOUT = 85.0         # Mache 85% ou plis
 ENTRY_LEAD = 10           # Avèti w 10 segonn anvan bouji 1m lan fèmen
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 180    # Chèche yon bon opòtinite nan 1 a 3 minit
 MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
 
-CANDLE_LIMIT = 80
-MIN_CANDLES = 30
+CANDLE_LIMIT = 90
+MIN_CANDLES = 50          # Nesesè pou EMA 40 + pullback + konfimasyon
 MAX_RECONNECTS = 4
 
-# Pè klasik ki pi estab (evite pè ekzotik ki manipile)
+# Pè klasik ki pi estab
 VALID_PAIRS = {
     "EURUSD_otc", "GBPUSD_otc", "USDJPY_otc", "AUDUSD_otc",
     "USDCAD_otc", "USDCHF_otc", "NZDUSD_otc", "EURGBP_otc",
@@ -81,7 +81,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioCallPutM1/1.0",
+            "User-Agent": "RomarioEmaFanPullbackM1/1.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -175,279 +175,254 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL RSI AK TREND LINE ADVANCED (CALL + PUT)
+# 2. KALKIL EMA 9, EMA 20, EMA 40 ("FAN & PULLBACK")
 # =====================================================
-def calc_rsi(closes, period=7):
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(max(diff, 0))
-        losses.append(max(-diff, 0))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
+def calc_ema_series(closes, period):
+    if len(closes) < period:
+        return []
+    multiplier = 2.0 / (period + 1.0)
+    ema_val = sum(closes[:period]) / period
+    series = [ema_val]
+    for price in closes[period:]:
+        ema_val = (price - ema_val) * multiplier + ema_val
+        series.append(ema_val)
+    return series
 
 
-def fit_trendline(points):
-    n = len(points)
-    if n < 2:
-        return None
-
-    sum_x = sum(p[0] for p in points)
-    sum_y = sum(p[1] for p in points)
-    sum_xy = sum(p[0] * p[1] for p in points)
-    sum_xx = sum(p[0] * p[0] for p in points)
-
-    denom = (n * sum_xx) - (sum_x * sum_x)
-    if denom == 0:
-        return None
-
-    slope = ((n * sum_xy) - (sum_x * sum_y)) / denom
-    intercept = (sum_y - (slope * sum_x)) / n
-    return slope, intercept
+def align_ema_series(closes, period):
+    raw = calc_ema_series(closes, period)
+    if not raw:
+        return [None] * len(closes)
+    pad_len = len(closes) - len(raw)
+    return ([None] * pad_len) + raw
 
 
-def build_trendlines(window):
-    base = window[:-1]
-    if len(base) < 12:
-        return None, None
+def calc_win_probability_ema(direction, ema9, ema20, ema40, curr, avg_range):
+    prob = 55.0
 
-    low_pivots = []
-    high_pivots = []
+    spread_9_20 = abs(ema9[-1] - ema20[-1])
+    spread_20_40 = abs(ema20[-1] - ema40[-1])
+    min_sep = max(avg_range * 0.25, 1e-12)
 
-    for i in range(1, len(base) - 1):
-        if base[i]["low"] <= base[i - 1]["low"] and base[i]["low"] <= base[i + 1]["low"]:
-            low_pivots.append((i, base[i]["low"]))
-        if base[i]["high"] >= base[i - 1]["high"] and base[i]["high"] >= base[i + 1]["high"]:
-            high_pivots.append((i, base[i]["high"]))
-
-    if len(low_pivots) < 2:
-        sorted_lows = sorted(
-            [(i, base[i]["low"]) for i in range(max(0, len(base) - 16), len(base))],
-            key=lambda t: t[1]
-        )[:2]
-        low_pivots = sorted(sorted_lows, key=lambda t: t[0])
+    if spread_9_20 >= min_sep and spread_20_40 >= min_sep:
+        prob += 14.0
     else:
-        low_pivots = low_pivots[-3:]
-
-    if len(high_pivots) < 2:
-        sorted_highs = sorted(
-            [(i, base[i]["high"]) for i in range(max(0, len(base) - 16), len(base))],
-            key=lambda t: t[1],
-            reverse=True
-        )[:2]
-        high_pivots = sorted(sorted_highs, key=lambda t: t[0])
-    else:
-        high_pivots = high_pivots[-3:]
-
-    last_idx = len(window) - 1
-    support_line = None
-    resistance_line = None
-
-    fit_sup = fit_trendline(low_pivots)
-    if fit_sup is not None:
-        sup_slope, sup_intercept = fit_sup
-        sup_val = (sup_slope * last_idx) + sup_intercept
-        support_line = {
-            "slope": sup_slope,
-            "value": sup_val,
-            "pivots": len(low_pivots)
-        }
-
-    fit_res = fit_trendline(high_pivots)
-    if fit_res is not None:
-        res_slope, res_intercept = fit_res
-        res_val = (res_slope * last_idx) + res_intercept
-        resistance_line = {
-            "slope": res_slope,
-            "value": res_val,
-            "pivots": len(high_pivots)
-        }
-
-    return support_line, resistance_line
-
-
-def calc_win_probability(direction, rsi, line_info, curr, line_val, has_retest_conf=True):
-    prob = 54.0 if has_retest_conf else 50.0
-
-    if line_info is not None:
-        if direction == "CALL" and line_info["slope"] >= 0:
-            prob += 12.0
-        elif direction == "PUT" and line_info["slope"] <= 0:
-            prob += 12.0
-        else:
-            prob += 4.0
-
-        if line_info.get("pivots", 0) >= 2:
-            prob += 10.0
-
-    if direction == "CALL" and curr["close"] > line_val:
-        prob += 12.0
-    elif direction == "PUT" and curr["close"] < line_val:
-        prob += 12.0
+        prob += 6.0
 
     if direction == "CALL":
-        if 45 <= rsi <= 68:
-            prob += 10.0
+        if ema9[-1] > ema9[-2] and ema20[-1] > ema20[-2] and ema40[-1] > ema40[-2]:
+            prob += 14.0
         else:
-            prob += 4.0
+            prob += 6.0
+        if curr["close"] > ema9[-1]:
+            prob += 10.0
     else:
-        if 32 <= rsi <= 55:
-            prob += 10.0
+        if ema9[-1] < ema9[-2] and ema20[-1] < ema20[-2] and ema40[-1] < ema40[-2]:
+            prob += 14.0
         else:
-            prob += 4.0
+            prob += 6.0
+        if curr["close"] < ema9[-1]:
+            prob += 10.0
 
     prob = max(50.0, min(98.0, prob))
     return int(round(prob))
 
 
-def score_trendline_structure(candles):
+def check_fan_and_emas(window):
+    closes = [c["close"] for c in window]
+    ema9 = align_ema_series(closes, 9)
+    ema20 = align_ema_series(closes, 20)
+    ema40 = align_ema_series(closes, 40)
+
+    if ema9[-1] is None or ema20[-1] is None or ema40[-1] is None:
+        return None
+    if ema9[-4] is None or ema20[-4] is None or ema40[-4] is None:
+        return None
+
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    min_sep = max(avg_range * 0.22, 1e-12)
+
+    # Verify EMAs are not flat / tangled over recent bars
+    e9_delta = abs(ema9[-1] - ema9[-4])
+    e20_delta = abs(ema20[-1] - ema20[-4])
+    e40_delta = abs(ema40[-1] - ema40[-4])
+
+    sep_9_20 = abs(ema9[-1] - ema20[-1])
+    sep_20_40 = abs(ema20[-1] - ema40[-1])
+
+    bull_fan = (
+        ema9[-1] > ema20[-1] > ema40[-1]
+        and sep_9_20 >= min_sep
+        and sep_20_40 >= min_sep
+        and ema9[-1] > ema9[-3]
+        and ema20[-1] > ema20[-3]
+        and ema40[-1] > ema40[-3]
+        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+    )
+
+    bear_fan = (
+        ema9[-1] < ema20[-1] < ema40[-1]
+        and sep_9_20 >= min_sep
+        and sep_20_40 >= min_sep
+        and ema9[-1] < ema9[-3]
+        and ema20[-1] < ema20[-3]
+        and ema40[-1] < ema40[-3]
+        and (e9_delta + e20_delta + e40_delta) > (avg_range * 0.30)
+    )
+
+    return {
+        "ema9": ema9,
+        "ema20": ema20,
+        "ema40": ema40,
+        "avg_range": avg_range,
+        "bull_fan": bull_fan,
+        "bear_fan": bear_fan
+    }
+
+
+def score_ema_structure(candles):
     if len(candles) < MIN_CANDLES:
         return 0.0
 
-    window = candles[-30:] if len(candles) >= 30 else candles[-25:]
-    closes = [c["close"] for c in window]
-    rsi = calc_rsi(closes, 7)
-    support_line, resistance_line = build_trendlines(window)
+    window = candles[-60:] if len(candles) >= 60 else candles
+    info = check_fan_and_emas(window)
+    if info is None:
+        return 0.0
+
     curr = window[-1]
-    prev = window[-2]
+    e9 = info["ema9"][-1]
+    e20 = info["ema20"][-1]
+    e40 = info["ema40"][-1]
+    avg_r = info["avg_range"]
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    tol = avg_range * 0.65
+    score = 20.0
+    if info["bull_fan"] or info["bear_fan"]:
+        score += 35.0
+    else:
+        if (e9 > e20 > e40) or (e9 < e20 < e40):
+            score += 15.0
 
-    score = 0.0
-    if support_line is not None:
-        score += 15.0 + (support_line.get("pivots", 0) * 5.0)
-        if abs(curr["close"] - support_line["value"]) <= tol * 1.5:
-            score += 12.0
-
-    if resistance_line is not None:
-        score += 15.0 + (resistance_line.get("pivots", 0) * 5.0)
-        if abs(curr["close"] - resistance_line["value"]) <= tol * 1.5:
-            score += 12.0
-
-    if rsi is not None and 25 <= rsi <= 75:
-        score += 8.0
-
-    if prev["close"] != prev["open"]:
-        score += 3.0
+    dist_e9 = abs(curr["close"] - e9)
+    if dist_e9 <= avg_r * 2.5:
+        score += 15.0
+    if abs(e9 - e20) >= avg_r * 0.25 and abs(e20 - e40) >= avg_r * 0.25:
+        score += 10.0
 
     return round(score, 2)
 
 
 # =====================================================
-# 3. ESTRATEJI CALL & PUT: BREAKOUT -> RETEST -> KONFIMASYON
+# 3. ESTRATEJI "FAN & PULLBACK" (CALL & PUT)
 # =====================================================
 def evaluate_real_market(candles):
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
-    window = candles[-30:] if len(candles) >= 30 else candles[-25:]
-    closes = [c["close"] for c in window]
-    rsi = calc_rsi(closes, 7)
-    if rsi is None:
-        return None, "rsi unavailable"
+    window = candles[-60:] if len(candles) >= 60 else candles
+    info = check_fan_and_emas(window)
+    if info is None:
+        return None, "ema unavailable"
 
-    support_line, resistance_line = build_trendlines(window)
-    recent = window[-6:-1]
-    prev = window[-2]
+    ema9 = info["ema9"]
+    ema20 = info["ema20"]
+    ema40 = info["ema40"]
+    avg_r = info["avg_range"]
+
+    # Check pullback on recent 1-3 candles before confirmation bar
+    pullback_bars = window[-4:-1]
+    pullback_e9 = ema9[-4:-1]
+    pullback_e20 = ema20[-4:-1]
+    pullback_e40 = ema40[-4:-1]
+
     curr = window[-1]
+    e9_now = ema9[-1]
+    e20_now = ema20[-1]
+    e40_now = ema40[-1]
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    tol = avg_range * 0.65
+    diag = (
+        f"e9={format_price(e9_now)} e20={format_price(e20_now)} "
+        f"e40={format_price(e40_now)} bull={info['bull_fan']} bear={info['bear_fan']}"
+    )
 
-    sup_slope = support_line["slope"] if support_line else 0.0
-    res_slope = resistance_line["slope"] if resistance_line else 0.0
-    diag = f"RSI={rsi:.1f} sup_m={sup_slope:.2e} res_m={res_slope:.2e}"
+    # Filter: Overextended price far from EMA 9
+    if abs(curr["close"] - e9_now) > avg_r * 2.8:
+        return None, f"{diag} overextended"
 
-    direction = None
-    win_prob = 50
-    setup_tag = ""
-
-    body_size = abs(curr["close"] - curr["open"])
-
-    # ---------------- CALL: BREAKOUT REZISTANS -> RETEST -> KONFIMASYON ----------------
-    if resistance_line is not None:
-        res_val = resistance_line["value"]
-        broke_above = any(
-            (b["close"] > res_val + (tol * 0.20)) or (b["high"] > res_val + (tol * 1.05))
-            for b in recent
+    # ---------------- BUY (CALL) RULES ----------------
+    if info["bull_fan"] and curr["close"] > e9_now > e20_now > e40_now:
+        # Filter: EMA 40 breach check on pullback candles
+        no_ema40_breach = all(
+            c["close"] > e40_v and min(c["open"], c["close"]) > e40_v - (avg_r * 0.35)
+            for c, e40_v in zip(pullback_bars, pullback_e40)
         )
-        retested_res = (
-            prev["low"] <= res_val + tol
-            or prev["close"] <= res_val + tol
-            or curr["low"] <= res_val + tol
+        # Pullback: red candle(s) dip to touch/pierce EMA 9 or EMA 20
+        had_red_pullback = any(
+            (c["close"] < c["open"])
+            and (
+                c["low"] <= e9_v + (avg_r * 0.25)
+                or c["low"] <= e20_v + (avg_r * 0.25)
+            )
+            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
         )
-        upper_wick = max(0.0, curr["high"] - max(curr["open"], curr["close"]))
-        no_heavy_seller_wick = upper_wick <= (body_size * 1.15)
-
+        # Confirmation: green candle rejects EMA zone and closes firmly above EMA 9
+        body_curr = curr["close"] - curr["open"]
+        range_curr = max(curr["high"] - curr["low"], 1e-12)
         confirmed_call = (
-            (curr["close"] > curr["open"])
-            and (curr["close"] >= res_val - (tol * 0.25))
-            and (curr["close"] >= prev["close"])
-            and no_heavy_seller_wick
+            curr["close"] > curr["open"]
+            and curr["close"] > e9_now + (avg_r * 0.12)
+            and body_curr >= range_curr * 0.35
         )
 
-        if broke_above and retested_res and confirmed_call and 25 <= rsi <= 72:
-            direction = "CALL"
-            setup_tag = "CALL_BRK_RET_CONF"
-            win_prob = calc_win_probability("CALL", rsi, resistance_line, curr, res_val, True)
+        if no_ema40_breach and had_red_pullback and confirmed_call:
+            win_prob = calc_win_probability_ema("CALL", ema9, ema20, ema40, curr, avg_r)
+            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            return {
+                "direction": "CALL",
+                "confidence": confidence,
+                "win_prob": win_prob,
+                "score": 6 if win_prob >= 75 else 5,
+                "close": curr["close"],
+                "candle_time": curr["time"]
+            }, f"{diag} CALL_FAN_PULLBACK"
 
-    # ---------------- PUT: BREAKOUT SIPÒ -> RETEST -> KONFIMASYON ----------------
-    if direction is None and support_line is not None:
-        sup_val = support_line["value"]
-        broke_below = any(
-            (b["close"] < sup_val - (tol * 0.25)) or (b["low"] < sup_val - (tol * 1.1))
-            for b in recent
+    # ---------------- SELL (PUT) RULES ----------------
+    if info["bear_fan"] and curr["close"] < e9_now < e20_now < e40_now:
+        # Filter: EMA 40 breach check on pullback candles
+        no_ema40_breach = all(
+            c["close"] < e40_v and max(c["open"], c["close"]) < e40_v + (avg_r * 0.35)
+            for c, e40_v in zip(pullback_bars, pullback_e40)
         )
-        retested_sup = (
-            prev["high"] >= sup_val - tol
-            or prev["close"] >= sup_val - tol
-            or curr["high"] >= sup_val - tol
+        # Pullback: green candle(s) bounce to touch EMA 9 or EMA 20
+        had_green_pullback = any(
+            (c["close"] > c["open"])
+            and (
+                c["high"] >= e9_v - (avg_r * 0.25)
+                or c["high"] >= e20_v - (avg_r * 0.25)
+            )
+            for c, e9_v, e20_v in zip(pullback_bars, pullback_e9, pullback_e20)
         )
-        lower_wick = max(0.0, min(curr["open"], curr["close"]) - curr["low"])
-        no_heavy_buyer_wick = lower_wick <= (body_size * 1.15)
-
+        # Confirmation: red candle rejects EMA zone and closes firmly below EMA 9
+        body_curr = curr["open"] - curr["close"]
+        range_curr = max(curr["high"] - curr["low"], 1e-12)
         confirmed_put = (
-            (curr["close"] < curr["open"])
-            and (curr["close"] <= sup_val + (tol * 0.25))
-            and (curr["close"] <= prev["close"])
-            and no_heavy_buyer_wick
+            curr["close"] < curr["open"]
+            and curr["close"] < e9_now - (avg_r * 0.12)
+            and body_curr >= range_curr * 0.35
         )
 
-        if broke_below and retested_sup and confirmed_put and 30 <= rsi <= 75:
-            direction = "PUT"
-            setup_tag = "PUT_BRK_RET_CONF"
-            win_prob = calc_win_probability("PUT", rsi, support_line, curr, sup_val, True)
+        if no_ema40_breach and had_green_pullback and confirmed_put:
+            win_prob = calc_win_probability_ema("PUT", ema9, ema20, ema40, curr, avg_r)
+            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            return {
+                "direction": "PUT",
+                "confidence": confidence,
+                "win_prob": win_prob,
+                "score": 6 if win_prob >= 75 else 5,
+                "close": curr["close"],
+                "candle_time": curr["time"]
+            }, f"{diag} PUT_FAN_PULLBACK"
 
-    if direction is None:
-        return None, f"{diag} no_brk_ret_conf"
-
-    if win_prob >= 75:
-        confidence = "🟢 TRÈ SOLID (Bon anpil)"
-        score = 6
-    else:
-        confidence = "🟡 RISKE (Fè pridan)"
-        score = 5
-
-    return {
-        "direction": direction,
-        "confidence": confidence,
-        "win_prob": win_prob,
-        "score": score,
-        "setup_tag": setup_tag,
-        "rsi": round(rsi, 2),
-        "close": curr["close"],
-        "candle_time": curr["time"]
-    }, f"{diag} {setup_tag}"
+    return None, f"{diag} no_fan_pullback"
 
 
 # =====================================================
@@ -456,7 +431,7 @@ def evaluate_real_market(candles):
 def format_signal_message(pair, payout, entry_time_str, signal_data):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
     return (
-        f"🤖 ROMARIO PRO M1\n\n"
+        f"🤖 ROMARIO PRO M1 (EMA 9/20/40)\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
         f"📊 Nivo: {signal_data['win_prob']}%\n"
         f"🎯 Antre: {entry_time_str} (Exp: 1 min)\n"
@@ -522,7 +497,7 @@ def download_all_histories(eligible):
 
     def fetch_and_score(item):
         candles = get_candles(item["symbol"])
-        setup_score = score_trendline_structure(candles) if candles else 0.0
+        setup_score = score_ema_structure(candles) if candles else 0.0
         enriched = dict(item)
         enriched["setup_score"] = setup_score
         return enriched, candles
@@ -568,7 +543,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening M1 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    log(f"Opening M1 EMA stream for top {len(symbols)} pairs: {', '.join(symbols)}")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
@@ -691,7 +666,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None,
                                 "last_price": price
                             }
-                            log(f"{symbol}: Single signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
+                            log(f"{symbol}: Single EMA signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
                     else:
                         log(f"{symbol}: no setup ({diag})")
 
@@ -738,7 +713,7 @@ def main():
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     top_pairs = ranked[:active_limit]
-    log("Top selected pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
+    log("Top selected EMA pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
     deadline = time.time() + MAX_WAIT_SECONDS
