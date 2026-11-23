@@ -11,19 +11,19 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 # =====================================================
-# 1. PARAMÈT JENERAL (ALL ELIGIBLE OTC PAIRS -> TOP 4 SNAP 60S)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (M1, EXP 60S, PAYOUT >= 90%)
 # =====================================================
-VERSION = "ROMARIO PRO M1 - ALL OTC TOP 4 SNAP 60S"
+VERSION = "ROMARIO PRO"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 TIMEFRAME = 60            # Graf 1 minit (M1)
 EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
-MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
-ENTRY_LEAD = 3            # Avèti w 3 segonn anvan ouvèti nouvo bouji a
+MIN_PAYOUT = 90.0         # Minimòm 90% payout sou OTC
+ALERT_LEAD = 3            # Avèti w 3 segonn anvan ouvèti nouvo bouji a
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 240    # Chèche yon bon opòtinite nan 4 minit max
-MAX_STREAM_PAIRS = 4      # 4 pi bon pè yo pou /v1/stream
+MAX_STREAM_PAIRS = 4      # Top 4 pi bon setup yo pou /v1/stream
 
 CANDLE_LIMIT = 90
 MIN_CANDLES = 50
@@ -73,7 +73,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioAllOtcSnapM1/1.0",
+            "User-Agent": "RomarioProM1/2.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -167,7 +167,7 @@ def send_telegram_fn(message):
 
 
 # =====================================================
-# 2. KALKIL EMA 9, EMA 20, EMA 40 ("MOMENTUM SNAP")
+# 2. KALKIL EMA 9, EMA 20, EMA 40 ("MOMENTUM SNAP" 60S)
 # =====================================================
 def calc_ema_series(closes, period):
     if len(closes) < period:
@@ -189,37 +189,8 @@ def align_ema_series(closes, period):
     return ([None] * pad_len) + raw
 
 
-def calc_win_probability_snap(direction, ema9, ema20, ema40, curr, avg_range):
-    prob = 56.0
-
-    spread_now = abs(ema9[-1] - ema20[-1])
-    spread_prev = abs(ema9[-2] - ema20[-2])
-    if spread_now > spread_prev:
-        prob += 12.0
-    else:
-        prob += 4.0
-
-    if direction == "CALL":
-        if ema9[-1] > ema9[-2] > ema9[-3] and ema20[-1] > ema20[-2] and ema40[-1] > ema40[-2]:
-            prob += 14.0
-        else:
-            prob += 6.0
-        if curr["close"] >= ema9[-1]:
-            prob += 10.0
-    else:
-        if ema9[-1] < ema9[-2] < ema9[-3] and ema20[-1] < ema20[-2] and ema40[-1] < ema40[-2]:
-            prob += 14.0
-        else:
-            prob += 6.0
-        if curr["close"] <= ema9[-1]:
-            prob += 10.0
-
-    prob = max(50.0, min(98.0, prob))
-    return int(round(prob))
-
-
-def check_snap_structure(window):
-    closes = [c["close"] for c in window]
+def check_snap_structure(closed_bars):
+    closes = [c["close"] for c in closed_bars]
     ema9 = align_ema_series(closes, 9)
     ema20 = align_ema_series(closes, 20)
     ema40 = align_ema_series(closes, 40)
@@ -227,7 +198,7 @@ def check_snap_structure(window):
     if any(x is None for x in (ema9[-1], ema9[-2], ema9[-3], ema20[-1], ema20[-2], ema40[-1], ema40[-2])):
         return None
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
+    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in closed_bars[-10:]) / 10.0
     min_gap = max(avg_range * 0.25, 1e-12)
 
     gap_9_20_now = abs(ema9[-1] - ema20[-1])
@@ -261,46 +232,74 @@ def check_snap_structure(window):
         "ema20": ema20,
         "ema40": ema40,
         "avg_range": avg_range,
+        "gap_9_20_now": gap_9_20_now,
+        "gap_9_20_prev": gap_9_20_prev,
+        "expanding_9_20": expanding_9_20,
         "bull_snap_trend": bull_snap_trend,
         "bear_snap_trend": bear_snap_trend
     }
 
 
-def score_snap_structure(candles):
-    if len(candles) < MIN_CANDLES:
-        return 0.0
+def calc_setup_and_win_rate(direction, bar, e9, e20, avg_r, gap_now, gap_prev, wick_ratio, body_ratio):
+    """
+    Kalkile Setup Score ak pousantaj win deterministik apati kalite estrikti bouji fèmen an.
+    Pa gen okenn valè o aza.
+    """
+    score = 0.0
+    win_pct = 55.0
 
-    window = candles[-60:] if len(candles) >= 60 else candles
-    info = check_snap_structure(window)
-    if info is None:
-        return 0.0
+    # 1. Espas EMA 9 & 20 k ap elaji (OTC wick protection)
+    if gap_now > gap_prev:
+        score += 25.0
+        win_pct += 11.0
+    if gap_now >= avg_r * 0.35:
+        score += 10.0
+        win_pct += 5.0
 
-    curr = window[-1]
-    e9 = info["ema9"][-1]
-    avg_r = info["avg_range"]
-
-    score = 20.0
-    if info["bull_snap_trend"] or info["bear_snap_trend"]:
-        score += 40.0
-    elif (info["ema9"][-1] > info["ema20"][-1] > info["ema40"][-1]) or (
-        info["ema9"][-1] < info["ema20"][-1] < info["ema40"][-1]
-    ):
+    # 2. Kalite mèch rejeksyon sou bouji ki fin fèmen
+    if wick_ratio >= 0.35:
+        score += 25.0
+        win_pct += 10.0
+    elif wick_ratio >= 0.22:
         score += 15.0
+        win_pct += 6.0
 
-    if abs(curr["close"] - e9) <= avg_r * 1.6:
-        score += 15.0
+    # 3. Kò bouji solid (pa doji / pa bouji piti)
+    if body_ratio >= 0.45:
+        score += 20.0
+        win_pct += 6.0
+    elif body_ratio >= 0.25:
+        score += 10.0
+        win_pct += 3.0
 
-    return round(score, 2)
+    # 4. Pozisyon fèmti parapò ak EMA 9 (san depase l twò lwen)
+    dist_e9 = abs(bar["close"] - e9)
+    if dist_e9 <= avg_r * 0.85:
+        score += 20.0
+        win_pct += 5.0
+    elif dist_e9 <= avg_r * 1.5:
+        score += 10.0
+        win_pct += 2.0
+
+    # Asire close rete anwo EMA 20 pou CALL oswa anba EMA 20 pou PUT
+    if direction == "CALL" and bar["close"] > e20:
+        win_pct += 2.0
+    elif direction == "PUT" and bar["close"] < e20:
+        win_pct += 2.0
+
+    setup_score = round(min(100.0, score), 1)
+    win_prob = int(round(max(50.0, min(92.0, win_pct))))
+    return setup_score, win_prob
 
 
 # =====================================================
-# 3. ESTRATEJI "MOMENTUM SNAP" 60S (CALL & PUT)
+# 3. EVALYASYON SOU BOUJI KI FIN FÈMEN NÈT
 # =====================================================
-def evaluate_real_market(candles):
-    if len(candles) < MIN_CANDLES:
-        return None, "not enough candles"
+def evaluate_closed_bar_market(closed_candles):
+    if len(closed_candles) < MIN_CANDLES:
+        return None, "not enough closed candles"
 
-    window = candles[-60:] if len(candles) >= 60 else candles
+    window = closed_candles[-60:] if len(closed_candles) >= 60 else closed_candles
     info = check_snap_structure(window)
     if info is None:
         return None, "ema unavailable"
@@ -310,82 +309,136 @@ def evaluate_real_market(candles):
     ema40 = info["ema40"]
     avg_r = info["avg_range"]
 
-    curr = window[-1]
+    # Analize dènye bouji ki FIN FÈMEN NÈT (window[-1])
+    bar = window[-1]
     e9_now = ema9[-1]
     e20_now = ema20[-1]
     e40_now = ema40[-1]
 
-    range_curr = max(curr["high"] - curr["low"], 1e-12)
-    body_curr = abs(curr["close"] - curr["open"])
-    body_ratio = body_curr / range_curr
+    range_bar = max(bar["high"] - bar["low"], 1e-12)
+    body_bar = abs(bar["close"] - bar["open"])
+    body_ratio = body_bar / range_bar
 
     diag = (
         f"e9={format_price(e9_now)} e20={format_price(e20_now)} "
         f"body_r={body_ratio:.2f} bull={info['bull_snap_trend']} bear={info['bear_snap_trend']}"
     )
 
-    if range_curr < avg_r * 0.55 or body_ratio < 0.25:
-        return None, f"{diag} doji_or_tiny_candle"
+    if range_bar < avg_r * 0.55 or body_ratio < 0.25:
+        return None, f"{diag} doji_or_tiny_closed_bar"
 
-    if abs(curr["close"] - e9_now) > avg_r * 1.8:
+    if abs(bar["close"] - e9_now) > avg_r * 1.8:
         return None, f"{diag} overextended"
 
-    if info["bull_snap_trend"] and curr["close"] > e9_now > e20_now > e40_now:
-        no_deep_pullback = curr["low"] > e20_now and curr["close"] > e20_now
-        shallow_touch_e9 = curr["low"] <= e9_now + (avg_r * 0.25)
-        lower_wick = max(0.0, min(curr["open"], curr["close"]) - curr["low"])
-        has_bottom_rejection = lower_wick >= (range_curr * 0.22) and (lower_wick >= body_curr * 0.45)
+    # ---------------- CALL: SHALLOW TOUCH EMA 9 + BOTTOM REJECTION WICK ----------------
+    if info["bull_snap_trend"] and bar["close"] > e9_now > e20_now > e40_now:
+        no_deep_pullback = bar["low"] > e20_now and bar["close"] > e20_now
+        shallow_touch_e9 = bar["low"] <= e9_now + (avg_r * 0.25)
+        lower_wick = max(0.0, min(bar["open"], bar["close"]) - bar["low"])
+        wick_ratio = lower_wick / range_bar
+        has_bottom_rejection = lower_wick >= (range_bar * 0.22) and (lower_wick >= body_bar * 0.45)
 
         if no_deep_pullback and shallow_touch_e9 and has_bottom_rejection:
-            win_prob = calc_win_probability_snap("CALL", ema9, ema20, ema40, curr, avg_r)
-            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            setup_score, win_prob = calc_setup_and_win_rate(
+                "CALL", bar, e9_now, e20_now, avg_r,
+                info["gap_9_20_now"], info["gap_9_20_prev"], wick_ratio, body_ratio
+            )
+            confidence = "🟢 TRÈ SOLID" if setup_score >= 75 else "🟡 MODERE"
             return {
                 "direction": "CALL",
-                "confidence": confidence,
+                "setup_score": setup_score,
                 "win_prob": win_prob,
-                "score": 6 if win_prob >= 75 else 5,
-                "close": curr["close"],
-                "candle_time": curr["time"]
-            }, f"{diag} CALL_SNAP_60S"
+                "confidence": confidence,
+                "ref_quote": bar["close"],
+                "candle_time": bar["time"]
+            }, f"{diag} CALL_SNAP_CLOSED score={setup_score} win={win_prob}%"
 
-    if info["bear_snap_trend"] and curr["close"] < e9_now < e20_now < e40_now:
-        no_deep_pullback = curr["high"] < e20_now and curr["close"] < e20_now
-        shallow_touch_e9 = curr["high"] >= e9_now - (avg_r * 0.25)
-        upper_wick = max(0.0, curr["high"] - max(curr["open"], curr["close"]))
-        has_top_rejection = upper_wick >= (range_curr * 0.22) and (upper_wick >= body_curr * 0.45)
+    # ---------------- PUT: SHALLOW TOUCH EMA 9 + TOP REJECTION WICK ----------------
+    if info["bear_snap_trend"] and bar["close"] < e9_now < e20_now < e40_now:
+        no_deep_pullback = bar["high"] < e20_now and bar["close"] < e20_now
+        shallow_touch_e9 = bar["high"] >= e9_now - (avg_r * 0.25)
+        upper_wick = max(0.0, bar["high"] - max(bar["open"], bar["close"]))
+        wick_ratio = upper_wick / range_bar
+        has_top_rejection = upper_wick >= (range_bar * 0.22) and (upper_wick >= body_bar * 0.45)
 
         if no_deep_pullback and shallow_touch_e9 and has_top_rejection:
-            win_prob = calc_win_probability_snap("PUT", ema9, ema20, ema40, curr, avg_r)
-            confidence = "🟢 TRÈ SOLID (Bon anpil)" if win_prob >= 75 else "🟡 RISKE (Fè pridan)"
+            setup_score, win_prob = calc_setup_and_win_rate(
+                "PUT", bar, e9_now, e20_now, avg_r,
+                info["gap_9_20_now"], info["gap_9_20_prev"], wick_ratio, body_ratio
+            )
+            confidence = "🟢 TRÈ SOLID" if setup_score >= 75 else "🟡 MODERE"
             return {
                 "direction": "PUT",
-                "confidence": confidence,
+                "setup_score": setup_score,
                 "win_prob": win_prob,
-                "score": 6 if win_prob >= 75 else 5,
-                "close": curr["close"],
-                "candle_time": curr["time"]
-            }, f"{diag} PUT_SNAP_60S"
+                "confidence": confidence,
+                "ref_quote": bar["close"],
+                "candle_time": bar["time"]
+            }, f"{diag} PUT_SNAP_CLOSED score={setup_score} win={win_prob}%"
 
-    return None, f"{diag} no_momentum_snap"
+    return None, f"{diag} no_closed_snap"
+
+
+def score_setup_quality(closed_candles):
+    """
+    Klase pè yo selon kalite vrè setup la (pa sèlman paske EMA yo aliyen).
+    Si gen yon setup konplè sou bouji ki fèmen a, li jwenn gwo nòt.
+    Sinonsa, li resevwa yon nòt pwoksimite/kalite estrikti sèlman.
+    """
+    sig, _ = evaluate_closed_bar_market(closed_candles)
+    if sig is not None:
+        return round(100.0 + sig["setup_score"], 2)
+
+    if len(closed_candles) < MIN_CANDLES:
+        return 0.0
+
+    window = closed_candles[-60:] if len(closed_candles) >= 60 else closed_candles
+    info = check_snap_structure(window)
+    if info is None:
+        return 0.0
+
+    bar = window[-1]
+    e9 = info["ema9"][-1]
+    avg_r = info["avg_range"]
+    range_bar = max(bar["high"] - bar["low"], 1e-12)
+    body_ratio = abs(bar["close"] - bar["open"]) / range_bar
+
+    quality = 0.0
+    if info["bull_snap_trend"] or info["bear_snap_trend"]:
+        quality += 35.0
+    if info["expanding_9_20"]:
+        quality += 15.0
+    if abs(bar["close"] - e9) <= avg_r * 1.2:
+        quality += 15.0
+    if range_bar >= avg_r * 0.55 and body_ratio >= 0.25:
+        quality += 10.0
+
+    return round(quality, 2)
 
 
 # =====================================================
-# 4. FORMAT MESAJ TELEGRAM SENP & RÈG WIN SÈLMAN
+# 4. FORMAT MESAJ TELEGRAM & VERIFIKASYON OTCHARTS 60S
 # =====================================================
-def format_signal_message(pair, payout, entry_time_str, signal_data):
+def format_signal_message(pair, payout, entry_time_str, signal_data, entry_quote=None):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
+    quote_str = format_price(entry_quote) if entry_quote is not None else f"~{format_price(signal_data['ref_quote'])}"
     return (
-        f"🤖 ROMARIO PRO M1 (SNAP 60S)\n\n"
+        f"🤖 {VERSION} (M1 / 60S)\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
-        f"📊 Nivo: {signal_data['win_prob']}%\n"
-        f"🎯 Antre: {entry_time_str} (Exp: 60s)\n"
+        f"📈 Pousantaj Win: {signal_data['win_prob']}% | Setup Score: {signal_data['setup_score']}\n"
+        f"🎯 Bon Kòt (Entry): {quote_str}\n"
+        f"🕒 Lè Antre: {entry_time_str} (Exp: 60s)\n"
         f"🛡️ Konfyans: {signal_data['confidence']}"
     )
 
 
-def handle_trade_result(pair, payout, is_win, send_fn):
+def handle_otcharts_60s_result(pair, payout, is_win, entry_quote, exit_quote, send_fn):
+    # Verifye rezilta 60s ak pri OTCharts sèlman (pa garanti Pocket Option)
     if is_win:
-        msg = f"✅ REZILTA: WIN | {pair} (+{payout:.0f}%)"
+        msg = (
+            f"✅ REZILTA (OTCharts 60s): WIN | {pair} (+{payout:.0f}%)\n"
+            f"Entry: {format_price(entry_quote)} -> Exit: {format_price(exit_quote)}"
+        )
         send_fn(msg)
 
 
@@ -437,11 +490,11 @@ def get_candles(symbol):
 
 def download_all_histories(eligible):
     histories, ranked = {}, []
-    log(f"Scanning {len(eligible)} eligible OTC pairs (>= {MIN_PAYOUT:.0f}%)...")
+    log(f"Scanning {len(eligible)} eligible OTC pairs (>= {MIN_PAYOUT:.0f}%) by setup quality...")
 
     def fetch_and_score(item):
         candles = get_candles(item["symbol"])
-        setup_score = score_snap_structure(candles) if candles else 0.0
+        setup_score = score_setup_quality(candles) if candles else 0.0
         enriched = dict(item)
         enriched["setup_score"] = setup_score
         return enriched, candles
@@ -464,7 +517,7 @@ def download_all_histories(eligible):
 
 def finalize_pending_trade(pending, last_prices):
     sym = pending["symbol"]
-    entry_price = pending["entry_price"] if pending["entry_price"] is not None else pending["last_price"]
+    entry_price = pending["entry_price"]
     exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
 
     if entry_price is not None and exit_price is not None:
@@ -472,22 +525,24 @@ def finalize_pending_trade(pending, last_prices):
             (pending["direction"] == "CALL" and exit_price > entry_price) or
             (pending["direction"] == "PUT" and exit_price < entry_price)
         )
-        handle_trade_result(
+        handle_otcharts_60s_result(
             sym,
             pending["payout"],
             is_win,
+            entry_price,
+            exit_price,
             send_telegram_fn
         )
-        log(f"{sym}: 60s trade finished ({'WIN' if is_win else 'LOSS'}). Stopping bot.")
+        log(f"{sym}: OTCharts 60s check -> {'WIN' if is_win else 'LOSS'} (entry={format_price(entry_price)}, exit={format_price(exit_price)}). Stopping bot.")
     else:
-        log(f"{sym}: Trade window ended. Stopping bot.")
+        log(f"{sym}: Missing exact entry/exit OTCharts tick. Stopping bot.")
 
 
 def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening M1 Momentum Snap stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    log(f"Opening M1 stream for top {len(symbols)} setup pairs: {', '.join(symbols)}")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
@@ -501,9 +556,10 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             now = time.time()
 
             if pending is not None:
+                # Pran entry price nan moman entry_time lan rive vre (pa 3s anvan)
                 if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
                     pending["entry_price"] = pending["last_price"]
-                    log(f"{pending['symbol']}: Entry set at {format_price(pending['entry_price'])}")
+                    log(f"{pending['symbol']}: Exact entry price captured at entry time -> {format_price(pending['entry_price'])}")
 
                 if now >= pending["expiry_time"]:
                     finalize_pending_trade(pending, last_prices)
@@ -561,11 +617,11 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             if pending is not None:
                 if symbol == pending["symbol"]:
                     pending["last_price"] = price
-                    if pending["entry_price"] is None and now >= pending["entry_time"]:
+                    if pending["entry_price"] is None and feed_time >= pending["entry_time"]:
                         pending["entry_price"] = price
-                        log(f"{symbol}: Entry set at {format_price(price)}")
+                        log(f"{symbol}: Exact entry price captured at entry time -> {format_price(price)}")
 
-                if now >= pending["expiry_time"]:
+                if feed_time >= pending["expiry_time"] or now >= pending["expiry_time"]:
                     finalize_pending_trade(pending, last_prices)
                     return "stop"
                 continue
@@ -585,35 +641,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             current = current_bars[symbol]
 
-            seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
-            if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
-                current["evaluated_preclose"] = True
-                hist = histories.get(symbol, [])
-                if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
-                    window = hist[-(MIN_CANDLES - 1):] + [current]
-                    signal_data, diag = evaluate_real_market(window)
-                    if signal_data:
-                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
-                        payout = pair_info["payout"]
-                        entry_ts = current["time"] + TIMEFRAME
-                        entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
-
-                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data)
-                        if send_telegram_fn(msg):
-                            signals_sent += 1
-                            pending = {
-                                "symbol": symbol,
-                                "payout": payout,
-                                "direction": signal_data["direction"],
-                                "entry_time": entry_ts,
-                                "expiry_time": entry_ts + EXPIRATION,
-                                "entry_price": None,
-                                "last_price": price
-                            }
-                            log(f"{symbol}: Single 60s snap signal sent ({signal_data['direction']}, {signal_data['win_prob']}%) -> Entry {entry_time_str}. Waiting {EXPIRATION}s then stopping.")
-                    else:
-                        log(f"{symbol}: no setup ({diag})")
-
+            # Lè yon bouji 1m fin fèmen nèt (bucket > current["time"]), nou ajoute l nan istorik
+            # epi nou evalye sou bouji ki fin fèmen an pou nouvo bouji k ap ouvè a (entry_ts = bucket).
             if bucket > current["time"]:
                 clean_bar = {
                     "time": current["time"],
@@ -628,10 +657,48 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 current_bars[symbol] = {
                     "time": bucket, "open": price, "high": price, "low": price, "close": price
                 }
+
+                hist = histories.get(symbol, [])
+                if len(hist) >= MIN_CANDLES and signals_sent < MAX_SIGNALS_PER_RUN:
+                    signal_data, diag = evaluate_closed_bar_market(hist)
+                    if signal_data:
+                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
+                        payout = pair_info["payout"]
+                        entry_ts = bucket
+                        entry_time_str = datetime.fromtimestamp(entry_ts, TIMEZONE).strftime("%I:%M:%S %p")
+
+                        # Kòt egzak nan moman nouvo bouji a ouvè (entry_ts)
+                        exact_entry_quote = price
+                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=exact_entry_quote)
+                        if send_telegram_fn(msg):
+                            signals_sent += 1
+                            pending = {
+                                "symbol": symbol,
+                                "payout": payout,
+                                "direction": signal_data["direction"],
+                                "entry_time": entry_ts,
+                                "expiry_time": entry_ts + EXPIRATION,
+                                "entry_price": exact_entry_quote,
+                                "last_price": price
+                            }
+                            log(f"{symbol}: {signal_data['direction']} signal sent (win={signal_data['win_prob']}%, score={signal_data['setup_score']}) | Entry quote={format_price(exact_entry_quote)} at {entry_time_str}.")
+                    else:
+                        log(f"{symbol}: no closed-bar setup ({diag})")
             else:
                 current["high"] = max(current["high"], price)
                 current["low"] = min(current["low"], price)
                 current["close"] = price
+
+                # Avètisman preparasyon 3s anvan bouji aktyèl la fèmen (san fikse entry_price twò bonè)
+                seconds_left = (current["time"] + TIMEFRAME) - feed_time
+                if 0 < seconds_left <= ALERT_LEAD and not current.get("preclose_logged"):
+                    current["preclose_logged"] = True
+                    hist = histories.get(symbol, [])
+                    if len(hist) + 1 >= MIN_CANDLES:
+                        preview_window = (hist[-(MIN_CANDLES - 1):] + [current])
+                        sig_prev, _ = evaluate_closed_bar_market(preview_window)
+                        if sig_prev:
+                            log(f"{symbol}: Candidate {sig_prev['direction']} forming ({seconds_left}s left) — waiting for candle close & exact entry tick.")
 
     finally:
         response.close()
@@ -647,7 +714,7 @@ def main():
 
     eligible = get_eligible_symbols()
     if not eligible:
-        log("No pairs >= 85% open right now.")
+        log(f"No pairs >= {MIN_PAYOUT:.0f}% open right now.")
         sys.exit(0)
 
     histories, ranked = download_all_histories(eligible)
@@ -657,7 +724,7 @@ def main():
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     top_pairs = ranked[:active_limit]
-    log("Top selected snap pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
+    log("Top 4 setup pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
     deadline = time.time() + MAX_WAIT_SECONDS
