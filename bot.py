@@ -1,804 +1,404 @@
-import os
-import sys
-import json
-import time
+import asyncio
 import logging
-import threading
-import requests
-
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone, timedelta
-
-# =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (M1, EXP 60S, UTC-5)
-# =====================================================
-VERSION = "ROMARIO PRO"
-
-BASE_URL = "https://otcharts.com"
-VENUE = "otc"
-TIMEFRAME = 60            # Graf 1 minit (M1)
-EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
-MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
-ENTRY_LEAD = 10           # Avèti w 10 segonn anvan nouvo bouji a ouvè
-MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
-MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
-MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
-
-CANDLE_LIMIT = 90
-MIN_CANDLES = 50
-MAX_RECONNECTS = 5
-
-# Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
-TOXIC_CURRENCIES = ("TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB", "HUF", "SEK", "NOK")
-
-API_CONNECT_TIMEOUT = 4
-API_READ_TIMEOUT = 10
-
-TELEGRAM_ATTEMPTS = 3
-TELEGRAM_TIMEOUT = (1, 2)
-
-# Lè egzak itilizatè a: UTC-5
-USER_TZ = timezone(timedelta(hours=-5))
-
-API_KEY = os.getenv("OTCHARTS_API_KEY", "").strip()
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+import math
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-_thread_local = threading.local()
-
-
-class StreamRateLimitError(Exception):
-    def __init__(self, message, retry_after=30):
-        super().__init__(message)
-        self.retry_after = retry_after
+logger = logging.getLogger("ROMARIO_PRO")
 
 
-class StreamBadRequestError(Exception):
-    pass
+# =====================================================================
+# 1. KONFIGIRASYON BOT LA
+# =====================================================================
+CONFIG = {
+    "pairs": ["PLTR_otc", "MARA_otc", "USDCHF_otc", "EURUSD_otc"],
+    "timeframe_sec": 60,        # M1 (60 segonn)
+    "expiry_sec": 60,           # Ekspirasyon 60 segonn (1m)
+    "min_payout": 85.0,         # Filtè payout minimòm (>= 85%)
+    "base_amount": 1.0,         # Montan baz (PA GEN MARTINGALE OTOMATIK)
+    "eval_sec_start": 55,       # Evalye apati segonn :55
+    "eval_sec_end": 58,         # Jiska segonn :58 (anvan bouji a fèmen)
+    "entry_sec": 0,             # Pase lòd egzakteman nan segonn :00
+    "min_adx": 25.0,            # Fòs tandans ADX >= 25
+    "min_di_diff": 4.0,         # Diferans DI+ ak DI- omwen 4 pwen
+    "min_body_ratio": 0.55,     # Kò bouji >= 55% gwosè total bouji a (nan 50%-60%)
+    "candle_lookback": 120,     # Kantite bouji M1 pou kalkile endikatè yo
+    "poll_interval": 0.25,      # Frekans tcheke revèy la (segonn)
+}
 
 
-def log(message):
-    logging.info(message)
-
-
-def normalize_ts(ts):
-    ts = int(ts)
-    return ts // 1000 if ts > 10_000_000_000 else ts
-
-
-def get_session():
-    if not hasattr(_thread_local, "session"):
-        _thread_local.session = requests.Session()
-        _thread_local.session.headers.update({
-            "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/2.5",
-            "Accept": "application/json"
-        })
-    return _thread_local.session
-
-
-def format_price(value):
-    return f"{float(value):.8f}".rstrip("0").rstrip(".")
-
-
-def is_clean_pair(symbol):
-    up = symbol.upper()
-    return not any(code in up for code in TOXIC_CURRENCIES)
-
-
-def compute_utc5_entry_timestamp(seconds_left_in_bar):
+# =====================================================================
+# 2. BROKER ADAPTER (KONEKTE API BROKER OU A ISIT LA)
+# =====================================================================
+class BrokerClient:
     """
-    Kalkile timestamp pwochen ouvèti bouji 60s la apati lè UTC-5 aktyèl la.
+    Ranplase kòd andedan metòd yo avèk apèl reyèl API / WebSocket broker ou a.
+    Pa chanje non metòd yo pou bouk prensipal la kontinye mache san pwoblèm.
     """
-    rem = max(1, min(TIMEFRAME, int(round(seconds_left_in_bar))))
-    now_utc5_epoch = datetime.now(USER_TZ).timestamp()
-    next_minute_utc5 = ((int(now_utc5_epoch) // TIMEFRAME) + 1) * TIMEFRAME
-    if abs(next_minute_utc5 - (now_utc5_epoch + rem)) <= 3:
-        return next_minute_utc5
-    return int(round(now_utc5_epoch + rem))
 
+    def __init__(self, pairs: List[str]):
+        self.pairs = pairs
+        self.connected = False
 
-def api_get(path, params=None, stream=False):
-    url = BASE_URL + path
-    attempts = 1 if stream else 4
-    backoffs = (0.8, 1.5, 2.5)
+    async def connect(self) -> None:
+        logger.info(f"Connecting stream for pairs: {', '.join(self.pairs)}...")
+        # TODO: Mete koneksyon reyèl broker ou a isit la (ex: await api.connect())
+        await asyncio.sleep(0.2)
+        self.connected = True
+        logger.info(f"Connected: {', '.join(sorted(self.pairs))}")
 
-    for attempt in range(1, attempts + 1):
-        response = None
-        try:
-            response = get_session().get(
-                url,
-                params=params,
-                timeout=(
-                    API_CONNECT_TIMEOUT,
-                    None if stream else API_READ_TIMEOUT
-                ),
-                stream=stream
-            )
+    async def get_payout(self, pair: str) -> float:
+        """Retounen payout pè a an pousantaj (ex: 88.0 pou 88%)."""
+        # TODO: Ranplase avèk payout reyèl pè a soti nan broker la
+        return 85.0
 
-            if response.status_code == 400 and stream:
-                body = ""
-                try:
-                    body = response.text[:160]
-                except Exception:
-                    pass
-                response.close()
-                raise StreamBadRequestError(f"400 Bad Request: {body}")
-
-            if response.status_code == 429:
-                retry_hdr = response.headers.get("Retry-After", "30")
-                try:
-                    retry_after = max(25, int(float(retry_hdr)))
-                except (TypeError, ValueError):
-                    retry_after = 30
-                response.close()
-                raise StreamRateLimitError("Rate limit", retry_after)
-
-            if response.status_code in (502, 503, 504):
-                status_code = response.status_code
-                response.close()
-                if attempt < attempts:
-                    delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
-                    log(f"HTTP {status_code} on {path}. Retrying in {delay:.1f}s ({attempt}/{attempts})...")
-                    time.sleep(delay)
-                    continue
-                raise requests.HTTPError(f"{status_code} Server Error for url: {url}")
-
-            if response.status_code in (401, 402, 403, 500):
-                status_code = response.status_code
-                response.close()
-                if attempt < 2:
-                    time.sleep(0.4)
-                    continue
-                raise requests.HTTPError(f"{status_code} Server Error for url: {url}")
-
-            response.raise_for_status()
-            if stream:
-                return response
-            return response.json()
-
-        except (StreamRateLimitError, StreamBadRequestError):
-            raise
-        except Exception:
-            if response is not None:
-                response.close()
-            if attempt >= attempts:
-                raise
-            delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
-            time.sleep(delay)
-
-    raise RuntimeError("Request failed.")
-
-
-def send_telegram_fn(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials missing.")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
-        response = None
-        try:
-            response = requests.post(
-                url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
-                timeout=TELEGRAM_TIMEOUT
-            )
-            if response.ok:
-                return True
-        except Exception:
-            pass
-        finally:
-            if response is not None:
-                response.close()
-        time.sleep(0.2)
-    return False
-
-
-# =====================================================
-# 2. KALKIL EMA 9, EMA 20, EMA 40 ("MOMENTUM SNAP" 60S)
-# =====================================================
-def calc_ema_series(closes, period):
-    if len(closes) < period:
+    async def fetch_candles(self, pair: str, count: int = 120) -> List[Dict[str, float]]:
+        """
+        Dwe retounen yon lis bouji M1 ki klase soti nan pi ansyen rive nan pi resan.
+        Chak bouji dwe gen: {'open': float, 'high': float, 'low': float, 'close': float}
+        """
+        # TODO: Ranplase avèk bouji M1 reyèl soti nan stream / API broker la
         return []
-    multiplier = 2.0 / (period + 1.0)
-    ema_val = sum(closes[:period]) / period
-    series = [ema_val]
-    for price in closes[period:]:
-        ema_val = (price - ema_val) * multiplier + ema_val
-        series.append(ema_val)
-    return series
+
+    async def place_order(
+        self,
+        pair: str,
+        direction: str,   # "CALL" oswa "PUT"
+        amount: float,
+        expiry_sec: int = 60,
+    ) -> Dict[str, Any]:
+        """Voye lòd la sou broker la epi retounen enfòmasyon trade la."""
+        # TODO: Ranplase avèk fonksyon acha reyèl broker la (ex: await api.buy(amount, pair, direction, expiry_sec))
+        logger.info(
+            f"ORDER SENT -> pair={pair} | dir={direction} | amount={amount:.2f} | expiry={expiry_sec}s"
+        )
+        return {"status": "submitted", "pair": pair, "direction": direction, "amount": amount}
 
 
-def align_ema_series(closes, period):
-    raw = calc_ema_series(closes, period)
-    if not raw:
-        return [None] * len(closes)
-    pad_len = len(closes) - len(raw)
-    return ([None] * pad_len) + raw
+# =====================================================================
+# 3. KALKIL ENDIKATÈ MATEMATIK (EMA, ATR, ADX/DMI, STOCHASTIC)
+# =====================================================================
+def calc_ema(values: List[float], period: int) -> List[float]:
+    if len(values) < period:
+        return []
+    k = 2.0 / (period + 1.0)
+    ema_vals: List[float] = [sum(values[:period]) / period]
+    for price in values[period:]:
+        ema_vals.append((price * k) + (ema_vals[-1] * (1.0 - k)))
+    return ema_vals
 
 
-def check_snap_structure(window):
-    closes = [c["close"] for c in window]
-    ema9 = align_ema_series(closes, 9)
-    ema20 = align_ema_series(closes, 20)
-    ema40 = align_ema_series(closes, 40)
-
-    if any(x is None for x in (ema9[-1], ema9[-2], ema9[-3], ema20[-1], ema20[-2], ema40[-1], ema40[-2])):
+def calc_atr_and_dmi(candles: List[Dict[str, float]], period: int = 14) -> Optional[Dict[str, float]]:
+    n = len(candles)
+    if n < (period * 2) + 2:
         return None
 
-    avg_range = sum(max(c["high"] - c["low"], 1e-12) for c in window[-10:]) / 10.0
-    min_gap = max(avg_range * 0.22, 1e-12)
+    tr_list: List[float] = []
+    plus_dm_list: List[float] = []
+    minus_dm_list: List[float] = []
 
-    gap_9_20_now = abs(ema9[-1] - ema20[-1])
-    gap_20_40_now = abs(ema20[-1] - ema40[-1])
-    gap_9_20_prev = abs(ema9[-2] - ema20[-2])
+    for i in range(1, n):
+        high = float(candles[i]["high"])
+        low = float(candles[i]["low"])
+        prev_close = float(candles[i - 1]["close"])
+        prev_high = float(candles[i - 1]["high"])
+        prev_low = float(candles[i - 1]["low"])
 
-    expanding_9_20 = gap_9_20_now >= gap_9_20_prev * 0.98
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        up_move = high - prev_high
+        down_move = prev_low - low
 
-    bull_snap_trend = (
-        ema9[-1] > ema20[-1] > ema40[-1]
-        and gap_9_20_now >= min_gap
-        and gap_20_40_now >= min_gap
-        and expanding_9_20
-        and ema9[-1] > ema9[-2]
-        and ema20[-1] > ema20[-2]
-        and ema40[-1] > ema40[-2]
-    )
+        plus_dm = up_move if (up_move > down_move and up_move > 0.0) else 0.0
+        minus_dm = down_move if (down_move > up_move and down_move > 0.0) else 0.0
 
-    bear_snap_trend = (
-        ema9[-1] < ema20[-1] < ema40[-1]
-        and gap_9_20_now >= min_gap
-        and gap_20_40_now >= min_gap
-        and expanding_9_20
-        and ema9[-1] < ema9[-2]
-        and ema20[-1] < ema20[-2]
-        and ema40[-1] < ema40[-2]
-    )
+        tr_list.append(tr)
+        plus_dm_list.append(plus_dm)
+        minus_dm_list.append(minus_dm)
+
+    atr = sum(tr_list[:period])
+    smooth_plus_dm = sum(plus_dm_list[:period])
+    smooth_minus_dm = sum(minus_dm_list[:period])
+
+    dx_list: List[float] = []
+
+    di_plus = (100.0 * smooth_plus_dm / atr) if atr > 0 else 0.0
+    di_minus = (100.0 * smooth_minus_dm / atr) if atr > 0 else 0.0
+    if (di_plus + di_minus) > 0:
+        dx_list.append(100.0 * abs(di_plus - di_minus) / (di_plus + di_minus))
+
+    atr_avg = atr / period
+
+    for i in range(period, len(tr_list)):
+        atr = atr - (atr / period) + tr_list[i]
+        smooth_plus_dm = smooth_plus_dm - (smooth_plus_dm / period) + plus_dm_list[i]
+        smooth_minus_dm = smooth_minus_dm - (smooth_minus_dm / period) + minus_dm_list[i]
+
+        atr_avg = atr / period
+        di_plus = (100.0 * smooth_plus_dm / atr) if atr > 0 else 0.0
+        di_minus = (100.0 * smooth_minus_dm / atr) if atr > 0 else 0.0
+
+        if (di_plus + di_minus) > 0:
+            dx_list.append(100.0 * abs(di_plus - di_minus) / (di_plus + di_minus))
+
+    if len(dx_list) < period:
+        return None
+
+    adx = sum(dx_list[:period]) / period
+    for dx in dx_list[period:]:
+        adx = ((adx * (period - 1)) + dx) / period
 
     return {
-        "ema9": ema9,
-        "ema20": ema20,
-        "ema40": ema40,
-        "avg_range": avg_range,
-        "gap_9_20_now": gap_9_20_now,
-        "gap_9_20_prev": gap_9_20_prev,
-        "expanding_9_20": expanding_9_20,
-        "bull_snap_trend": bull_snap_trend,
-        "bear_snap_trend": bear_snap_trend
+        "atr": atr_avg,
+        "adx": adx,
+        "di_plus": di_plus,
+        "di_minus": di_minus,
     }
 
 
-def calc_setup_and_win_rate(direction, bar, e9, e20, avg_r, gap_now, gap_prev, wick_ratio, body_ratio):
-    score = 0.0
-    win_pct = 55.0
+def calc_stochastic(
+    candles: List[Dict[str, float]],
+    k_period: int = 14,
+    smooth_k: int = 3,
+    d_period: int = 3,
+) -> Optional[Dict[str, float]]:
+    needed = k_period + smooth_k + d_period + 2
+    if len(candles) < needed:
+        return None
 
-    if gap_now > gap_prev:
-        score += 25.0
-        win_pct += 11.0
-    if gap_now >= avg_r * 0.30:
-        score += 10.0
-        win_pct += 5.0
+    raw_k: List[float] = []
+    for i in range(k_period - 1, len(candles)):
+        window = candles[i - k_period + 1 : i + 1]
+        highest_high = max(float(c["high"]) for c in window)
+        lowest_low = min(float(c["low"]) for c in window)
+        close = float(candles[i]["close"])
+        span = highest_high - lowest_low
+        raw_k.append(50.0 if span <= 0 else (100.0 * (close - lowest_low) / span))
 
-    if wick_ratio >= 0.32:
-        score += 25.0
-        win_pct += 10.0
-    elif wick_ratio >= 0.18:
-        score += 15.0
-        win_pct += 6.0
+    if len(raw_k) < smooth_k:
+        return None
 
-    if body_ratio >= 0.42:
-        score += 20.0
-        win_pct += 6.0
-    elif body_ratio >= 0.22:
-        score += 10.0
-        win_pct += 3.0
+    k_line = [
+        sum(raw_k[i - smooth_k + 1 : i + 1]) / smooth_k
+        for i in range(smooth_k - 1, len(raw_k))
+    ]
 
-    dist_e9 = abs(bar["close"] - e9)
-    if dist_e9 <= avg_r * 0.9:
-        score += 20.0
-        win_pct += 5.0
-    elif dist_e9 <= avg_r * 1.6:
-        score += 10.0
-        win_pct += 2.0
+    if len(k_line) < d_period + 1:
+        return None
 
-    if direction == "CALL" and bar["close"] > e20:
-        win_pct += 2.0
-    elif direction == "PUT" and bar["close"] < e20:
-        win_pct += 2.0
+    d_line = [
+        sum(k_line[i - d_period + 1 : i + 1]) / d_period
+        for i in range(d_period - 1, len(k_line))
+    ]
 
-    setup_score = round(min(100.0, score), 1)
-    win_prob = int(round(max(50.0, min(92.0, win_pct))))
-    return setup_score, win_prob
+    if len(d_line) < 2:
+        return None
+
+    return {
+        "k_prev": k_line[-2],
+        "k_curr": k_line[-1],
+        "d_prev": d_line[-2],
+        "d_curr": d_line[-1],
+    }
 
 
-# =====================================================
-# 3. EVALYASYON 10S ANVAN FÈMTI BOUJI A (MOMENTUM SNAP 60S)
-# =====================================================
-def evaluate_real_market(candles):
-    if len(candles) < MIN_CANDLES:
-        return None, "not enough candles"
+# =====================================================================
+# 4. EVALUASYON SIYAL LA
+# =====================================================================
+def evaluate_signal(candles: List[Dict[str, float]], payout: float, cfg: Dict[str, Any]) -> Dict[str, Any]:
+    min_payout = float(cfg["min_payout"])
+    min_adx = float(cfg["min_adx"])
+    min_di_diff = float(cfg["min_di_diff"])
+    min_body_ratio = float(cfg["min_body_ratio"])
 
-    window = candles[-60:] if len(candles) >= 60 else candles
-    info = check_snap_structure(window)
-    if info is None:
-        return None, "ema unavailable"
+    if payout < min_payout:
+        return {"signal": None, "reason": f"low_payout({payout:.1f}<{min_payout:.1f})"}
 
-    ema9 = info["ema9"]
-    ema20 = info["ema20"]
-    ema40 = info["ema40"]
-    avg_r = info["avg_range"]
+    if len(candles) < 60:
+        return {"signal": None, "reason": "not_enough_candles"}
 
-    bar = window[-1]
-    e9_now = ema9[-1]
-    e20_now = ema20[-1]
-    e40_now = ema40[-1]
+    closes = [float(c["close"]) for c in candles]
+    ema9_list = calc_ema(closes, 9)
+    ema20_list = calc_ema(closes, 20)
+    ema40_list = calc_ema(closes, 40)
 
-    range_bar = max(bar["high"] - bar["low"], 1e-12)
-    body_bar = abs(bar["close"] - bar["open"])
-    body_ratio = body_bar / range_bar
+    if not ema9_list or not ema20_list or not ema40_list:
+        return {"signal": None, "reason": "ema_not_ready"}
 
-    diag = (
-        f"e9={format_price(e9_now)} e20={format_price(e20_now)} "
-        f"body_r={body_ratio:.2f} bull={info['bull_snap_trend']} bear={info['bear_snap_trend']}"
+    dmi = calc_atr_and_dmi(candles, period=14)
+    stoch = calc_stochastic(candles, k_period=14, smooth_k=3, d_period=3)
+
+    if dmi is None or stoch is None:
+        return {"signal": None, "reason": "indicators_not_ready"}
+
+    atr = dmi["atr"]
+    adx = dmi["adx"]
+    di_plus = dmi["di_plus"]
+    di_minus = dmi["di_minus"]
+
+    if atr <= 0 or math.isnan(atr):
+        return {"signal": None, "reason": "invalid_atr"}
+
+    # A. Espas EMA ak limit ekstansyon pri
+    ema9 = ema9_list[-1]
+    ema20 = ema20_list[-1]
+    ema40 = ema40_list[-1]
+
+    ema_spread = abs(ema9 - ema20)
+    if ema_spread <= (0.2 * atr):
+        return {"signal": None, "reason": f"ema_flat_spread({ema_spread:.6f}<={0.2*atr:.6f})"}
+
+    curr = candles[-1]
+    prev = candles[-2]
+    curr_open = float(curr["open"])
+    curr_high = float(curr["high"])
+    curr_low = float(curr["low"])
+    curr_close = float(curr["close"])
+
+    price_extension = abs(curr_close - ema9)
+    if price_extension > (1.0 * atr):
+        return {"signal": None, "reason": f"overextended({price_extension:.6f}>{1.0*atr:.6f})"}
+
+    # B. Fòs tandans ADX
+    if adx < min_adx:
+        return {"signal": None, "reason": f"weak_adx({adx:.2f}<{min_adx:.2f})"}
+
+    # C. Filtè kò bouji vs gwosè total bouji
+    candle_range = curr_high - curr_low
+    if candle_range <= 0:
+        return {"signal": None, "reason": "zero_range_candle"}
+
+    body_size = abs(curr_close - curr_open)
+    body_ratio = body_size / candle_range
+    if body_ratio < min_body_ratio:
+        return {"signal": None, "reason": f"weak_body_ratio({body_ratio:.2f}<{min_body_ratio:.2f})"}
+
+    # Pullback: bouji anvan an touche oswa pwoche zòn EMA9 oswa EMA20
+    ema9_prev = ema9_list[-2] if len(ema9_list) >= 2 else ema9
+    ema20_prev = ema20_list[-2] if len(ema20_list) >= 2 else ema20
+    pullback_tol = 0.15 * atr
+
+    prev_low = float(prev["low"])
+    prev_high = float(prev["high"])
+
+    touched_ema_zone = (
+        (prev_low <= ema9_prev + pullback_tol and prev_high >= ema9_prev - pullback_tol)
+        or (prev_low <= ema20_prev + pullback_tol and prev_high >= ema20_prev - pullback_tol)
     )
 
-    if range_bar < avg_r * 0.45 or body_ratio < 0.20:
-        return None, f"{diag} doji_or_tiny_bar"
+    k_prev, k_curr = stoch["k_prev"], stoch["k_curr"]
+    d_prev, d_curr = stoch["d_prev"], stoch["d_curr"]
+
+    # CALL: EMA9 > EMA20 > EMA40 + espas + ADX + DI+ - DI- >= 4 + pullback + bouji vèt > EMA9 + Stoch cross (20-65)
+    bull_ema_stack = (ema9 > ema20) and (ema20 > ema40)
+    bull_di = (di_plus > di_minus) and ((di_plus - di_minus) >= min_di_diff)
+    bull_candle_ok = (curr_close > curr_open) and (curr_close > ema9)
+    bull_stoch_ok = (k_prev <= d_prev) and (k_curr > d_curr) and (20.0 <= k_curr <= 65.0)
+
+    if bull_ema_stack and bull_di and touched_ema_zone and bull_candle_ok and bull_stoch_ok:
+        return {
+            "signal": "CALL",
+            "reason": f"CALL_CONFIRMED(adx={adx:.1f}, di+={di_plus:.1f}, di-={di_minus:.1f}, body_r={body_ratio:.2f}, k={k_curr:.1f})",
+        }
+
+    # PUT: EMA9 < EMA20 < EMA40 + espas + ADX + DI- - DI+ >= 4 + pullback + bouji wouj < EMA9 + Stoch cross (35-80)
+    bear_ema_stack = (ema9 < ema20) and (ema20 < ema40)
+    bear_di = (di_minus > di_plus) and ((di_minus - di_plus) >= min_di_diff)
+    bear_candle_ok = (curr_close < curr_open) and (curr_close < ema9)
+    bear_stoch_ok = (k_prev >= d_prev) and (k_curr < d_curr) and (35.0 <= k_curr <= 80.0)
+
+    if bear_ema_stack and bear_di and touched_ema_zone and bear_candle_ok and bear_stoch_ok:
+        return {
+            "signal": "PUT",
+            "reason": f"PUT_CONFIRMED(adx={adx:.1f}, di-={di_minus:.1f}, di+={di_plus:.1f}, body_r={body_ratio:.2f}, k={k_curr:.1f})",
+        }
+
+    return {
+        "signal": None,
+        "reason": f"no_setup(adx={adx:.1f}, di+={di_plus:.1f}, di-={di_minus:.1f}, body_r={body_ratio:.2f}, pull={touched_ema_zone}, k={k_curr:.1f}/d={d_curr:.1f})",
+    }
+
+
+# =====================================================================
+# 5. BOUK PRENSIPAL (EVALYE :55-:58, ANTREFÈ :00, SAN MARTINGALE)
+# =====================================================================
+async def run_bot() -> None:
+    logger.info("ROMARIO PRO starting...")
+    client = BrokerClient(CONFIG["pairs"])
+    await client.connect()
+
+    current_stake = float(CONFIG["base_amount"])  # Toujou rete base_amount (pa gen Martingale)
+    last_eval_minute_key: Optional[int] = None
+    pending_signals: List[Dict[str, Any]] = []
+    last_entry_minute_key: Optional[int] = None
 
-    if abs(bar["close"] - e9_now) > avg_r * 1.9:
-        return None, f"{diag} overextended"
-
-    if info["bull_snap_trend"] and bar["close"] > e9_now > e20_now > e40_now:
-        no_deep_pullback = bar["low"] > e20_now and bar["close"] > e20_now
-        shallow_touch_e9 = bar["low"] <= e9_now + (avg_r * 0.30)
-        lower_wick = max(0.0, min(bar["open"], bar["close"]) - bar["low"])
-        wick_ratio = lower_wick / range_bar
-        has_bottom_rejection = lower_wick >= (range_bar * 0.18) and (lower_wick >= body_bar * 0.35)
-
-        if no_deep_pullback and shallow_touch_e9 and has_bottom_rejection:
-            setup_score, win_prob = calc_setup_and_win_rate(
-                "CALL", bar, e9_now, e20_now, avg_r,
-                info["gap_9_20_now"], info["gap_9_20_prev"], wick_ratio, body_ratio
-            )
-            confidence = "🟢 TRÈ SOLID" if setup_score >= 70 else "🟡 MODERE"
-            return {
-                "direction": "CALL",
-                "setup_score": setup_score,
-                "win_prob": win_prob,
-                "confidence": confidence,
-                "ref_quote": bar["close"],
-                "candle_time": bar["time"]
-            }, f"{diag} CALL_SNAP_60S score={setup_score} win={win_prob}%"
-
-    if info["bear_snap_trend"] and bar["close"] < e9_now < e20_now < e40_now:
-        no_deep_pullback = bar["high"] < e20_now and bar["close"] < e20_now
-        shallow_touch_e9 = bar["high"] >= e9_now - (avg_r * 0.30)
-        upper_wick = max(0.0, bar["high"] - max(bar["open"], bar["close"]))
-        wick_ratio = upper_wick / range_bar
-        has_top_rejection = upper_wick >= (range_bar * 0.18) and (upper_wick >= body_bar * 0.35)
-
-        if no_deep_pullback and shallow_touch_e9 and has_top_rejection:
-            setup_score, win_prob = calc_setup_and_win_rate(
-                "PUT", bar, e9_now, e20_now, avg_r,
-                info["gap_9_20_now"], info["gap_9_20_prev"], wick_ratio, body_ratio
-            )
-            confidence = "🟢 TRÈ SOLID" if setup_score >= 70 else "🟡 MODERE"
-            return {
-                "direction": "PUT",
-                "setup_score": setup_score,
-                "win_prob": win_prob,
-                "confidence": confidence,
-                "ref_quote": bar["close"],
-                "candle_time": bar["time"]
-            }, f"{diag} PUT_SNAP_60S score={setup_score} win={win_prob}%"
-
-    return None, f"{diag} no_momentum_snap"
-
-
-def score_setup_quality(candles):
-    sig, _ = evaluate_real_market(candles)
-    if sig is not None:
-        return round(100.0 + sig["setup_score"], 2)
-
-    if len(candles) < MIN_CANDLES:
-        return 0.0
-
-    window = candles[-60:] if len(candles) >= 60 else candles
-    info = check_snap_structure(window)
-    if info is None:
-        return 0.0
-
-    bar = window[-1]
-    e9 = info["ema9"][-1]
-    avg_r = info["avg_range"]
-
-    quality = 0.0
-    if info["bull_snap_trend"] or info["bear_snap_trend"]:
-        quality += 35.0
-    if info["expanding_9_20"]:
-        quality += 15.0
-    if abs(bar["close"] - e9) <= avg_r * 1.3:
-        quality += 15.0
-
-    return round(quality, 2)
-
-
-# =====================================================
-# 4. FORMAT MESAJ TELEGRAM SENP & VERIFIKASYON OTCHARTS 60S
-# =====================================================
-def format_signal_message(pair, payout, entry_time_str, signal_data, entry_quote=None):
-    emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
-    quote_str = format_price(entry_quote) if entry_quote is not None else format_price(signal_data["ref_quote"])
-    return (
-        f"🤖 {VERSION}\n\n"
-        f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
-        f"📊 Win: {signal_data['win_prob']}%\n"
-        f"🎯 Kot: {quote_str}\n"
-        f"🕒 Antre: {entry_time_str} (Exp: 60s)\n"
-        f"🛡️ Konfyans: {signal_data['confidence']}"
-    )
-
-
-def handle_otcharts_60s_result(pair, payout, is_win, entry_quote, exit_quote, send_fn):
-    if is_win:
-        msg = (
-            f"✅ REZILTA (OTCharts 60s): WIN | {pair} (+{payout:.0f}%)\n"
-            f"Kot: {format_price(entry_quote)} -> {format_price(exit_quote)}"
-        )
-        send_fn(msg)
-
-
-def get_eligible_symbols():
-    data = api_get("/v1/symbols", params={"venue": VENUE})
-    eligible = []
-    seen = set()
-
-    for item in data.get("symbols", []):
-        symbol = (item.get("symbol") or "").strip()
-        if not symbol or symbol in seen:
-            continue
-        if not is_clean_pair(symbol):
-            continue
-        if item.get("open") is False:
-            continue
-        try:
-            payout = float(item.get("payout", 0.0))
-        except (TypeError, ValueError):
-            payout = 0.0
-        if payout < MIN_PAYOUT:
-            continue
-        seen.add(symbol)
-        eligible.append({"symbol": symbol, "payout": payout})
-
-    eligible.sort(key=lambda x: (-x["payout"], x["symbol"]))
-    return eligible
-
-
-def get_candles(symbol):
-    data = api_get(
-        "/v1/candles",
-        params={"venue": VENUE, "symbol": symbol, "tf": TIMEFRAME, "limit": CANDLE_LIMIT}
-    )
-    candles = data.get("candles", [])
-    parsed = []
-    for c in candles:
-        try:
-            parsed.append({
-                "time": normalize_ts(c["time"]),
-                "open": float(c["open"]),
-                "high": float(c["high"]),
-                "low": float(c["low"]),
-                "close": float(c["close"])
-            })
-        except (KeyError, TypeError, ValueError):
-            continue
-    parsed.sort(key=lambda x: x["time"])
-    return parsed[-CANDLE_LIMIT:] if len(parsed) >= MIN_CANDLES else []
-
-
-def download_all_histories(eligible):
-    histories, ranked = {}, []
-    log(f"Scanning {len(eligible)} clean OTC pairs (>= {MIN_PAYOUT:.0f}%)...")
-
-    def fetch_and_score(item):
-        candles = get_candles(item["symbol"])
-        setup_score = score_setup_quality(candles) if candles else 0.0
-        enriched = dict(item)
-        enriched["setup_score"] = setup_score
-        return enriched, candles
-
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        futures = {executor.submit(fetch_and_score, item): item for item in eligible}
-        for future in as_completed(futures):
-            item = futures[future]
-            try:
-                enriched, candles = future.result()
-                if candles:
-                    histories[enriched["symbol"]] = candles
-                    ranked.append(enriched)
-            except Exception:
-                pass
-
-    ranked.sort(key=lambda x: (-x["setup_score"], -x["payout"], x["symbol"]))
-    return histories, ranked
-
-
-def finalize_pending_trade(pending, last_prices):
-    sym = pending["symbol"]
-    entry_price = pending["entry_price"]
-    exit_price = pending["last_price"] if pending["last_price"] is not None else last_prices.get(sym)
-
-    if entry_price is not None and exit_price is not None:
-        is_win = (
-            (pending["direction"] == "CALL" and exit_price > entry_price) or
-            (pending["direction"] == "PUT" and exit_price < entry_price)
-        )
-        handle_otcharts_60s_result(
-            sym,
-            pending["payout"],
-            is_win,
-            entry_price,
-            exit_price,
-            send_telegram_fn
-        )
-        log(f"{sym}: OTCharts 60s check -> {'WIN' if is_win else 'LOSS'}. Stopping bot.")
-    else:
-        log(f"{sym}: Missing entry/exit tick. Stopping bot.")
-
-
-def run_live_stream(monitored, histories, current_bars, deadline):
-    symbols = [item["symbol"] for item in monitored]
-    params = {"venue": VENUE, "symbol": ",".join(symbols)}
-
-    log(f"Opening M1 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
-    response = api_get("/v1/stream", params=params, stream=True)
-
-    connected_symbols = set()
-    last_prices = {}
-    signals_sent = 0
-    pending = None
-    event_name = ""
-
-    try:
-        for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
-            now = datetime.now(USER_TZ).timestamp()
-
-            if pending is not None:
-                if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
-                    pending["entry_price"] = pending["last_price"]
-                    log(f"{pending['symbol']}: Entry price at entry time -> {format_price(pending['entry_price'])}")
-
-                if now >= pending["expiry_time"]:
-                    finalize_pending_trade(pending, last_prices)
-                    return "stop"
-
-            if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
-                log("Single signal completed. Stopping bot.")
-                return "stop"
-
-            if pending is None and now >= deadline:
-                log("Scan window ended with no signal.")
-                return "stop"
-
-            if not raw_line:
-                event_name = ""
-                continue
-
-            line = raw_line.decode("utf-8", errors="replace").strip() if isinstance(raw_line, bytes) else raw_line.strip()
-            if not line or line.startswith(":"):
-                continue
-
-            if line.startswith("event:"):
-                event_name = line[6:].strip()
-                continue
-
-            if not line.startswith("data:"):
-                continue
-
-            try:
-                data = json.loads(line[5:].strip())
-            except json.JSONDecodeError:
-                continue
-
-            if event_name == "connected":
-                connected_symbols = set(data.get("symbols", []))
-                log("Connected: " + ", ".join(sorted(connected_symbols)))
-                continue
-
-            if event_name != "tick":
-                continue
-
-            symbol = data.get("symbol")
-            if connected_symbols and symbol not in connected_symbols:
-                continue
-
-            try:
-                price = float(data["price"])
-                feed_time = normalize_ts(data["time"])
-            except (KeyError, TypeError, ValueError):
-                continue
-
-            last_prices[symbol] = price
-            now = datetime.now(USER_TZ).timestamp()
-
-            if pending is not None:
-                if symbol == pending["symbol"]:
-                    pending["last_price"] = price
-                    if pending["entry_price"] is None and now >= pending["entry_time"]:
-                        pending["entry_price"] = price
-                        log(f"{symbol}: Entry price at entry time -> {format_price(price)}")
-
-                if now >= pending["expiry_time"]:
-                    finalize_pending_trade(pending, last_prices)
-                    return "stop"
-                continue
-
-            if signals_sent >= MAX_SIGNALS_PER_RUN:
-                log("Single signal limit reached. Stopping bot.")
-                return "stop"
-
-            bucket = (feed_time // TIMEFRAME) * TIMEFRAME
-
-            if symbol not in current_bars:
-                histories[symbol] = [c for c in histories.get(symbol, []) if c["time"] < bucket]
-                current_bars[symbol] = {
-                    "time": bucket, "open": price, "high": price, "low": price, "close": price
-                }
-                continue
-
-            current = current_bars[symbol]
-
-            seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
-            if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
-                current["evaluated_preclose"] = True
-                hist = histories.get(symbol, [])
-                if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
-                    window = hist[-(MIN_CANDLES - 1):] + [current]
-                    signal_data, diag = evaluate_real_market(window)
-                    if signal_data:
-                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
-                        payout = pair_info["payout"]
-                        entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
-                        entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
-
-                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=price)
-                        if send_telegram_fn(msg):
-                            signals_sent += 1
-                            pending = {
-                                "symbol": symbol,
-                                "payout": payout,
-                                "direction": signal_data["direction"],
-                                "entry_time": entry_ts,
-                                "expiry_time": entry_ts + EXPIRATION,
-                                "entry_price": None,
-                                "last_price": price
-                            }
-                            log(f"{symbol}: Signal sent ({signal_data['direction']}, win={signal_data['win_prob']}%) -> Entry {entry_time_str} (UTC-5).")
-                    else:
-                        log(f"{symbol}: no setup ({diag})")
-
-            if bucket > current["time"]:
-                clean_bar = {
-                    "time": current["time"],
-                    "open": current["open"],
-                    "high": current["high"],
-                    "low": current["low"],
-                    "close": current["close"]
-                }
-                histories.setdefault(symbol, []).append(clean_bar)
-                histories[symbol] = histories[symbol][-CANDLE_LIMIT:]
-
-                current_bars[symbol] = {
-                    "time": bucket, "open": price, "high": price, "low": price, "close": price
-                }
-            else:
-                current["high"] = max(current["high"], price)
-                current["low"] = min(current["low"], price)
-                current["close"] = price
-
-    finally:
-        response.close()
-
-    return "stop" if signals_sent >= MAX_SIGNALS_PER_RUN else "reconnect"
-
-
-def fetch_eligible_with_retry(deadline):
     while True:
-        try:
-            return get_eligible_symbols()
-        except Exception as e:
-            remaining = deadline - datetime.now(USER_TZ).timestamp()
-            if remaining <= 3.0:
-                raise
-            wait_sec = min(4.0, max(1.0, remaining - 1.0))
-            log(f"Symbols fetch failed ({e}). Retrying in {wait_sec:.1f}s...")
-            time.sleep(wait_sec)
+        now = datetime.now(timezone.utc)
+        minute_key = int(now.timestamp()) // 60
+        sec = now.second
 
+        # 1) Evalye nan fenèt :55 a :58 segonn (yon sèl fwa pa minit)
+        if (
+            CONFIG["eval_sec_start"] <= sec <= CONFIG["eval_sec_end"]
+            and minute_key != last_eval_minute_key
+        ):
+            last_eval_minute_key = minute_key
+            pending_signals.clear()
 
-def main():
-    log(f"{VERSION} starting...")
-    if not API_KEY or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Credentials missing!")
-        sys.exit(1)
+            for pair in CONFIG["pairs"]:
+                try:
+                    payout = await client.get_payout(pair)
+                    candles = await client.fetch_candles(pair, count=CONFIG["candle_lookback"])
+                    res = evaluate_signal(candles, payout=payout, cfg=CONFIG)
 
-    deadline = datetime.now(USER_TZ).timestamp() + MAX_WAIT_SECONDS
+                    if res["signal"] in ("CALL", "PUT"):
+                        pending_signals.append({
+                            "pair": pair,
+                            "direction": res["signal"],
+                            "payout": payout,
+                            "reason": res["reason"],
+                        })
+                        logger.info(f"SIGNAL READY [{pair}] -> {res['reason']} (payout={payout:.1f}%)")
+                    else:
+                        logger.info(f"{pair}: no setup ({res['reason']})")
+                except Exception as exc:
+                    logger.error(f"Error evaluating {pair}: {exc}")
 
-    try:
-        eligible = fetch_eligible_with_retry(deadline)
-    except Exception as e:
-        log(f"Unable to load eligible symbols: {e}")
-        sys.exit(0)
+        # 2) Pase lòd egzakteman nan segonn :00 pou 60s
+        if (
+            sec == CONFIG["entry_sec"]
+            and pending_signals
+            and minute_key != last_entry_minute_key
+        ):
+            last_entry_minute_key = minute_key
+            signals_to_fire = list(pending_signals)
+            pending_signals.clear()
 
-    if not eligible:
-        log(f"No clean pairs >= {MIN_PAYOUT:.0f}% open right now.")
-        sys.exit(0)
+            for sig in signals_to_fire:
+                # Re-verifye payout anvan antre
+                payout = await client.get_payout(sig["pair"])
+                if payout < CONFIG["min_payout"]:
+                    logger.info(f"Skipped {sig['pair']}: payout dropped to {payout:.1f}%")
+                    continue
 
-    histories, ranked = download_all_histories(eligible)
-    if not ranked:
-        log("No candle history available.")
-        sys.exit(0)
+                # Pa gen Martingale: toujou itilize base_amount
+                current_stake = float(CONFIG["base_amount"])
+                await client.place_order(
+                    pair=sig["pair"],
+                    direction=sig["direction"],
+                    amount=current_stake,
+                    expiry_sec=CONFIG["expiry_sec"],
+                )
 
-    active_limit = min(MAX_STREAM_PAIRS, len(ranked))
-    top_pairs = ranked[:active_limit]
-    log("Top selected pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
-
-    current_bars = {}
-
-    reconnects = 0
-    while datetime.now(USER_TZ).timestamp() < deadline:
-        stream_subset = ranked[:active_limit]
-        try:
-            status = run_live_stream(stream_subset, histories, current_bars, deadline)
-            if status in ("done", "stop"):
-                log(f"{VERSION} finished.")
-                sys.stdout.flush()
-                os._exit(0)
-            reconnects += 1
-            if reconnects > MAX_RECONNECTS:
-                break
-            rem = deadline - datetime.now(USER_TZ).timestamp()
-            wait_sec = min(7.0, max(2.0, rem))
-            log(f"Reconnecting in {wait_sec:.1f}s...")
-            time.sleep(wait_sec)
-        except StreamBadRequestError as e:
-            log(f"Stream error: {e}")
-            if active_limit > 1:
-                active_limit -= 1
-                log(f"Reducing stream batch to {active_limit} pairs and retrying...")
-                time.sleep(1.5)
-                continue
-            break
-        except StreamRateLimitError as e:
-            reconnects += 1
-            if reconnects > MAX_RECONNECTS:
-                break
-            rem = deadline - datetime.now(USER_TZ).timestamp()
-            wait_sec = min(e.retry_after, max(0.0, rem))
-            if wait_sec <= 2:
-                break
-            log(f"Rate limit. Waiting {wait_sec:.1f}s...")
-            time.sleep(wait_sec)
-        except Exception as e:
-            log(f"Stream error: {e}")
-            reconnects += 1
-            if reconnects > MAX_RECONNECTS:
-                break
-            rem = deadline - datetime.now(USER_TZ).timestamp()
-            wait_sec = min(7.0, max(2.0, rem))
-            if wait_sec <= 1:
-                break
-            time.sleep(wait_sec)
-
-    log(f"{VERSION} finished.")
-    sys.stdout.flush()
-    os._exit(0)
+        await asyncio.sleep(CONFIG["poll_interval"])
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(run_bot())
+    except KeyboardInterrupt:
+        logger.info("ROMARIO PRO stopped by user.")
