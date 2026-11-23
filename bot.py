@@ -75,7 +75,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/2.3",
+            "User-Agent": "RomarioProM1/2.4",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -88,6 +88,20 @@ def format_price(value):
 def is_clean_pair(symbol):
     up = symbol.upper()
     return not any(code in up for code in TOXIC_CURRENCIES)
+
+
+def compute_real_entry_timestamp(seconds_left_in_bar):
+    """
+    Kalkile lè egzak antre a apati revèy lokal sistèm nan (time.time())
+    plis segonn ki rete anvan nouvo bouji 60s lan ouvè.
+    """
+    rem = max(1, min(TIMEFRAME, int(round(seconds_left_in_bar))))
+    now_local = time.time()
+    # Awondi sou pwochen minit plen dapre lè lokal aktyèl la
+    next_minute_local = ((int(now_local) // TIMEFRAME) + 1) * TIMEFRAME
+    if abs(next_minute_local - (now_local + rem)) <= 3:
+        return next_minute_local
+    return int(round(now_local + rem))
 
 
 def api_get(path, params=None, stream=False):
@@ -617,11 +631,11 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             if pending is not None:
                 if symbol == pending["symbol"]:
                     pending["last_price"] = price
-                    if pending["entry_price"] is None and feed_time >= pending["entry_time"]:
+                    if pending["entry_price"] is None and now >= pending["entry_time"]:
                         pending["entry_price"] = price
                         log(f"{symbol}: Entry price at entry time -> {format_price(price)}")
 
-                if feed_time >= pending["expiry_time"] or now >= pending["expiry_time"]:
+                if now >= pending["expiry_time"]:
                     finalize_pending_trade(pending, last_prices)
                     return "stop"
                 continue
@@ -651,7 +665,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     if signal_data:
                         pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
                         payout = pair_info["payout"]
-                        entry_ts = current["time"] + TIMEFRAME
+                        entry_ts = compute_real_entry_timestamp(seconds_left_in_bar)
                         entry_time_str = datetime.fromtimestamp(entry_ts, tz=LOCAL_TZ).strftime("%I:%M:%S %p")
 
                         msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=price)
