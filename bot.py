@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (6 INDICATORS M1, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (INSTANT SIGNAL -> NEXT M1 CANDLE, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -20,7 +20,6 @@ VENUE = "otc"
 TIMEFRAME = 60            # Graf 1 minit (M1)
 EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
 MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
-ENTRY_LEAD = 10           # Avèti w 10 segonn anvan nouvo bouji a ouvè
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
@@ -80,7 +79,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/3.0",
+            "User-Agent": "RomarioProM1/3.3",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -95,16 +94,14 @@ def is_clean_pair(symbol):
     return not any(code in up for code in TOXIC_CURRENCIES)
 
 
-def compute_utc5_entry_timestamp(seconds_left_in_bar):
+def compute_next_candle_utc5(ref_ts=None):
     """
-    Kalkile timestamp pwochen ouvèti bouji 60s la apati lè UTC-5 aktyèl la.
+    Kalkile pwochen ouvèti bouji M1 (Next Candle) an UTC-5 apati lè aktyèl la.
     """
-    rem = max(1, min(TIMEFRAME, int(round(seconds_left_in_bar))))
-    now_utc5_epoch = datetime.now(USER_TZ).timestamp()
-    next_minute_utc5 = ((int(now_utc5_epoch) // TIMEFRAME) + 1) * TIMEFRAME
-    if abs(next_minute_utc5 - (now_utc5_epoch + rem)) <= 3:
-        return next_minute_utc5
-    return int(round(now_utc5_epoch + rem))
+    now_utc5 = ref_ts if ref_ts is not None else datetime.now(USER_TZ).timestamp()
+    next_candle_ts = ((int(now_utc5) // TIMEFRAME) + 1) * TIMEFRAME
+    countdown = max(1, int(round(next_candle_ts - now_utc5)))
+    return next_candle_ts, countdown
 
 
 def api_get(path, params=None, stream=False):
@@ -437,14 +434,22 @@ def evaluate_six_indicators(candles):
     # 1. EMA 9 / 21 (2 pwen)
     if ema9[-1] > ema21[-1]:
         score_call += 2
+        ema_state = "Haussier"
     elif ema9[-1] < ema21[-1]:
         score_put += 2
+        ema_state = "Baissier"
+    else:
+        ema_state = "Neutre"
 
     # 2. MACD (12, 26, 9) (2 pwen)
     if macd_line[-1] > signal_line[-1] and hist_line[-1] >= 0:
         score_call += 2
+        macd_state = "Haussier"
     elif macd_line[-1] < signal_line[-1] and hist_line[-1] <= 0:
         score_put += 2
+        macd_state = "Baissier"
+    else:
+        macd_state = "Neutre"
 
     # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
@@ -454,6 +459,15 @@ def evaluate_six_indicators(candles):
         score_put += 2
 
     # 4. Bollinger Bands (20, 2) (2 pwen)
+    if price >= bb_upper[-1] * 0.9995:
+        bb_state = "Proche bande haute"
+    elif price <= bb_lower[-1] * 1.0005:
+        bb_state = "Proche bande basse"
+    elif price >= bb_mid[-1]:
+        bb_state = "Milieu haut"
+    else:
+        bb_state = "Milieu bas"
+
     if price >= bb_mid[-1] and price < bb_upper[-1]:
         score_call += 2
     elif price <= bb_mid[-1] and price > bb_lower[-1]:
@@ -490,6 +504,12 @@ def evaluate_six_indicators(candles):
     call_conf = (score_call / total_votes) * 100.0
     put_conf = (score_put / total_votes) * 100.0
 
+    summary_lines = (
+        f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
+        f"• Bollinger: {bb_state} | EMA 9/21: {ema_state}\n"
+        f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f}"
+    )
+
     if call_conf >= MIN_CONFIDENCE and call_conf >= put_conf:
         win_prob = int(round(max(50.0, min(95.0, call_conf))))
         confidence_label = "🟢 TRÈ SOLID" if win_prob >= 80 else "🟡 MODERE"
@@ -500,6 +520,7 @@ def evaluate_six_indicators(candles):
             "win_prob": win_prob,
             "adx": adx_val,
             "confidence": confidence_label,
+            "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
@@ -514,11 +535,29 @@ def evaluate_six_indicators(candles):
             "win_prob": win_prob,
             "adx": adx_val,
             "confidence": confidence_label,
+            "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
         }, f"{diag} PUT_SIGNAL conf={win_prob}%"
 
     return None, f"{diag} conf_below_{MIN_CONFIDENCE:.0f}%"
+
+
+def build_live_window(symbol, histories, current_bar):
+    """
+    Konbine bouji ki deja fèmen yo (Historical Candles) ak bouji k ap fòme an dirèk la (Live Forming Candle).
+    """
+    hist = histories.get(symbol, [])
+    if len(hist) < 1 or current_bar is None:
+        return []
+    live_bar = {
+        "time": current_bar["time"],
+        "open": current_bar["open"],
+        "high": current_bar["high"],
+        "low": current_bar["low"],
+        "close": current_bar["close"]
+    }
+    return hist[-(CANDLE_LIMIT - 1):] + [live_bar]
 
 
 def score_setup_quality(candles):
@@ -548,15 +587,16 @@ def score_setup_quality(candles):
 # =====================================================
 # 4. FORMAT MESAJ TELEGRAM SENP & VERIFIKASYON OTCHARTS 60S
 # =====================================================
-def format_signal_message(pair, payout, entry_time_str, signal_data, entry_quote=None):
+def format_signal_message(pair, payout, entry_time_str, countdown_sec, signal_data, entry_quote=None):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
     quote_str = format_price(entry_quote) if entry_quote is not None else format_price(signal_data["ref_quote"])
     return (
         f"🤖 {VERSION}\n\n"
         f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
-        f"📊 Win: {signal_data['win_prob']}% (ADX {signal_data['adx']:.1f})\n"
+        f"📊 Confiance: {signal_data['win_prob']}% | SCORE CALL: {signal_data['score_call']} vs SCORE PUT: {signal_data['score_put']}\n"
         f"🎯 Kot: {quote_str}\n"
-        f"🕒 Antre: {entry_time_str} (Exp: 60s)\n"
+        f"🕒 Next Candle: {entry_time_str} ({countdown_sec}s | Expiration 1min)\n"
+        f"{signal_data['indicators_summary']}\n"
         f"🛡️ Konfyans: {signal_data['confidence']}"
     )
 
@@ -677,28 +717,29 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
     connected_symbols = set()
     last_prices = {}
+    last_eval_ts = {}
     signals_sent = 0
-    pending = None
+    active_trade = None
     event_name = ""
 
     try:
         for raw_line in response.iter_lines(decode_unicode=True, chunk_size=1):
             now = datetime.now(USER_TZ).timestamp()
 
-            if pending is not None:
-                if pending["entry_price"] is None and now >= pending["entry_time"] and pending["last_price"] is not None:
-                    pending["entry_price"] = pending["last_price"]
-                    log(f"{pending['symbol']}: Entry price at entry time -> {format_price(pending['entry_price'])}")
+            if active_trade is not None:
+                if active_trade["entry_price"] is None and now >= active_trade["entry_time"] and active_trade["last_price"] is not None:
+                    active_trade["entry_price"] = active_trade["last_price"]
+                    log(f"{active_trade['symbol']}: Entry price at entry time -> {format_price(active_trade['entry_price'])}")
 
-                if now >= pending["expiry_time"]:
-                    finalize_pending_trade(pending, last_prices)
+                if now >= active_trade["expiry_time"]:
+                    finalize_pending_trade(active_trade, last_prices)
                     return "stop"
 
-            if signals_sent >= MAX_SIGNALS_PER_RUN and pending is None:
+            if signals_sent >= MAX_SIGNALS_PER_RUN and active_trade is None:
                 log("Single signal completed. Stopping bot.")
                 return "stop"
 
-            if pending is None and now >= deadline:
+            if active_trade is None and now >= deadline:
                 log("Scan window ended with no signal.")
                 return "stop"
 
@@ -743,15 +784,15 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             last_prices[symbol] = price
             now = datetime.now(USER_TZ).timestamp()
 
-            if pending is not None:
-                if symbol == pending["symbol"]:
-                    pending["last_price"] = price
-                    if pending["entry_price"] is None and now >= pending["entry_time"]:
-                        pending["entry_price"] = price
+            if active_trade is not None:
+                if symbol == active_trade["symbol"]:
+                    active_trade["last_price"] = price
+                    if active_trade["entry_price"] is None and now >= active_trade["entry_time"]:
+                        active_trade["entry_price"] = price
                         log(f"{symbol}: Entry price at entry time -> {format_price(price)}")
 
-                if now >= pending["expiry_time"]:
-                    finalize_pending_trade(pending, last_prices)
+                if now >= active_trade["expiry_time"]:
+                    finalize_pending_trade(active_trade, last_prices)
                     return "stop"
                 continue
 
@@ -770,35 +811,6 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             current = current_bars[symbol]
 
-            seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
-            if 0 < seconds_left_in_bar <= ENTRY_LEAD and not current.get("evaluated_preclose"):
-                current["evaluated_preclose"] = True
-                hist = histories.get(symbol, [])
-                if len(hist) >= 1 and len(hist) + 1 >= MIN_CANDLES:
-                    window = hist[-(MIN_CANDLES - 1):] + [current]
-                    signal_data, diag = evaluate_six_indicators(window)
-                    if signal_data:
-                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
-                        payout = pair_info["payout"]
-                        entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
-                        entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
-
-                        msg = format_signal_message(symbol, payout, entry_time_str, signal_data, entry_quote=price)
-                        if send_telegram_fn(msg):
-                            signals_sent += 1
-                            pending = {
-                                "symbol": symbol,
-                                "payout": payout,
-                                "direction": signal_data["direction"],
-                                "entry_time": entry_ts,
-                                "expiry_time": entry_ts + EXPIRATION,
-                                "entry_price": None,
-                                "last_price": price
-                            }
-                            log(f"{symbol}: Signal sent ({signal_data['direction']}, win={signal_data['win_prob']}%) -> Entry {entry_time_str} (UTC-5).")
-                    else:
-                        log(f"{symbol}: no setup ({diag})")
-
             if bucket > current["time"]:
                 clean_bar = {
                     "time": current["time"],
@@ -813,10 +825,49 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 current_bars[symbol] = {
                     "time": bucket, "open": price, "high": price, "low": price, "close": price
                 }
+                current = current_bars[symbol]
             else:
                 current["high"] = max(current["high"], price)
                 current["low"] = min(current["low"], price)
                 current["close"] = price
+
+            # Voye nenpòt lè siyal la valid (`>= 75%` konfyans + `ADX > 20`), pou antre sou pwochen bouji a (Next Candle)
+            if now - last_eval_ts.get(symbol, 0.0) >= 2.0:
+                last_eval_ts[symbol] = now
+                window = build_live_window(symbol, histories, current)
+                if len(window) >= MIN_CANDLES:
+                    signal_data, diag = evaluate_six_indicators(window)
+                    if signal_data:
+                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
+                        payout = pair_info["payout"]
+                        next_candle_ts, countdown_sec = compute_next_candle_utc5(now)
+                        entry_time_str = datetime.fromtimestamp(next_candle_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
+
+                        msg = format_signal_message(
+                            symbol,
+                            payout,
+                            entry_time_str,
+                            countdown_sec,
+                            signal_data,
+                            entry_quote=price
+                        )
+                        if send_telegram_fn(msg):
+                            signals_sent += 1
+                            active_trade = {
+                                "symbol": symbol,
+                                "payout": payout,
+                                "direction": signal_data["direction"],
+                                "entry_time": next_candle_ts,
+                                "expiry_time": next_candle_ts + EXPIRATION,
+                                "entry_price": None,
+                                "last_price": price
+                            }
+                            log(
+                                f"{symbol}: Signal sent ({signal_data['direction']}, win={signal_data['win_prob']}%) "
+                                f"-> Next Candle {entry_time_str} ({countdown_sec}s, UTC-5)."
+                            )
+                    else:
+                        log(f"{symbol}: no setup ({diag})")
 
     finally:
         response.close()
