@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (POCKETBIP LOGIC, MULTI-PAIR OTC, M1 60s, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (MIN 92% PAYOUT, NO MODERE, M1 60s, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -19,19 +19,19 @@ BASE_URL = "https://otcharts.com"
 VENUE = "otc"
 TIMEFRAME = 60            # Graf 1 minit (M1)
 EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
-MIN_PAYOUT = 85.0         # Minimòm 85% payout sou OTC
+MIN_PAYOUT = 92.0         # Sèlman mache ki gen 92%+ payout sou OTC
 MAX_SIGNALS_PER_RUN = 1   # 1 sèl siyal pa kouri
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
-MAX_STREAM_PAIRS = 5      # Siveye top 5 pè ki gen pi bon setup sou /v1/stream
+MAX_STREAM_PAIRS = 5      # Siveye top 5 pè >= 92% ki gen pi bon setup sou /v1/stream
 
-MIN_CONFIDENCE = 75.0     # Konfyans minimòm (tankou 75% lè tandans lan modere)
-MIN_ADX = 17.5            # Pèmèt tandans k ap kòmanse (menm alantou ~18) san fòse 94%
+MIN_CONFIDENCE = 85.0     # Pa gen MODERE — sèlman siyal solid (>= 85%)
+MIN_ADX = 24.0            # Tandans solid sèlman sou M1 OTC
 
 CANDLE_LIMIT = 100
 MIN_CANDLES = 55
 MAX_RECONNECTS = 5
 
-# Evite pè ki gen spik toksik / twou brital sou 60s, men kenbe anpil pè pwòp
+# Evite pè ki gen spik toksik / twou brital / ticks etwat sou 60s
 TOXIC_CURRENCIES = (
     "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB",
     "HUF", "SEK", "NOK", "MYR", "SYP", "NGN"
@@ -82,7 +82,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/4.7",
+            "User-Agent": "RomarioProM1/4.8",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -402,7 +402,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO (LOJIK POCKETBIP + PWOTEKSYON KONTRADIKSYON)
+# 3. EVALYASYON 6 ENDIKATÈ YO (PA GEN MODERE, CONFIANCE >= 85%, ADX >= 24)
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -456,35 +456,35 @@ def evaluate_six_indicators(candles):
 
     # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
-    if 49.0 <= rsi_val <= 67.0:
+    if 51.0 <= rsi_val <= 65.0:
         score_call += 2
-    elif 33.0 <= rsi_val <= 51.0:
+    elif 35.0 <= rsi_val <= 49.0:
         score_put += 2
 
     # 4. Bollinger Bands (20, 2) (2 pwen)
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if bb_pos >= 0.78:
+    if bb_pos >= 0.75:
         bb_state = "proche bande haute"
-    elif bb_pos <= 0.22:
+    elif bb_pos <= 0.25:
         bb_state = "proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "milieu haut"
     else:
         bb_state = "milieu bas"
 
-    if bb_pos <= 0.78:
+    if price > bb_mid[-1] and bb_pos <= 0.74:
         score_call += 2
-    if bb_pos >= 0.22:
+    elif price < bb_mid[-1] and bb_pos >= 0.26:
         score_put += 2
 
     # 5. Stochastique (14, 3, 3) (2 pwen)
     sk = stoch_k[-1]
     sd = stoch_d[-1]
-    if sk > sd and sk <= 80.0:
+    if sk > sd and 28.0 <= sk <= 72.0:
         score_call += 2
-    elif sk < sd and sk >= 20.0:
+    elif sk < sd and 28.0 <= sk <= 72.0:
         score_put += 2
 
     # 6. ADX (14) (3 pwen)
@@ -504,14 +504,9 @@ def evaluate_six_indicators(candles):
     if adx_val < MIN_ADX:
         return None, f"{diag} adx_below_{MIN_ADX:.1f}"
 
-    # Kalkil konfyans dinamik ki sanble ak PocketBip (pa kole sou 94%/95%)
-    dominant_score = max(score_call, score_put)
-    spread = abs(score_call - score_put)
-    adx_bonus = min(6.0, max(0.0, (adx_val - MIN_ADX) * 0.35))
-    score_bonus = min(5.0, max(0.0, (spread - 4) * 0.5))
-
-    raw_conf = 74.0 + adx_bonus + score_bonus
-    win_prob = int(round(max(75.0, min(88.0, raw_conf))))
+    adx_bonus = min(3.0, max(0.0, (adx_val - MIN_ADX) * 0.25))
+    score_bonus = min(1.0, max(0.0, (abs(score_call - score_put) - 8) * 0.25))
+    win_prob = int(round(max(85.0, min(89.0, 85.0 + adx_bonus + score_bonus))))
 
     summary_lines = (
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
@@ -519,39 +514,37 @@ def evaluate_six_indicators(candles):
         f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f} ({adx_dir})"
     )
 
-    if score_call >= 10 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
-        if macd_state == "baissier" or rsi_val > 68.0 or sk > 80.0 or bb_pos > 0.80:
+    if score_call >= 12 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
+        if macd_state != "haussier" or rsi_val > 65.0 or sk > 72.0 or bb_pos > 0.74:
             return None, f"{diag} call_filtered"
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
         return {
             "direction": "CALL",
             "score_call": score_call,
             "score_put": score_put,
             "win_prob": win_prob,
             "adx": adx_val,
-            "confidence": confidence_label,
+            "confidence": "🟢 TRÈ SOLID",
             "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
-    if score_put >= 10 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
-        if macd_state == "haussier" or rsi_val < 32.0 or sk < 20.0 or bb_pos < 0.20:
+    if score_put >= 12 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
+        if macd_state != "baissier" or rsi_val < 35.0 or sk < 28.0 or bb_pos < 0.26:
             return None, f"{diag} put_filtered"
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
         return {
             "direction": "PUT",
             "score_call": score_call,
             "score_put": score_put,
             "win_prob": win_prob,
             "adx": adx_val,
-            "confidence": confidence_label,
+            "confidence": "🟢 TRÈ SOLID",
             "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
         }, f"{diag} PUT_SIGNAL conf={win_prob}%"
 
-    return None, f"{diag} no_strong_score"
+    return None, f"{diag} no_strong_solid_setup"
 
 
 def build_live_window(symbol, histories, current_bar):
