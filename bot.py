@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (ANTI-REVERSAL M1, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (6 INDICATORS M1 -> NEXT CANDLE, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -24,8 +24,8 @@ MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
 
-MIN_CONFIDENCE = 80.0     # Minimòm 80% konfyans (omwen 5/6 endikatè dakò)
-MIN_ADX = 22.0            # Filtè fòs tandans: ADX > 22
+MIN_CONFIDENCE = 75.0     # Minimòm 75% konfyans (score / total * 100)
+MIN_ADX = 18.0            # Minimòm fòs tandans (pa twò rèd pou l pa kole)
 
 CANDLE_LIMIT = 100
 MIN_CANDLES = 55
@@ -79,7 +79,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/3.5",
+            "User-Agent": "RomarioProM1/3.6",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -399,7 +399,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + PWOTEKSYON ANTI-RETOUNEN (ANTI-REVERSAL)
+# 3. EVALYASYON 6 ENDIKATÈ YO + SISTÈM PWEN (SCORE CALL / PUT)
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -431,44 +431,34 @@ def evaluate_six_indicators(candles):
     score_call = 0
     score_put = 0
 
-    # 1. EMA 9 / 21 (2 pwen) + tcheke si EMA 9 ap monte/desann vre
-    ema_rising = ema9[-2] is not None and ema9[-1] > ema9[-2]
-    ema_falling = ema9[-2] is not None and ema9[-1] < ema9[-2]
-
-    if ema9[-1] > ema21[-1] and ema_rising:
+    # 1. EMA 9 / 21 (2 pwen)
+    if ema9[-1] > ema21[-1]:
         score_call += 2
         ema_state = "Haussier"
-    elif ema9[-1] < ema21[-1] and ema_falling:
+    elif ema9[-1] < ema21[-1]:
         score_put += 2
         ema_state = "Baissier"
     else:
         ema_state = "Neutre"
 
-    # 2. MACD (12, 26, 9) (2 pwen) + momentum histogram ap grandi
-    hist_growing = hist_line[-2] is not None and hist_line[-1] > hist_line[-2]
-    hist_shrinking = hist_line[-2] is not None and hist_line[-1] < hist_line[-2]
-
-    if macd_line[-1] > signal_line[-1] and hist_line[-1] > 0 and hist_growing:
+    # 2. MACD (12, 26, 9) (2 pwen)
+    if macd_line[-1] > signal_line[-1] and hist_line[-1] >= 0:
         score_call += 2
         macd_state = "Haussier"
-    elif macd_line[-1] < signal_line[-1] and hist_line[-1] < 0 and hist_shrinking:
+    elif macd_line[-1] < signal_line[-1] and hist_line[-1] <= 0:
         score_put += 2
         macd_state = "Baissier"
     else:
         macd_state = "Neutre"
 
-    # 3. RSI (14) (2 pwen) — evite zòn fatige (52..68 pou CALL, 32..48 pou PUT)
+    # 3. RSI (14) (2 pwen) — evite zòn ki deja twò cho (>75 pou CALL, <25 pou PUT)
     rsi_val = rsi14[-1]
-    if 52.0 <= rsi_val <= 68.0:
+    if 50.0 < rsi_val <= 75.0:
         score_call += 2
-    elif 32.0 <= rsi_val <= 48.0:
+    elif 25.0 <= rsi_val < 50.0:
         score_put += 2
 
-    # 4. Bollinger Bands (20, 2) (2 pwen) — dwe gen omwen 25% espas anvan liy ekstrèm lan
-    bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
-    dist_to_upper = (bb_upper[-1] - price) / bb_span
-    dist_to_lower = (price - bb_lower[-1]) / bb_span
-
+    # 4. Bollinger Bands (20, 2) (2 pwen)
     if price >= bb_upper[-1] * 0.9995:
         bb_state = "Proche bande haute"
     elif price <= bb_lower[-1] * 1.0005:
@@ -478,26 +468,25 @@ def evaluate_six_indicators(candles):
     else:
         bb_state = "Milieu bas"
 
-    if price > bb_mid[-1] and dist_to_upper >= 0.20:
+    if price >= bb_mid[-1] and price < bb_upper[-1]:
         score_call += 2
-    elif price < bb_mid[-1] and dist_to_lower >= 0.20:
+    elif price <= bb_mid[-1] and price > bb_lower[-1]:
         score_put += 2
 
-    # 5. Stochastique (14, 3, 3) (2 pwen) — pa antre nan zòn surachat (>80) / survente (<20)
+    # 5. Stochastique (14, 3, 3) (2 pwen)
     sk = stoch_k[-1]
     sd = stoch_d[-1]
-    if sk > sd and 25.0 <= sk <= 78.0:
+    if sk > sd and sk <= 85.0:
         score_call += 2
-    elif sk < sd and 22.0 <= sk <= 75.0:
+    elif sk < sd and sk >= 15.0:
         score_put += 2
 
-    # 6. ADX (14) - fòs tandans lan (2 pwen si ADX > MIN_ADX epi l ap monte)
+    # 6. ADX (14) - fòs tandans lan (2 pwen si ADX > MIN_ADX)
     adx_val = adx14[-1]
-    adx_rising = adx14[-2] is None or adx_val >= adx14[-2]
-    if adx_val > MIN_ADX and adx_rising:
-        if ema9[-1] > ema21[-1]:
+    if adx_val > MIN_ADX:
+        if ema9[-1] >= ema21[-1]:
             score_call += 2
-        elif ema9[-1] < ema21[-1]:
+        else:
             score_put += 2
 
     total_votes = score_call + score_put
@@ -512,13 +501,6 @@ def evaluate_six_indicators(candles):
     if total_votes <= 0:
         return None, f"{diag} no_votes"
 
-    # Pwoteksyon bouji aktyèl la (Live Candle Alignment) pou l pa vire kont ou
-    body = abs(bar["close"] - bar["open"])
-    upper_wick = bar["high"] - max(bar["open"], bar["close"])
-    lower_wick = min(bar["open"], bar["close"]) - bar["low"]
-    is_green_clean = (bar["close"] > bar["open"]) and (body > 0) and (upper_wick <= body * 0.65)
-    is_red_clean = (bar["close"] < bar["open"]) and (body > 0) and (lower_wick <= body * 0.65)
-
     call_conf = (score_call / total_votes) * 100.0
     put_conf = (score_put / total_votes) * 100.0
 
@@ -529,10 +511,8 @@ def evaluate_six_indicators(candles):
     )
 
     if score_call > score_put and call_conf >= MIN_CONFIDENCE:
-        if not is_green_clean:
-            return None, f"{diag} call_blocked_candle_rejection"
         win_prob = int(round(max(50.0, min(95.0, call_conf))))
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 85 else "🟡 MODERE"
+        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 80 else "🟡 MODERE"
         return {
             "direction": "CALL",
             "score_call": score_call,
@@ -546,10 +526,8 @@ def evaluate_six_indicators(candles):
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
     if score_put > score_call and put_conf >= MIN_CONFIDENCE:
-        if not is_red_clean:
-            return None, f"{diag} put_blocked_candle_rejection"
         win_prob = int(round(max(50.0, min(95.0, put_conf))))
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 85 else "🟡 MODERE"
+        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 80 else "🟡 MODERE"
         return {
             "direction": "PUT",
             "score_call": score_call,
