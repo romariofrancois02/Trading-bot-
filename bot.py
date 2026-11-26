@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (SCAN A,B,C,D -> PRE-ALERT ON LOCKED PAIR A -> 2-3s SIGNAL, >=92%, M1, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (SCAN A,B,C,D -> PRE-ALERT ON LOCKED PAIR A -> 2-3s SIGNAL / CANCEL ALERT, >=92%, M1, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.2",
+            "User-Agent": "RomarioProM1/5.3",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -215,6 +215,17 @@ def send_pre_signal_pair_alert(symbol, payout, entry_time_str, sec_left, now_ts)
         f"⚡ Pè ki pral bay siyal la: {symbol} (OTCharts {payout:.0f}%)\n"
         f"🕒 Lè avètisman: {sent_str} (UTC-5)\n"
         f"⏳ Siyal final ap vini nan dènye 2-3s bouji a (~{entry_time_str} | {sec_left}s)"
+    )
+    send_telegram_fn(msg)
+
+
+def send_cancelled_pair_alert(symbol, direction, reason, now_ts):
+    sent_str = datetime.fromtimestamp(now_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
+    msg = (
+        f"🤖 {VERSION} — SIYAL ANILE\n\n"
+        f"❌ {symbol} ({direction}) anile nan dènye 2-3s\n"
+        f"🕒 Lè: {sent_str} (UTC-5)\n"
+        f"ℹ️ Rezon: {reason} — ap chèche lòt pè..."
     )
     send_telegram_fn(msg)
 
@@ -738,7 +749,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
     connected_symbols = set()
     last_prices = {}
     signals_sent = 0
-    locked_order = None      # Lè yon pè (ex: A) kòmanse pare pou siyal, li bloke pou avèti w sou li
+    locked_order = None
     staged_setups = {}
     active_trade = None
     event_name = ""
@@ -835,6 +846,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             if bucket > current["time"]:
                 if locked_order is not None and locked_order["symbol"] == symbol and locked_order["bar_time"] == current["time"]:
                     log(f"{symbol}: Locked setup expired at bar close without final confirmation. Releasing lock.")
+                    send_cancelled_pair_alert(symbol, locked_order["direction"], "bouji fèmen san konfimasyon", now)
                     locked_order = None
 
                 clean_bar = {
@@ -858,7 +870,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
 
-            # ETAP 1: Siveye 4 pè yo. Lè yon pè (ex: A) fè setup anvan dènye 3s yo, bloke sou li epi avèti w sou Telegram!
+            # ETAP 1: Siveye 4 pè yo. Lè yon pè fè setup anvan dènye 3s yo, bloke sou li epi avèti w sou Telegram!
             if locked_order is None and seconds_left_in_bar > CONFIRM_WINDOW_MAX:
                 last_eval_ts = staged_setups.get(symbol, 0)
                 if now - last_eval_ts >= 3.0:
@@ -888,11 +900,10 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 f"-> waiting 2-3s pre-close | {diag}"
                             )
 
-            # Si yon pè bloke (ex: A), nou sèlman tcheke siyal final li nan dènye 2-3 segonn yo
             if locked_order is not None and symbol != locked_order["symbol"]:
                 continue
 
-            # ETAP 2: Nan dènye 2-3 segonn anvan bouji a fèmen, voye siyal final la sou pè ki te avèti w la
+            # ETAP 2: Nan dènye 2-3 segonn anvan bouji a fèmen, voye siyal final la oswa avèti w si l anile
             if CONFIRM_WINDOW_MIN <= seconds_left_in_bar <= CONFIRM_WINDOW_MAX and not current.get("final_verified"):
                 current["final_verified"] = True
                 window = build_live_window(symbol, histories, current)
@@ -935,7 +946,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                             )
                     else:
                         if locked_order is not None and locked_order["symbol"] == symbol:
-                            log(f"{symbol}: Locked setup cancelled at 2-3s check ({diag}). Releasing lock.")
+                            log(f"{symbol}: Cancelled at 2-3s check ({diag}). Releasing lock.")
+                            send_cancelled_pair_alert(symbol, locked_order["direction"], "endikatè yo chanje nan dènye 2-3s", now)
                             locked_order = None
 
     finally:
