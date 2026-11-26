@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (2-3s PRE-CLOSE, PAIR PREVIEW, >=92% PAYOUT, M1, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (SCAN A,B,C,D -> PRE-ALERT ON LOCKED PAIR A -> 2-3s SIGNAL, >=92%, M1, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -24,7 +24,7 @@ CONFIRM_WINDOW_MAX = 3    # Dènye verifikasyon nan dènye 2-3 segonn anvan fèm
 CONFIRM_WINDOW_MIN = 2    # Omwen 2s anvan fèmti bouji a
 MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
-MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
+MAX_STREAM_PAIRS = 4      # Siveye 4 pè (A, B, C, D) sou /v1/stream
 
 MIN_CONFIDENCE = 82.0     # Minimòm 82% konfyans kalkile
 MIN_ADX = 22.0            # Filtè fòs tandans sou M1 OTC
@@ -36,7 +36,7 @@ MAX_RECONNECTS = 5
 # Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
 TOXIC_CURRENCIES = (
     "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB",
-    "HUF", "SEK", "NOK", "MYR", "SYP", "NGN"
+    "HUF", "SEK", "NOK", "MYR", "SYP", "NGN", "IDR", "OMR"
 )
 
 API_CONNECT_TIMEOUT = 4
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/4.9",
+            "User-Agent": "RomarioProM1/5.2",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -208,14 +208,13 @@ def send_telegram_fn(message):
     return False
 
 
-def send_monitored_pairs_preview(top_pairs):
-    now_str = datetime.now(USER_TZ).strftime("%I:%M:%S %p")
-    pair_list = "\n".join(f"• {x['symbol']} ({x['payout']:.0f}%)" for x in top_pairs)
+def send_pre_signal_pair_alert(symbol, payout, entry_time_str, sec_left, now_ts):
+    sent_str = datetime.fromtimestamp(now_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
     msg = (
-        f"🤖 {VERSION} — ANALIZ KÒMANSE\n"
-        f"🕒 Lè: {now_str} (UTC-5)\n"
-        f"🔎 Pè bot la ap analyze kounye a:\n"
-        f"{pair_list}"
+        f"🤖 {VERSION} — PREPARE SOU PÈ SA A\n\n"
+        f"⚡ Pè ki pral bay siyal la: {symbol} (OTCharts {payout:.0f}%)\n"
+        f"🕒 Lè avètisman: {sent_str} (UTC-5)\n"
+        f"⏳ Siyal final ap vini nan dènye 2-3s bouji a (~{entry_time_str} | {sec_left}s)"
     )
     send_telegram_fn(msg)
 
@@ -730,15 +729,16 @@ def finalize_pending_trade(pending, last_prices):
 
 def run_live_stream(monitored, histories, current_bars, deadline):
     symbols = [item["symbol"] for item in monitored]
+    payout_map = {item["symbol"]: item["payout"] for item in monitored}
     params = {"venue": VENUE, "symbol": ",".join(symbols)}
 
-    log(f"Opening M1 stream for top {len(symbols)} pairs: {', '.join(symbols)}")
+    log(f"Scanning 4 pairs ({', '.join(symbols)}) silently until one pair triggers...")
     response = api_get("/v1/stream", params=params, stream=True)
 
     connected_symbols = set()
     last_prices = {}
     signals_sent = 0
-    pending_order = None
+    locked_order = None      # Lè yon pè (ex: A) kòmanse pare pou siyal, li bloke pou avèti w sou li
     staged_setups = {}
     active_trade = None
     event_name = ""
@@ -760,7 +760,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 log("Single signal completed. Stopping bot.")
                 return "stop"
 
-            if active_trade is None and pending_order is None and now >= deadline:
+            if active_trade is None and locked_order is None and now >= deadline:
                 log("Scan window ended with no signal.")
                 return "stop"
 
@@ -833,9 +833,9 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             current = current_bars[symbol]
 
             if bucket > current["time"]:
-                if pending_order is not None and pending_order["symbol"] == symbol and pending_order["bar_time"] == current["time"]:
-                    log(f"{symbol}: Pending {pending_order['direction']} expired unconfirmed at bar close. Cancelled.")
-                    pending_order = None
+                if locked_order is not None and locked_order["symbol"] == symbol and locked_order["bar_time"] == current["time"]:
+                    log(f"{symbol}: Locked setup expired at bar close without final confirmation. Releasing lock.")
+                    locked_order = None
 
                 clean_bar = {
                     "time": current["time"],
@@ -858,8 +858,8 @@ def run_live_stream(monitored, histories, current_bars, deadline):
 
             seconds_left_in_bar = (current["time"] + TIMEFRAME) - feed_time
 
-            # ETAP 1: Prepare setup anvan dènye 3 segonn yo
-            if pending_order is None and seconds_left_in_bar > CONFIRM_WINDOW_MAX:
+            # ETAP 1: Siveye 4 pè yo. Lè yon pè (ex: A) fè setup anvan dènye 3s yo, bloke sou li epi avèti w sou Telegram!
+            if locked_order is None and seconds_left_in_bar > CONFIRM_WINDOW_MAX:
                 last_eval_ts = staged_setups.get(symbol, 0)
                 if now - last_eval_ts >= 3.0:
                     staged_setups[symbol] = now
@@ -869,29 +869,44 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                         if signal_data:
                             entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
                             entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
-                            pending_order = {
+                            sec_left = max(1, int(round(seconds_left_in_bar)))
+                            payout = payout_map.get(symbol, MIN_PAYOUT)
+                            locked_order = {
                                 "symbol": symbol,
+                                "payout": payout,
                                 "bar_time": current["time"],
                                 "direction": signal_data["direction"],
                                 "win_prob": signal_data["win_prob"],
                                 "entry_ts": entry_ts,
-                                "entry_time_str": entry_time_str
+                                "entry_time_str": entry_time_str,
+                                "pre_alert_sent": False
                             }
-                            log(f"{symbol}: READY {signal_data['direction']} ({signal_data['win_prob']}%) -> waiting 2-3s pre-close | {diag}")
+                            send_pre_signal_pair_alert(symbol, payout, entry_time_str, sec_left, now)
+                            locked_order["pre_alert_sent"] = True
+                            log(
+                                f"{symbol}: LOCKED & PRE-ALERTED ({signal_data['direction']}, {signal_data['win_prob']}%) "
+                                f"-> waiting 2-3s pre-close | {diag}"
+                            )
 
-            # ETAP 2: Voye siyal la sèlman nan dènye 2-3 segonn anvan bouji a fèmen (ex: 10:10:58 pou antre 10:11:00)
+            # Si yon pè bloke (ex: A), nou sèlman tcheke siyal final li nan dènye 2-3 segonn yo
+            if locked_order is not None and symbol != locked_order["symbol"]:
+                continue
+
+            # ETAP 2: Nan dènye 2-3 segonn anvan bouji a fèmen, voye siyal final la sou pè ki te avèti w la
             if CONFIRM_WINDOW_MIN <= seconds_left_in_bar <= CONFIRM_WINDOW_MAX and not current.get("final_verified"):
                 current["final_verified"] = True
                 window = build_live_window(symbol, histories, current)
                 if len(window) >= MIN_CANDLES:
                     signal_data, diag = evaluate_six_indicators(window)
                     if signal_data:
-                        pair_info = next((x for x in monitored if x["symbol"] == symbol), {"payout": MIN_PAYOUT})
-                        payout = pair_info["payout"]
+                        payout = payout_map.get(symbol, MIN_PAYOUT)
                         entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
                         entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
                         sent_time_str = datetime.fromtimestamp(now, tz=USER_TZ).strftime("%I:%M:%S %p")
                         sec_left = max(1, int(round(seconds_left_in_bar)))
+
+                        if locked_order is None:
+                            send_pre_signal_pair_alert(symbol, payout, entry_time_str, sec_left, now)
 
                         msg = format_signal_message(
                             symbol,
@@ -913,15 +928,15 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                                 "entry_price": None,
                                 "last_price": price
                             }
-                            pending_order = None
+                            locked_order = None
                             log(
-                                f"{symbol}: SENT {signal_data['direction']} at {sent_time_str} ({sec_left}s left) "
+                                f"{symbol}: SENT FINAL SIGNAL {signal_data['direction']} at {sent_time_str} ({sec_left}s left) "
                                 f"-> Next Candle {entry_time_str} (UTC-5)."
                             )
                     else:
-                        if pending_order is not None and pending_order["symbol"] == symbol:
-                            log(f"{symbol}: Cancelled at 2-3s check ({diag})")
-                            pending_order = None
+                        if locked_order is not None and locked_order["symbol"] == symbol:
+                            log(f"{symbol}: Locked setup cancelled at 2-3s check ({diag}). Releasing lock.")
+                            locked_order = None
 
     finally:
         response.close()
@@ -967,8 +982,7 @@ def main():
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     top_pairs = ranked[:active_limit]
-    log("Top selected pairs: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
-    send_monitored_pairs_preview(top_pairs)
+    log("Scanning 4 pairs silently: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
 
