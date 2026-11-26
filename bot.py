@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (STRICT RSI/STOCH, 1 SIGNAL/RUN, M1 60s, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (NO TOP-BAND CALL, CLEAN OTC, M1 60s, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -31,8 +31,11 @@ CANDLE_LIMIT = 100
 MIN_CANDLES = 55
 MAX_RECONNECTS = 5
 
-# Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
-TOXIC_CURRENCIES = ("TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB", "HUF", "SEK", "NOK")
+# Evite pè ki gen gwo twou / spik brital sou 60s
+TOXIC_CURRENCIES = (
+    "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB",
+    "HUF", "SEK", "NOK", "MYR"
+)
 
 API_CONNECT_TIMEOUT = 4
 API_READ_TIMEOUT = 10
@@ -79,7 +82,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/4.2",
+            "User-Agent": "RomarioProM1/4.3",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -399,7 +402,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + BLOKAJ STRIK RSI (35-65) & STOCH (25-75)
+# 3. EVALYASYON 6 ENDIKATÈ YO + BLOKAJ STRIK RSI (35-65), STOCH (25-75) & BOLLINGER
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -462,18 +465,18 @@ def evaluate_six_indicators(candles):
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if price >= bb_upper[-1] * 0.9995:
+    if bb_pos >= 0.78:
         bb_state = "Proche bande haute"
-    elif price <= bb_lower[-1] * 1.0005:
+    elif bb_pos <= 0.22:
         bb_state = "Proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "Milieu haut"
     else:
         bb_state = "Milieu bas"
 
-    if bb_mid[-1] <= price < bb_upper[-1] and bb_pos <= 0.80:
+    if bb_mid[-1] <= price < bb_upper[-1] and bb_pos <= 0.72:
         score_call += 2
-    elif bb_lower[-1] < price <= bb_mid[-1] and bb_pos >= 0.20:
+    elif bb_lower[-1] < price <= bb_mid[-1] and bb_pos >= 0.28:
         score_put += 2
 
     # 5. Stochastique (14, 3, 3) (2 pwen) — sèlman ant 25 ak 75
@@ -495,7 +498,7 @@ def evaluate_six_indicators(candles):
     total_votes = score_call + score_put
     diag = (
         f"CALL={score_call} PUT={score_put} ADX={adx_val:.2f} "
-        f"RSI={rsi_val:.2f} STOCH={sk:.2f}"
+        f"RSI={rsi_val:.2f} STOCH={sk:.2f} BBPOS={bb_pos:.2f}"
     )
 
     if adx_val <= MIN_ADX:
@@ -504,7 +507,7 @@ def evaluate_six_indicators(candles):
     if total_votes <= 0:
         return None, f"{diag} no_votes"
 
-    # Kalkil konfyans varyab e balanse (pa blòk sou 94% oswa 95%)
+    # Kalkil konfyans varyab e balanse
     vote_ratio = max(score_call, score_put) / float(total_votes)
     adx_factor = min(6.0, max(0.0, (adx_val - MIN_ADX) * 0.25))
     mid_balance_bonus = max(0.0, 4.0 - (abs(rsi_val - 50.0) * 0.16))
@@ -519,8 +522,8 @@ def evaluate_six_indicators(candles):
     )
 
     if score_call > score_put and win_prob >= MIN_CONFIDENCE:
-        if rsi_val > 65.0 or sk > 75.0:
-            return None, f"{diag} call_blocked_overbought"
+        if rsi_val > 65.0 or sk > 75.0 or bb_pos > 0.78:
+            return None, f"{diag} call_blocked_top_or_overbought"
         confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
         return {
             "direction": "CALL",
@@ -535,8 +538,8 @@ def evaluate_six_indicators(candles):
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
     if score_put > score_call and win_prob >= MIN_CONFIDENCE:
-        if rsi_val < 35.0 or sk < 25.0:
-            return None, f"{diag} put_blocked_oversold"
+        if rsi_val < 35.0 or sk < 25.0 or bb_pos < 0.22:
+            return None, f"{diag} put_blocked_bottom_or_oversold"
         confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
         return {
             "direction": "PUT",
@@ -602,7 +605,7 @@ def format_signal_message(pair, payout, entry_time_str, countdown_sec, signal_da
     quote_str = format_price(entry_quote) if entry_quote is not None else format_price(signal_data["ref_quote"])
     return (
         f"🤖 {VERSION}\n\n"
-        f"{emoji} {signal_data['direction']} | {pair} ({payout:.0f}%)\n"
+        f"{emoji} {signal_data['direction']} | {pair} (OTCharts {payout:.0f}%)\n"
         f"📊 Confiance: {signal_data['win_prob']}% | SCORE CALL: {signal_data['score_call']} vs SCORE PUT: {signal_data['score_put']}\n"
         f"🎯 Kot: {quote_str}\n"
         f"🕒 Next Candle: {entry_time_str} ({countdown_sec}s | Expiration 1min)\n"
