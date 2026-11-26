@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (NO TOP-BAND CALL, CLEAN OTC, M1 60s, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (100% 6-INDICATOR CONSENSUS, M1 60s, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -24,17 +24,17 @@ MAX_SIGNALS_PER_RUN = 1   # 1 sèl siyal pa kouri
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
 
-MIN_CONFIDENCE = 75.0     # Minimòm 75% konfyans kalkile
-MIN_ADX = 20.0            # Minimòm fòs tandans sou M1 OTC
+MIN_CONFIDENCE = 82.0     # Minimòm 82% konfyans kalkile (pa janm 94%/95%)
+MIN_ADX = 25.0            # Tandans solid sèlman sou M1 OTC
 
 CANDLE_LIMIT = 100
 MIN_CANDLES = 55
 MAX_RECONNECTS = 5
 
-# Evite pè ki gen gwo twou / spik brital sou 60s
+# Evite pè ki gen gwo twou / spik brital / ticks etwat sou 60s
 TOXIC_CURRENCIES = (
     "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB",
-    "HUF", "SEK", "NOK", "MYR"
+    "HUF", "SEK", "NOK", "MYR", "SYP", "NGN"
 )
 
 API_CONNECT_TIMEOUT = 4
@@ -82,7 +82,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/4.3",
+            "User-Agent": "RomarioProM1/4.5",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -402,9 +402,13 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + BLOKAJ STRIK RSI (35-65), STOCH (25-75) & BOLLINGER
+# 3. EVALYASYON 6 ENDIKATÈ YO (100% KONSANSIS POU VOYE SIYAL)
 # =====================================================
 def evaluate_six_indicators(candles):
+    """
+    Sèlman voye siyal lè TOUT 6 endikatè yo dakò nan menm direksyon an
+    ak fòs tandans ADX >= MIN_ADX epi pa gen zòn ekstrèm.
+    """
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
@@ -431,89 +435,70 @@ def evaluate_six_indicators(candles):
     ):
         return None, "indicators unavailable"
 
-    score_call = 0
-    score_put = 0
-
-    # 1. EMA 9 / 21 (2 pwen)
-    if ema9[-1] > ema21[-1]:
-        score_call += 2
-        ema_state = "Haussier"
-    elif ema9[-1] < ema21[-1]:
-        score_put += 2
-        ema_state = "Baissier"
-    else:
-        ema_state = "Neutre"
-
-    # 2. MACD (12, 26, 9) (2 pwen)
-    if macd_line[-1] > signal_line[-1] and hist_line[-1] >= 0:
-        score_call += 2
-        macd_state = "Haussier"
-    elif macd_line[-1] < signal_line[-1] and hist_line[-1] <= 0:
-        score_put += 2
-        macd_state = "Baissier"
-    else:
-        macd_state = "Neutre"
-
-    # 3. RSI (14) (2 pwen) — sèlman nan zòn mwayen kontwole (50..65 pou CALL, 35..50 pou PUT)
+    adx_val = adx14[-1]
     rsi_val = rsi14[-1]
-    if 50.0 < rsi_val <= 65.0:
-        score_call += 2
-    elif 35.0 <= rsi_val < 50.0:
-        score_put += 2
-
-    # 4. Bollinger Bands (20, 2) (2 pwen)
+    sk = stoch_k[-1]
+    sd = stoch_d[-1]
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if bb_pos >= 0.78:
+    ema_state = "Haussier" if ema9[-1] > ema21[-1] else ("Baissier" if ema9[-1] < ema21[-1] else "Neutre")
+    macd_state = (
+        "Haussier" if (macd_line[-1] > signal_line[-1] and hist_line[-1] > 0)
+        else ("Baissier" if (macd_line[-1] < signal_line[-1] and hist_line[-1] < 0) else "Neutre")
+    )
+
+    if bb_pos >= 0.75:
         bb_state = "Proche bande haute"
-    elif bb_pos <= 0.22:
+    elif bb_pos <= 0.25:
         bb_state = "Proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "Milieu haut"
     else:
         bb_state = "Milieu bas"
 
-    if bb_mid[-1] <= price < bb_upper[-1] and bb_pos <= 0.72:
-        score_call += 2
-    elif bb_lower[-1] < price <= bb_mid[-1] and bb_pos >= 0.28:
-        score_put += 2
-
-    # 5. Stochastique (14, 3, 3) (2 pwen) — sèlman ant 25 ak 75
-    sk = stoch_k[-1]
-    sd = stoch_d[-1]
-    if sk > sd and 25.0 <= sk <= 75.0:
-        score_call += 2
-    elif sk < sd and 25.0 <= sk <= 75.0:
-        score_put += 2
-
-    # 6. ADX (14) - fòs tandans lan (2 pwen si ADX > MIN_ADX)
-    adx_val = adx14[-1]
-    if adx_val > MIN_ADX:
-        if ema9[-1] > ema21[-1]:
-            score_call += 2
-        elif ema9[-1] < ema21[-1]:
-            score_put += 2
-
-    total_votes = score_call + score_put
     diag = (
-        f"CALL={score_call} PUT={score_put} ADX={adx_val:.2f} "
-        f"RSI={rsi_val:.2f} STOCH={sk:.2f} BBPOS={bb_pos:.2f}"
+        f"ADX={adx_val:.2f} RSI={rsi_val:.2f} STOCH={sk:.2f} "
+        f"MACD={macd_state} EMA={ema_state} BBPOS={bb_pos:.2f}"
     )
 
-    if adx_val <= MIN_ADX:
-        return None, f"{diag} adx_below_{MIN_ADX:.0f}"
+    if adx_val < MIN_ADX:
+        return None, f"{diag} weak_trend_adx<{MIN_ADX:.0f}"
 
-    if total_votes <= 0:
-        return None, f"{diag} no_votes"
+    # Verifye 100% konsansis CALL (6/6 kondisyon dakò)
+    call_conds = [
+        ema9[-1] > ema21[-1],
+        macd_state == "Haussier",
+        52.0 <= rsi_val <= 65.0,
+        price > bb_mid[-1] and 0.52 <= bb_pos <= 0.74,
+        sk > sd and 28.0 <= sk <= 74.0,
+        adx_val >= MIN_ADX
+    ]
 
-    # Kalkil konfyans varyab e balanse
-    vote_ratio = max(score_call, score_put) / float(total_votes)
-    adx_factor = min(6.0, max(0.0, (adx_val - MIN_ADX) * 0.25))
-    mid_balance_bonus = max(0.0, 4.0 - (abs(rsi_val - 50.0) * 0.16))
+    # Verifye 100% konsansis PUT (6/6 kondisyon dakò)
+    put_conds = [
+        ema9[-1] < ema21[-1],
+        macd_state == "Baissier",
+        35.0 <= rsi_val <= 48.0,
+        price < bb_mid[-1] and 0.26 <= bb_pos <= 0.48,
+        sk < sd and 26.0 <= sk <= 72.0,
+        adx_val >= MIN_ADX
+    ]
 
-    raw_conf = 64.0 + (vote_ratio * 15.0) + adx_factor + mid_balance_bonus
-    win_prob = int(round(max(50.0, min(88.0, raw_conf))))
+    if all(call_conds):
+        direction = "CALL"
+        score_call, score_put = 12, 0
+    elif all(put_conds):
+        direction = "PUT"
+        score_call, score_put = 0, 12
+    else:
+        return None, f"{diag} not_full_6of6_consensus"
+
+    # Kalkil konfyans varyab reyèl (ant 82% ak 89%, pa kole sou 94%/95%)
+    adx_bonus = min(4.0, max(0.0, (adx_val - MIN_ADX) * 0.20))
+    rsi_center_bonus = max(0.0, 3.0 - (abs(rsi_val - 50.0) * 0.12))
+    win_prob = int(round(max(82.0, min(89.0, 82.0 + adx_bonus + rsi_center_bonus))))
+    confidence_label = "🟢 TRÈ SOLID" if win_prob >= 85 else "🟡 MODERE"
 
     summary_lines = (
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
@@ -521,39 +506,17 @@ def evaluate_six_indicators(candles):
         f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f}"
     )
 
-    if score_call > score_put and win_prob >= MIN_CONFIDENCE:
-        if rsi_val > 65.0 or sk > 75.0 or bb_pos > 0.78:
-            return None, f"{diag} call_blocked_top_or_overbought"
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
-        return {
-            "direction": "CALL",
-            "score_call": score_call,
-            "score_put": score_put,
-            "win_prob": win_prob,
-            "adx": adx_val,
-            "confidence": confidence_label,
-            "indicators_summary": summary_lines,
-            "ref_quote": price,
-            "candle_time": bar["time"]
-        }, f"{diag} CALL_SIGNAL conf={win_prob}%"
-
-    if score_put > score_call and win_prob >= MIN_CONFIDENCE:
-        if rsi_val < 35.0 or sk < 25.0 or bb_pos < 0.22:
-            return None, f"{diag} put_blocked_bottom_or_oversold"
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 82 else "🟡 MODERE"
-        return {
-            "direction": "PUT",
-            "score_call": score_call,
-            "score_put": score_put,
-            "win_prob": win_prob,
-            "adx": adx_val,
-            "confidence": confidence_label,
-            "indicators_summary": summary_lines,
-            "ref_quote": price,
-            "candle_time": bar["time"]
-        }, f"{diag} PUT_SIGNAL conf={win_prob}%"
-
-    return None, f"{diag} conf_below_{MIN_CONFIDENCE:.0f}%"
+    return {
+        "direction": direction,
+        "score_call": score_call,
+        "score_put": score_put,
+        "win_prob": win_prob,
+        "adx": adx_val,
+        "confidence": confidence_label,
+        "indicators_summary": summary_lines,
+        "ref_quote": price,
+        "candle_time": bar["time"]
+    }, f"{diag} {direction}_6OF6 conf={win_prob}%"
 
 
 def build_live_window(symbol, histories, current_bar):
