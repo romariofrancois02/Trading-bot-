@@ -24,7 +24,7 @@ MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Top 4 pi bon pè yo pou /v1/stream
 
-MIN_CONFIDENCE = 75.0     # Minimòm 75% konfyans (score / total * 100)
+MIN_CONFIDENCE = 75.0     # Minimòm 75% konfyans kalkile
 MIN_ADX = 18.0            # Minimòm fòs tandans (pa twò rèd pou l pa kole)
 
 CANDLE_LIMIT = 100
@@ -79,7 +79,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/3.6",
+            "User-Agent": "RomarioProM1/3.7",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -399,7 +399,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + SISTÈM PWEN (SCORE CALL / PUT)
+# 3. EVALYASYON 6 ENDIKATÈ YO + KONFYANS VARYAB REYÈL
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -451,7 +451,7 @@ def evaluate_six_indicators(candles):
     else:
         macd_state = "Neutre"
 
-    # 3. RSI (14) (2 pwen) — evite zòn ki deja twò cho (>75 pou CALL, <25 pou PUT)
+    # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
     if 50.0 < rsi_val <= 75.0:
         score_call += 2
@@ -501,8 +501,14 @@ def evaluate_six_indicators(candles):
     if total_votes <= 0:
         return None, f"{diag} no_votes"
 
-    call_conf = (score_call / total_votes) * 100.0
-    put_conf = (score_put / total_votes) * 100.0
+    # Kalkil konfyans varyab selon vòt yo + fòs reyèl ADX, RSI ak Stochastique
+    base_conf = (score_call / total_votes) * 100.0 if score_call > score_put else (score_put / total_votes) * 100.0
+    adx_bonus = min(8.0, max(0.0, (adx_val - MIN_ADX) * 0.45))
+    rsi_bonus = min(5.5, abs(rsi_val - 50.0) * 0.25)
+    stoch_bonus = min(4.0, abs(sk - 50.0) * 0.12)
+
+    raw_conf = 67.5 + (base_conf * 0.17) + adx_bonus + rsi_bonus + stoch_bonus
+    win_prob = int(round(max(50.0, min(94.0, raw_conf))))
 
     summary_lines = (
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
@@ -510,9 +516,8 @@ def evaluate_six_indicators(candles):
         f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f}"
     )
 
-    if score_call > score_put and call_conf >= MIN_CONFIDENCE:
-        win_prob = int(round(max(50.0, min(95.0, call_conf))))
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 80 else "🟡 MODERE"
+    if score_call > score_put and win_prob >= MIN_CONFIDENCE:
+        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 83 else "🟡 MODERE"
         return {
             "direction": "CALL",
             "score_call": score_call,
@@ -525,9 +530,8 @@ def evaluate_six_indicators(candles):
             "candle_time": bar["time"]
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
-    if score_put > score_call and put_conf >= MIN_CONFIDENCE:
-        win_prob = int(round(max(50.0, min(95.0, put_conf))))
-        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 80 else "🟡 MODERE"
+    if score_put > score_call and win_prob >= MIN_CONFIDENCE:
+        confidence_label = "🟢 TRÈ SOLID" if win_prob >= 83 else "🟡 MODERE"
         return {
             "direction": "PUT",
             "score_call": score_call,
