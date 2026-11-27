@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (CLEAN M1 60s SIGNALS, PRE-ALERT ON LOCKED PAIR, >=92% PAYOUT, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (STRONG CLEAN M1 60s, CANDLE STRUCTURE GUARD, >=92% PAYOUT, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -27,7 +27,7 @@ MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Siveye 4 pè (A, B, C, D) sou /v1/stream
 
 MIN_CONFIDENCE = 80.0     # Konfyans pwòp e solid (>= 80%)
-MIN_ADX = 20.0            # Filtè fòs tandans sou M1 OTC
+MIN_ADX = 22.0            # Filtè fòs tandans sou M1 OTC
 
 CANDLE_LIMIT = 100
 MIN_CANDLES = 55
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.4",
+            "User-Agent": "RomarioProM1/5.5",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -188,13 +188,14 @@ def send_telegram_fn(message):
         log("Telegram credentials missing.")
         return False
 
+    clean_msg = str(message).strip()
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     for attempt in range(1, TELEGRAM_ATTEMPTS + 1):
         response = None
         try:
             response = requests.post(
                 url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": message},
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": clean_msg},
                 timeout=TELEGRAM_TIMEOUT
             )
             if response.ok:
@@ -214,7 +215,7 @@ def send_pre_signal_pair_alert(symbol, payout, entry_time_str, sec_left, now_ts)
         f"🤖 {VERSION} — PREPARE SOU PÈ SA A\n\n"
         f"⚡ Pè ki pral bay siyal la: {symbol} (OTCharts {payout:.0f}%)\n"
         f"🕒 Lè avètisman: {sent_str} (UTC-5)\n"
-        f"⏳ Siyal final ap vini nan dènye 2-3s bouji a (~{entry_time_str} | {sec_left}s)"
+        f"⏳ Siyal final ap vini nan dènye 2s bouji a (~{entry_time_str} | {sec_left}s)"
     )
     send_telegram_fn(msg)
 
@@ -223,7 +224,7 @@ def send_cancelled_pair_alert(symbol, direction, reason, now_ts):
     sent_str = datetime.fromtimestamp(now_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
     msg = (
         f"🤖 {VERSION} — SIYAL ANILE\n\n"
-        f"❌ {symbol} ({direction}) anile nan dènye 2-3s\n"
+        f"❌ {symbol} ({direction}) anile nan dènye 2s\n"
         f"🕒 Lè: {sent_str} (UTC-5)\n"
         f"ℹ️ Rezon: {reason} — ap chèche lòt pè..."
     )
@@ -428,7 +429,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO (PWÒP E BALANSE SOU M1 OTC)
+# 3. EVALYASYON 6 ENDIKATÈ YO + FILTÈ STRIKTI BOUJI M1
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -436,6 +437,7 @@ def evaluate_six_indicators(candles):
 
     window = candles[-80:] if len(candles) >= 80 else candles
     closes = [c["close"] for c in window]
+    prev_closed = window[-2] if len(window) >= 2 else window[-1]
     bar = window[-1]
     price = bar["close"]
 
@@ -471,10 +473,10 @@ def evaluate_six_indicators(candles):
         ema_state = "Neutre"
 
     # 2. MACD (12, 26, 9) (2 pwen)
-    if macd_line[-1] > signal_line[-1] and hist_line[-1] >= 0:
+    if macd_line[-1] > signal_line[-1] and hist_line[-1] > 0:
         score_call += 2
         macd_state = "Haussier"
-    elif macd_line[-1] < signal_line[-1] and hist_line[-1] <= 0:
+    elif macd_line[-1] < signal_line[-1] and hist_line[-1] < 0:
         score_put += 2
         macd_state = "Baissier"
     else:
@@ -482,44 +484,49 @@ def evaluate_six_indicators(candles):
 
     # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
-    if 50.0 <= rsi_val <= 70.0:
+    if 50.0 < rsi_val <= 68.0:
         score_call += 2
-    elif 30.0 <= rsi_val <= 50.0:
+    elif 32.0 <= rsi_val < 50.0:
         score_put += 2
 
     # 4. Bollinger Bands (20, 2) (2 pwen)
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if bb_pos >= 0.80:
+    if bb_pos >= 0.78:
         bb_state = "Proche bande haute"
-    elif bb_pos <= 0.20:
+    elif bb_pos <= 0.22:
         bb_state = "Proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "Milieu haut"
     else:
         bb_state = "Milieu bas"
 
-    if price >= bb_mid[-1] and bb_pos <= 0.82:
+    if price > bb_mid[-1] and bb_pos <= 0.78:
         score_call += 2
-    elif price <= bb_mid[-1] and bb_pos >= 0.18:
+    elif price < bb_mid[-1] and bb_pos >= 0.22:
         score_put += 2
 
     # 5. Stochastique (14, 3, 3) (2 pwen)
     sk = stoch_k[-1]
     sd = stoch_d[-1]
-    if sk > sd and 20.0 <= sk <= 80.0:
+    if sk > sd and 25.0 <= sk <= 76.0:
         score_call += 2
-    elif sk < sd and 20.0 <= sk <= 80.0:
+    elif sk < sd and 24.0 <= sk <= 75.0:
         score_put += 2
 
     # 6. ADX (14) (2 pwen)
     adx_val = adx14[-1]
     if adx_val >= MIN_ADX:
-        if ema9[-1] >= ema21[-1]:
+        if ema9[-1] > ema21[-1]:
             score_call += 2
-        else:
+        elif ema9[-1] < ema21[-1]:
             score_put += 2
+
+    prev_bearish = prev_closed["close"] < prev_closed["open"]
+    prev_bullish = prev_closed["close"] > prev_closed["open"]
+    live_bearish = bar["close"] < bar["open"]
+    live_bullish = bar["close"] > bar["open"]
 
     diag = (
         f"CALL={score_call} PUT={score_put} ADX={adx_val:.2f} "
@@ -531,7 +538,7 @@ def evaluate_six_indicators(candles):
 
     adx_bonus = min(4.0, max(0.0, (adx_val - MIN_ADX) * 0.25))
     score_bonus = min(4.0, max(0.0, (abs(score_call - score_put) - 4) * 0.5))
-    win_prob = int(round(max(80.0, min(89.0, 80.0 + adx_bonus + score_bonus))))
+    win_prob = int(round(max(80.0, min(90.0, 80.0 + adx_bonus + score_bonus))))
 
     summary_lines = (
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
@@ -540,7 +547,13 @@ def evaluate_six_indicators(candles):
     )
 
     if score_call >= 8 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
-        if ema_state == "Baissier" or macd_state == "Baissier" or rsi_val > 72.0 or bb_pos > 0.85:
+        if (
+            ema_state != "Haussier"
+            or macd_state != "Haussier"
+            or rsi_val > 68.0
+            or bb_pos > 0.78
+            or (prev_bearish and live_bearish)
+        ):
             return None, f"{diag} call_filtered"
         return {
             "direction": "CALL",
@@ -555,7 +568,13 @@ def evaluate_six_indicators(candles):
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
     if score_put >= 8 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
-        if ema_state == "Haussier" or macd_state == "Haussier" or rsi_val < 28.0 or bb_pos < 0.15:
+        if (
+            ema_state != "Baissier"
+            or macd_state != "Baissier"
+            or rsi_val < 32.0
+            or bb_pos < 0.22
+            or (prev_bullish and live_bullish)
+        ):
             return None, f"{diag} put_filtered"
         return {
             "direction": "PUT",
@@ -569,7 +588,7 @@ def evaluate_six_indicators(candles):
             "candle_time": bar["time"]
         }, f"{diag} PUT_SIGNAL conf={win_prob}%"
 
-    return None, f"{diag} no_clean_setup"
+    return None, f"{diag} no_strong_clean_setup"
 
 
 def build_live_window(symbol, histories, current_bar):
@@ -947,7 +966,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     else:
                         if locked_order is not None and locked_order["symbol"] == symbol:
                             log(f"{symbol}: Cancelled at 2s check ({diag}). Releasing lock.")
-                            send_cancelled_pair_alert(symbol, locked_order["direction"], "endikatè yo chanje nan dènye 2s", now)
+                            send_cancelled_pair_alert(symbol, locked_order["direction"], "endikatè oswa bouji chanje nan dènye 2s", now)
                             locked_order = None
 
     finally:
