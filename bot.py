@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (BALANCED FIRMER M1 60s, PRE-ALERT ON LOCKED PAIR, >=92% PAYOUT, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (ANTI-EXTREME GUARD M1 60s, PRE-ALERT ON LOCKED PAIR, >=92% PAYOUT, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.7",
+            "User-Agent": "RomarioProM1/5.8",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -429,7 +429,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO (EKILIBRE E PWÒP SOU M1 OTC)
+# 3. EVALYASYON 6 ENDIKATÈ YO + GAD KONT ZÒN SURACHAT / SURVENTE
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -484,35 +484,35 @@ def evaluate_six_indicators(candles):
 
     # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
-    if 50.0 < rsi_val <= 70.0:
+    if 50.0 < rsi_val <= 68.0:
         score_call += 2
-    elif 30.0 <= rsi_val < 50.0:
+    elif 32.0 <= rsi_val < 50.0:
         score_put += 2
 
     # 4. Bollinger Bands (20, 2) (2 pwen)
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if bb_pos >= 0.80:
+    if bb_pos >= 0.78:
         bb_state = "Proche bande haute"
-    elif bb_pos <= 0.20:
+    elif bb_pos <= 0.22:
         bb_state = "Proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "Milieu haut"
     else:
         bb_state = "Milieu bas"
 
-    if price > bb_mid[-1] and bb_pos <= 0.80:
+    if price > bb_mid[-1] and bb_pos <= 0.78:
         score_call += 2
-    elif price < bb_mid[-1] and bb_pos >= 0.20:
+    elif price < bb_mid[-1] and bb_pos >= 0.22:
         score_put += 2
 
     # 5. Stochastique (14, 3, 3) (2 pwen)
     sk = stoch_k[-1]
     sd = stoch_d[-1]
-    if sk > sd and 20.0 <= sk <= 80.0:
+    if sk > sd and 22.0 <= sk <= 78.0:
         score_call += 2
-    elif sk < sd and 20.0 <= sk <= 80.0:
+    elif sk < sd and 22.0 <= sk <= 78.0:
         score_put += 2
 
     # 6. ADX (14) (2 pwen)
@@ -548,13 +548,14 @@ def evaluate_six_indicators(candles):
 
     if score_call >= 8 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
         if (
-            ema_state == "Baissier"
-            or macd_state == "Baissier"
-            or rsi_val > 72.0
-            or bb_pos > 0.85
+            ema_state != "Haussier"
+            or macd_state != "Haussier"
+            or rsi_val > 68.0
+            or sk > 78.0
+            or bb_pos > 0.78
             or (prev_bearish and live_bearish)
         ):
-            return None, f"{diag} call_filtered"
+            return None, f"{diag} call_overextended_guard"
         return {
             "direction": "CALL",
             "score_call": score_call,
@@ -569,13 +570,14 @@ def evaluate_six_indicators(candles):
 
     if score_put >= 8 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
         if (
-            ema_state == "Haussier"
-            or macd_state == "Haussier"
-            or rsi_val < 28.0
-            or bb_pos < 0.15
+            ema_state != "Baissier"
+            or macd_state != "Baissier"
+            or rsi_val < 32.0
+            or sk < 22.0
+            or bb_pos < 0.22
             or (prev_bullish and live_bullish)
         ):
-            return None, f"{diag} put_filtered"
+            return None, f"{diag} put_overextended_guard"
         return {
             "direction": "PUT",
             "score_call": score_call,
