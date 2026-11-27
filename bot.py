@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (SLIGHTLY FIRMER M1 60s, PRE-ALERT ON LOCKED PAIR, >=92% PAYOUT, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (BALANCED FIRMER M1 60s, PRE-ALERT ON LOCKED PAIR, >=92% PAYOUT, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -26,8 +26,8 @@ MAX_SIGNALS_PER_RUN = 1   # Kanpe otomatikman aprè 1 sèl siyal
 MAX_WAIT_SECONDS = 300    # Chèche yon opòtinite nan 5 minit max
 MAX_STREAM_PAIRS = 4      # Siveye 4 pè (A, B, C, D) sou /v1/stream
 
-MIN_CONFIDENCE = 82.0     # Yon ti kras pi di: omwen 82% konfyans kalkile
-MIN_ADX = 24.0            # Filtè fòs tandans yon ti kras pi di sou M1 OTC
+MIN_CONFIDENCE = 80.0     # Konfyans pwòp e solid (>= 80%)
+MIN_ADX = 21.0            # Balans fòs tandans sou M1 OTC
 
 CANDLE_LIMIT = 100
 MIN_CANDLES = 55
@@ -35,7 +35,7 @@ MAX_RECONNECTS = 5
 
 # Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
 TOXIC_CURRENCIES = (
-    "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "THB",
+    "TRY", "ZAR", "MXN", "BRL", "PLN", "RUB", "INR", "CNH", "CNY", "THB",
     "HUF", "SEK", "NOK", "MYR", "SYP", "NGN", "IDR", "OMR"
 )
 
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.6",
+            "User-Agent": "RomarioProM1/5.7",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -429,7 +429,7 @@ def calc_adx_aligned(candles, period=14):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO (YON TI KRAS PI DI / PI EXIJAN)
+# 3. EVALYASYON 6 ENDIKATÈ YO (EKILIBRE E PWÒP SOU M1 OTC)
 # =====================================================
 def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
@@ -484,35 +484,35 @@ def evaluate_six_indicators(candles):
 
     # 3. RSI (14) (2 pwen)
     rsi_val = rsi14[-1]
-    if 52.0 <= rsi_val <= 65.0:
+    if 50.0 < rsi_val <= 70.0:
         score_call += 2
-    elif 35.0 <= rsi_val <= 48.0:
+    elif 30.0 <= rsi_val < 50.0:
         score_put += 2
 
     # 4. Bollinger Bands (20, 2) (2 pwen)
     bb_span = max(bb_upper[-1] - bb_lower[-1], 1e-12)
     bb_pos = (price - bb_lower[-1]) / bb_span
 
-    if bb_pos >= 0.72:
+    if bb_pos >= 0.80:
         bb_state = "Proche bande haute"
-    elif bb_pos <= 0.28:
+    elif bb_pos <= 0.20:
         bb_state = "Proche bande basse"
     elif price >= bb_mid[-1]:
         bb_state = "Milieu haut"
     else:
         bb_state = "Milieu bas"
 
-    if price > bb_mid[-1] and bb_pos <= 0.72:
+    if price > bb_mid[-1] and bb_pos <= 0.80:
         score_call += 2
-    elif price < bb_mid[-1] and bb_pos >= 0.28:
+    elif price < bb_mid[-1] and bb_pos >= 0.20:
         score_put += 2
 
     # 5. Stochastique (14, 3, 3) (2 pwen)
     sk = stoch_k[-1]
     sd = stoch_d[-1]
-    if sk > sd and 28.0 <= sk <= 72.0:
+    if sk > sd and 20.0 <= sk <= 80.0:
         score_call += 2
-    elif sk < sd and 28.0 <= sk <= 72.0:
+    elif sk < sd and 20.0 <= sk <= 80.0:
         score_put += 2
 
     # 6. ADX (14) (2 pwen)
@@ -537,8 +537,8 @@ def evaluate_six_indicators(candles):
         return None, f"{diag} adx_below_{MIN_ADX:.0f}"
 
     adx_bonus = min(4.0, max(0.0, (adx_val - MIN_ADX) * 0.25))
-    score_bonus = min(3.0, max(0.0, (abs(score_call - score_put) - 6) * 0.5))
-    win_prob = int(round(max(82.0, min(90.0, 82.0 + adx_bonus + score_bonus))))
+    score_bonus = min(4.0, max(0.0, (abs(score_call - score_put) - 4) * 0.5))
+    win_prob = int(round(max(80.0, min(90.0, 80.0 + adx_bonus + score_bonus))))
 
     summary_lines = (
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
@@ -546,16 +546,15 @@ def evaluate_six_indicators(candles):
         f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f}"
     )
 
-    if score_call >= 10 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
+    if score_call >= 8 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
         if (
-            ema_state != "Haussier"
-            or macd_state != "Haussier"
-            or not (52.0 <= rsi_val <= 65.0)
-            or not (28.0 <= sk <= 72.0)
-            or bb_pos > 0.72
+            ema_state == "Baissier"
+            or macd_state == "Baissier"
+            or rsi_val > 72.0
+            or bb_pos > 0.85
             or (prev_bearish and live_bearish)
         ):
-            return None, f"{diag} call_firmer_filter"
+            return None, f"{diag} call_filtered"
         return {
             "direction": "CALL",
             "score_call": score_call,
@@ -568,16 +567,15 @@ def evaluate_six_indicators(candles):
             "candle_time": bar["time"]
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
-    if score_put >= 10 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
+    if score_put >= 8 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
         if (
-            ema_state != "Baissier"
-            or macd_state != "Baissier"
-            or not (35.0 <= rsi_val <= 48.0)
-            or not (28.0 <= sk <= 72.0)
-            or bb_pos < 0.28
+            ema_state == "Haussier"
+            or macd_state == "Haussier"
+            or rsi_val < 28.0
+            or bb_pos < 0.15
             or (prev_bullish and live_bullish)
         ):
-            return None, f"{diag} put_firmer_filter"
+            return None, f"{diag} put_filtered"
         return {
             "direction": "PUT",
             "score_call": score_call,
@@ -590,7 +588,7 @@ def evaluate_six_indicators(candles):
             "candle_time": bar["time"]
         }, f"{diag} PUT_SIGNAL conf={win_prob}%"
 
-    return None, f"{diag} no_firmer_setup"
+    return None, f"{diag} no_balanced_setup"
 
 
 def build_live_window(symbol, histories, current_bar):
