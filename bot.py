@@ -11,13 +11,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (BETTER CONFIRMATION M1 60s, STOCH & CANDLE GUARD, >=92% PAYOUT, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (M30 + M10 + M1 60s, STOCH & CANDLE GUARD, >=92% PAYOUT, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
-TIMEFRAME = 60            # Graf 1 minit (M1)
+TIMEFRAME = 60            # Graf antre 1 minit (M1)
+HTF_M10 = 600             # Konfimasyon tandans 10 minit (M10)
+HTF_M30 = 1800            # Gwo tandans global 30 minit (M30)
 EXPIRATION = 60           # Ekspirasyon 60 segonn (1 minit)
 MIN_PAYOUT = 92.0         # Sèlman mache ki gen 92%+ payout sou OTC
 CONFIRM_WINDOW_MAX = 2    # Verifikasyon nan dènye 2 segonn anvan fèmti bouji a
@@ -30,7 +32,9 @@ MIN_CONFIDENCE = 80.0     # Konfyans pwòp e solid (>= 80%)
 MIN_ADX = 22.0            # Filtè fòs tandans sou M1 OTC
 
 CANDLE_LIMIT = 100
+HTF_CANDLE_LIMIT = 40
 MIN_CANDLES = 55
+MIN_HTF_CANDLES = 22
 MAX_RECONNECTS = 5
 
 # Evite vye mache ekzotik ki gen gwo twou / spik brital sou 60s
@@ -84,7 +88,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.6",
+            "User-Agent": "RomarioProM1/6.0",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -443,9 +447,101 @@ def has_heavy_upper_wick(candle):
 
 
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + KONFIMASYON BOUJI M1
+# 3. ANALIZ M30 (GWO TANDANS) & M10 (KONFIMASYON TANDANS)
 # =====================================================
-def evaluate_six_indicators(candles, require_live_alignment=False):
+def analyze_htf_bias(candles, tf_label):
+    """
+    Detèmine direksyon M30 oswa M10 ("Haussier", "Baissier", oswa "Neutre").
+    """
+    if not candles or len(candles) < MIN_HTF_CANDLES:
+        return "Neutre"
+
+    closes = [c["close"] for c in candles]
+    ema9 = calc_ema_aligned(closes, 9)
+    ema21 = calc_ema_aligned(closes, 21)
+
+    if ema9[-1] is None or ema21[-1] is None:
+        return "Neutre"
+
+    last_closed = candles[-2] if len(candles) >= 2 else candles[-1]
+    closed_bull = last_closed["close"] > last_closed["open"]
+    closed_bear = last_closed["close"] < last_closed["open"]
+
+    if ema9[-1] > ema21[-1] and not (closed_bear and closes[-1] < ema21[-1]):
+        return "Haussier"
+    if ema9[-1] < ema21[-1] and not (closed_bull and closes[-1] > ema21[-1]):
+        return "Baissier"
+    return "Neutre"
+
+
+def get_mtf_state(symbol, htf_cache):
+    entry = htf_cache.get(symbol, {})
+    m30_bias = entry.get("m30", "Neutre")
+    m10_bias = entry.get("m10", "Neutre")
+    return m30_bias, m10_bias
+
+
+def allows_direction_mtf(direction, m30_bias, m10_bias):
+    """
+    M30 = gwo tandans global.
+    M10 = konfimasyon tandans aktif (pa nan pullback opoze).
+    Tou de dwe aliyen ak direksyon siyal la.
+    """
+    if direction == "CALL":
+        return m30_bias == "Haussier" and m10_bias == "Haussier"
+    if direction == "PUT":
+        return m30_bias == "Baissier" and m10_bias == "Baissier"
+    return False
+
+
+def fetch_htf_candles(symbol, tf_seconds):
+    data = api_get(
+        "/v1/candles",
+        params={"venue": VENUE, "symbol": symbol, "tf": tf_seconds, "limit": HTF_CANDLE_LIMIT}
+    )
+    candles = data.get("candles", [])
+    parsed = []
+    for c in candles:
+        try:
+            parsed.append({
+                "time": normalize_ts(c["time"]),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"])
+            })
+        except (KeyError, TypeError, ValueError):
+            continue
+    parsed.sort(key=lambda x: x["time"])
+    return parsed[-HTF_CANDLE_LIMIT:] if len(parsed) >= MIN_HTF_CANDLES else []
+
+
+def refresh_mtf_for_symbols(symbols, htf_cache, force=False):
+    now_ts = time.time()
+    for sym in symbols:
+        current = htf_cache.get(sym, {})
+        last_upd = current.get("updated_at", 0.0)
+        if not force and (now_ts - last_upd) < 30.0 and "m30" in current and "m10" in current:
+            continue
+        try:
+            m30_candles = fetch_htf_candles(sym, HTF_M30)
+            m10_candles = fetch_htf_candles(sym, HTF_M10)
+            m30_bias = analyze_htf_bias(m30_candles, "M30")
+            m10_bias = analyze_htf_bias(m10_candles, "M10")
+            htf_cache[sym] = {
+                "m30": m30_bias,
+                "m10": m10_bias,
+                "updated_at": now_ts
+            }
+        except Exception:
+            if sym not in htf_cache:
+                htf_cache[sym] = {"m30": "Neutre", "m10": "Neutre", "updated_at": now_ts}
+
+
+# =====================================================
+# 4. EVALYASYON 6 ENDIKATÈ YO + KONFIMASYON M30 / M10 / M1
+# =====================================================
+def evaluate_six_indicators(candles, require_live_alignment=False, m30_bias=None, m10_bias=None):
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
@@ -542,9 +638,13 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
     live_bearish = bar["close"] < bar["open"]
     live_bullish = bar["close"] > bar["open"]
 
+    m30_txt = m30_bias or "Neutre"
+    m10_txt = m10_bias or "Neutre"
+
     diag = (
         f"CALL={score_call} PUT={score_put} ADX={adx_val:.2f} "
-        f"RSI={rsi_val:.2f} STOCH={sk:.2f} MACD={macd_state} BBPOS={bb_pos:.2f}"
+        f"RSI={rsi_val:.2f} STOCH={sk:.2f} MACD={macd_state} BBPOS={bb_pos:.2f} "
+        f"M30={m30_txt} M10={m10_txt}"
     )
 
     if adx_val < MIN_ADX:
@@ -555,12 +655,15 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
     win_prob = int(round(max(80.0, min(90.0, 80.0 + adx_bonus + score_bonus))))
 
     summary_lines = (
+        f"• M30 / M10: {m30_txt} / {m10_txt}\n"
         f"• RSI (14): {rsi_val:.2f} | MACD: {macd_state}\n"
         f"• Bollinger: {bb_state} | EMA 9/21: {ema_state}\n"
         f"• Stoch %K: {sk:.2f} | ADX: {adx_val:.2f}"
     )
 
     if score_call >= 8 and score_call > score_put and win_prob >= MIN_CONFIDENCE:
+        if not allows_direction_mtf("CALL", m30_txt, m10_txt):
+            return None, f"{diag} mtf_call_mismatch"
         if (
             ema_state != "Haussier"
             or macd_state != "Haussier"
@@ -578,13 +681,15 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
             "score_put": score_put,
             "win_prob": win_prob,
             "adx": adx_val,
-            "confidence": "🟢 TRÈ SOLID",
+            "confidence": "🟢 TRÈ SOLID (M30+M10+M1)",
             "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
         }, f"{diag} CALL_SIGNAL conf={win_prob}%"
 
     if score_put >= 8 and score_put > score_call and win_prob >= MIN_CONFIDENCE:
+        if not allows_direction_mtf("PUT", m30_txt, m10_txt):
+            return None, f"{diag} mtf_put_mismatch"
         if (
             ema_state != "Baissier"
             or macd_state != "Baissier"
@@ -602,7 +707,7 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
             "score_put": score_put,
             "win_prob": win_prob,
             "adx": adx_val,
-            "confidence": "🟢 TRÈ SOLID",
+            "confidence": "🟢 TRÈ SOLID (M30+M10+M1)",
             "indicators_summary": summary_lines,
             "ref_quote": price,
             "candle_time": bar["time"]
@@ -628,8 +733,13 @@ def build_live_window(symbol, histories, current_bar):
     return hist[-(CANDLE_LIMIT - 1):] + [live_bar]
 
 
-def score_setup_quality(candles):
-    sig, _ = evaluate_six_indicators(candles, require_live_alignment=False)
+def score_setup_quality(candles, m30_bias="Neutre", m10_bias="Neutre"):
+    sig, _ = evaluate_six_indicators(
+        candles,
+        require_live_alignment=False,
+        m30_bias=m30_bias,
+        m10_bias=m10_bias
+    )
     if sig is not None:
         return round(100.0 + float(sig["win_prob"]), 2)
 
@@ -644,8 +754,12 @@ def score_setup_quality(candles):
 
     quality = 0.0
     if ema9[-1] is not None and ema21[-1] is not None:
-        if ema9[-1] > ema21[-1] or ema9[-1] < ema21[-1]:
-            quality += 25.0
+        if ema9[-1] > ema21[-1] and m30_bias == "Haussier" and m10_bias == "Haussier":
+            quality += 35.0
+        elif ema9[-1] < ema21[-1] and m30_bias == "Baissier" and m10_bias == "Baissier":
+            quality += 35.0
+        elif ema9[-1] > ema21[-1] or ema9[-1] < ema21[-1]:
+            quality += 15.0
     if adx14[-1] is not None and adx14[-1] >= MIN_ADX:
         quality += min(35.0, adx14[-1])
 
@@ -653,7 +767,7 @@ def score_setup_quality(candles):
 
 
 # =====================================================
-# 4. FORMAT MESAJ TELEGRAM SENP & VERIFIKASYON OTCHARTS 60S
+# 5. FORMAT MESAJ TELEGRAM SENP & VERIFIKASYON OTCHARTS 60S
 # =====================================================
 def format_signal_message(pair, payout, sent_time_str, entry_time_str, sec_left, signal_data, entry_quote=None):
     emoji = "🟢" if signal_data["direction"] == "CALL" else "🔴"
@@ -777,11 +891,12 @@ def finalize_pending_trade(pending, last_prices):
         log(f"{sym}: Missing entry/exit tick. Stopping bot.")
 
 
-def run_live_stream(monitored, histories, current_bars, deadline):
+def run_live_stream(monitored, histories, current_bars, htf_cache, deadline):
     symbols = [item["symbol"] for item in monitored]
     payout_map = {item["symbol"]: item["payout"] for item in monitored}
-    params = {"venue": VENUE, "symbol": ",".join(symbols)}
+    refresh_mtf_for_symbols(symbols, htf_cache, force=True)
 
+    params = {"venue": VENUE, "symbol": ",".join(symbols)}
     log(f"Scanning 4 pairs ({', '.join(symbols)}) silently until one pair triggers...")
     response = api_get("/v1/stream", params=params, stream=True)
 
@@ -914,9 +1029,16 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 last_eval_ts = staged_setups.get(symbol, 0)
                 if now - last_eval_ts >= 3.0:
                     staged_setups[symbol] = now
+                    refresh_mtf_for_symbols(symbols, htf_cache, force=False)
+                    m30_bias, m10_bias = get_mtf_state(symbol, htf_cache)
                     window = build_live_window(symbol, histories, current)
                     if len(window) >= MIN_CANDLES:
-                        signal_data, diag = evaluate_six_indicators(window, require_live_alignment=False)
+                        signal_data, diag = evaluate_six_indicators(
+                            window,
+                            require_live_alignment=False,
+                            m30_bias=m30_bias,
+                            m10_bias=m10_bias
+                        )
                         if signal_data:
                             entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
                             entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
@@ -945,9 +1067,16 @@ def run_live_stream(monitored, histories, current_bars, deadline):
             # ETAP 2: Nan dènye 2 segonn anvan bouji a fèmen, voye siyal final la oswa avèti w si l anile
             if CONFIRM_WINDOW_MIN <= seconds_left_in_bar <= CONFIRM_WINDOW_MAX and not current.get("final_verified"):
                 current["final_verified"] = True
+                refresh_mtf_for_symbols([symbol], htf_cache, force=True)
+                m30_bias, m10_bias = get_mtf_state(symbol, htf_cache)
                 window = build_live_window(symbol, histories, current)
                 if len(window) >= MIN_CANDLES:
-                    signal_data, diag = evaluate_six_indicators(window, require_live_alignment=True)
+                    signal_data, diag = evaluate_six_indicators(
+                        window,
+                        require_live_alignment=True,
+                        m30_bias=m30_bias,
+                        m10_bias=m10_bias
+                    )
                     if signal_data:
                         payout = payout_map.get(symbol, MIN_PAYOUT)
                         entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
@@ -986,7 +1115,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     else:
                         if locked_order is not None and locked_order["symbol"] == symbol:
                             log(f"{symbol}: Cancelled at 2s check ({diag}). Releasing lock.")
-                            send_cancelled_pair_alert(symbol, locked_order["direction"], "endikatè oswa bouji chanje nan dènye 2s", now)
+                            send_cancelled_pair_alert(symbol, locked_order["direction"], "endikatè, M30/M10 oswa bouji chanje nan dènye 2s", now)
                             locked_order = None
 
     finally:
@@ -1033,15 +1162,27 @@ def main():
 
     active_limit = min(MAX_STREAM_PAIRS, len(ranked))
     top_pairs = ranked[:active_limit]
+    htf_cache = {}
+    refresh_mtf_for_symbols([x["symbol"] for x in top_pairs], htf_cache, force=True)
+
+    for item in top_pairs:
+        m30_b, m10_b = get_mtf_state(item["symbol"], htf_cache)
+        item["setup_score"] = score_setup_quality(
+            histories.get(item["symbol"], []),
+            m30_bias=m30_b,
+            m10_bias=m10_b
+        )
+
+    top_pairs.sort(key=lambda x: (-x["setup_score"], -x["payout"], x["symbol"]))
     log("Scanning 4 pairs silently: " + ", ".join(f"{x['symbol']}(score={x['setup_score']})" for x in top_pairs))
 
     current_bars = {}
 
     reconnects = 0
     while datetime.now(USER_TZ).timestamp() < deadline:
-        stream_subset = ranked[:active_limit]
+        stream_subset = top_pairs[:active_limit]
         try:
-            status = run_live_stream(stream_subset, histories, current_bars, deadline)
+            status = run_live_stream(stream_subset, histories, current_bars, htf_cache, deadline)
             if status in ("done", "stop"):
                 log(f"{VERSION} finished.")
                 sys.stdout.flush()
