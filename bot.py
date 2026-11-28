@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 # =====================================================
-# 1. PARAMÈT JENERAL - ROMARIO PRO (BETTER CONFIRMATION M1 60s, STOCH & CANDLE GUARD, >=92% PAYOUT, UTC-5)
+# 1. PARAMÈT JENERAL - ROMARIO PRO (STRONG CLEAN M1 60s, CANDLE STRUCTURE GUARD, >=92% PAYOUT, UTC-5)
 # =====================================================
 VERSION = "ROMARIO PRO"
 
@@ -84,7 +84,7 @@ def get_session():
         _thread_local.session = requests.Session()
         _thread_local.session.headers.update({
             "Authorization": f"Bearer {API_KEY}",
-            "User-Agent": "RomarioProM1/5.6",
+            "User-Agent": "RomarioProM1/5.5",
             "Accept": "application/json"
         })
     return _thread_local.session
@@ -428,24 +428,10 @@ def calc_adx_aligned(candles, period=14):
     return adx_out
 
 
-def has_heavy_lower_wick(candle):
-    total_range = max(candle["high"] - candle["low"], 1e-12)
-    body_bottom = min(candle["open"], candle["close"])
-    lower_wick = max(0.0, body_bottom - candle["low"])
-    return (lower_wick / total_range) >= 0.45
-
-
-def has_heavy_upper_wick(candle):
-    total_range = max(candle["high"] - candle["low"], 1e-12)
-    body_top = max(candle["open"], candle["close"])
-    upper_wick = max(0.0, candle["high"] - body_top)
-    return (upper_wick / total_range) >= 0.45
-
-
 # =====================================================
-# 3. EVALYASYON 6 ENDIKATÈ YO + KONFIMASYON BOUJI M1
+# 3. EVALYASYON 6 ENDIKATÈ YO + FILTÈ STRIKTI BOUJI M1
 # =====================================================
-def evaluate_six_indicators(candles, require_live_alignment=False):
+def evaluate_six_indicators(candles):
     if len(candles) < MIN_CANDLES:
         return None, "not enough candles"
 
@@ -565,11 +551,8 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
             ema_state != "Haussier"
             or macd_state != "Haussier"
             or rsi_val > 68.0
-            or sk > 78.0
             or bb_pos > 0.78
-            or has_heavy_upper_wick(prev_closed)
             or (prev_bearish and live_bearish)
-            or (require_live_alignment and not live_bullish)
         ):
             return None, f"{diag} call_filtered"
         return {
@@ -589,11 +572,8 @@ def evaluate_six_indicators(candles, require_live_alignment=False):
             ema_state != "Baissier"
             or macd_state != "Baissier"
             or rsi_val < 32.0
-            or sk < 22.0
             or bb_pos < 0.22
-            or has_heavy_lower_wick(prev_closed)
             or (prev_bullish and live_bullish)
-            or (require_live_alignment and not live_bearish)
         ):
             return None, f"{diag} put_filtered"
         return {
@@ -629,7 +609,7 @@ def build_live_window(symbol, histories, current_bar):
 
 
 def score_setup_quality(candles):
-    sig, _ = evaluate_six_indicators(candles, require_live_alignment=False)
+    sig, _ = evaluate_six_indicators(candles)
     if sig is not None:
         return round(100.0 + float(sig["win_prob"]), 2)
 
@@ -916,7 +896,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                     staged_setups[symbol] = now
                     window = build_live_window(symbol, histories, current)
                     if len(window) >= MIN_CANDLES:
-                        signal_data, diag = evaluate_six_indicators(window, require_live_alignment=False)
+                        signal_data, diag = evaluate_six_indicators(window)
                         if signal_data:
                             entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
                             entry_time_str = datetime.fromtimestamp(entry_ts, tz=USER_TZ).strftime("%I:%M:%S %p")
@@ -947,7 +927,7 @@ def run_live_stream(monitored, histories, current_bars, deadline):
                 current["final_verified"] = True
                 window = build_live_window(symbol, histories, current)
                 if len(window) >= MIN_CANDLES:
-                    signal_data, diag = evaluate_six_indicators(window, require_live_alignment=True)
+                    signal_data, diag = evaluate_six_indicators(window)
                     if signal_data:
                         payout = payout_map.get(symbol, MIN_PAYOUT)
                         entry_ts = compute_utc5_entry_timestamp(seconds_left_in_bar)
