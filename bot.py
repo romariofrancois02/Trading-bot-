@@ -10,11 +10,11 @@ from datetime import datetime, timezone, timedelta
 from collections import deque
 
 # =========================================================
-# ROMARIO PRO M1 ONLY
-# M1 ANALYSIS | 60S EXPIRATION | STRICT CONFIRMATION
+# ROMARIO PRO M1 ONLY 3.1
+# M1 ONLY | EXPIRATION 60S | STRICT 7/7 CONFIRMATION
 # =========================================================
 
-VERSION = "ROMARIO PRO M1 ONLY"
+VERSION = "ROMARIO PRO M1 ONLY 3.1"
 
 BASE_URL = "https://otcharts.com"
 VENUE = "otc"
@@ -36,7 +36,10 @@ MIN_SCORE = 7
 
 MAX_WAIT_SECONDS = 300
 
-# Florida / New York standard-time offset
+# OTCharts documents Pocket Option OTC candle clock as UTC+2.
+# Convert historical OTC candle timestamps back by two hours.
+OTC_CANDLE_CLOCK_OFFSET = 7200
+
 LOCAL_TZ = timezone(timedelta(hours=-5))
 
 TOXIC_CURRENCIES = {
@@ -54,12 +57,12 @@ session = requests.Session()
 session.headers.update({
     "Authorization": f"Bearer {API_KEY}",
     "Accept": "application/json",
-    "User-Agent": "RomarioProM1/3.0"
+    "User-Agent": "ROMARIO-PRO-M1/3.1"
 })
 
 
 # =========================================================
-# BASIC VALIDATION
+# TIME AND ENVIRONMENT
 # =========================================================
 
 def validate_environment():
@@ -85,7 +88,8 @@ def local_time(timestamp=None):
         timestamp = time.time()
 
     return datetime.fromtimestamp(
-        timestamp, tz=LOCAL_TZ
+        timestamp,
+        tz=LOCAL_TZ
     ).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -101,13 +105,17 @@ def normalize_timestamp(value):
                 dt = datetime.fromisoformat(
                     value.replace("Z", "+00:00")
                 )
+
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+
                 return dt.timestamp()
+
             except Exception:
                 return None
 
     value = float(value)
 
-    # Convert milliseconds to seconds
     if value > 100000000000:
         value /= 1000
 
@@ -116,42 +124,64 @@ def normalize_timestamp(value):
 
 def normalize_candle(raw):
     try:
+        timestamp = normalize_timestamp(
+            raw.get("time", raw.get("timestamp"))
+        )
+
+        if timestamp is None:
+            return None
+
+        # Important: correct Pocket Option OTC candle clock.
+        timestamp -= OTC_CANDLE_CLOCK_OFFSET
+
         candle = {
-            "time": normalize_timestamp(
-                raw.get("time", raw.get("timestamp"))
-            ),
+            "time": timestamp,
             "open": float(raw.get("open", raw.get("o"))),
             "high": float(raw.get("high", raw.get("h"))),
             "low": float(raw.get("low", raw.get("l"))),
             "close": float(raw.get("close", raw.get("c")))
         }
 
-        if candle["time"] is None:
+        if candle["high"] < candle["low"]:
             return None
 
-        if candle["high"] < candle["low"]:
+        if candle["high"] < max(
+            candle["open"], candle["close"]
+        ):
+            return None
+
+        if candle["low"] > min(
+            candle["open"], candle["close"]
+        ):
             return None
 
         return candle
 
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return None
 
 
 # =========================================================
-# OTCHARTS API
+# API
 # =========================================================
 
-def api_get(endpoint, params=None, timeout=20):
-    url = BASE_URL + endpoint
-
+def api_get(endpoint, params=None, timeout=25):
     response = session.get(
-        url,
+        BASE_URL + endpoint,
         params=params,
         timeout=timeout
     )
 
+    if not response.ok:
+        logging.error(
+            "API error %s on %s: %s",
+            response.status_code,
+            endpoint,
+            response.text[:500]
+        )
+
     response.raise_for_status()
+
     return response.json()
 
 
@@ -171,6 +201,7 @@ def get_eligible_markets():
         if not symbol:
             continue
 
+        # Currency / crypto OTC symbols ending in _otc.
         if not re.fullmatch(r"[A-Z]{6}_otc", symbol):
             continue
 
@@ -178,7 +209,7 @@ def get_eligible_markets():
             continue
 
         try:
-            payout = float(item.get("payout", 0))
+            payout = float(item.get("payout"))
         except (TypeError, ValueError):
             continue
 
@@ -203,13 +234,13 @@ def get_eligible_markets():
         reverse=True
     )
 
-    selected = eligible[:MAX_MARKETS]
-
     logging.info(
         "Eligible OTC pairs with payout >= %.1f%%: %s",
         MIN_PAYOUT,
         len(eligible)
     )
+
+    selected = eligible[:MAX_MARKETS]
 
     logging.info(
         "Selected markets: %s",
@@ -230,12 +261,15 @@ def get_closed_candles(symbol):
         }
     )
 
-    raw_candles = data.get(
-        "candles",
-        data.get("data", [])
-    )
+    raw_candles = data.get("candles", [])
 
-    now = time.time()
+    if not isinstance(raw_candles, list):
+        logging.warning(
+            "%s: Unexpected candle response format.",
+            symbol
+        )
+        return []
+
     candles = []
 
     for raw in raw_candles:
@@ -244,20 +278,41 @@ def get_closed_candles(symbol):
         if candle is None:
             continue
 
-        # Candle timestamps are treated as opening timestamps.
-        # Only use candles that have fully closed.
-        if candle["time"] + TIMEFRAME <= now:
-            candles.append(candle)
+        candles.append(candle)
 
-    candles.sort(key=lambda x: x["time"])
+    candles.sort(key=lambda item: item["time"])
 
-    # Remove duplicate timestamps
+    # Remove duplicate candle timestamps.
     unique = {}
 
     for candle in candles:
         unique[candle["time"]] = candle
 
-    return list(unique.values())[-CANDLE_LIMIT:]
+    candles = list(unique.values())
+
+    now = time.time()
+
+    closed = [
+        candle for candle in candles
+        if candle["time"] + TIMEFRAME <= now
+    ]
+
+    logging.info(
+        "%s: raw=%s | parsed=%s | closed=%s",
+        symbol,
+        len(raw_candles),
+        len(candles),
+        len(closed)
+    )
+
+    if candles:
+        logging.info(
+            "%s: newest corrected candle age: %.1f seconds",
+            symbol,
+            now - candles[-1]["time"]
+        )
+
+    return closed[-CANDLE_LIMIT:]
 
 
 # =========================================================
@@ -318,27 +373,26 @@ def calculate_macd(values):
     if len(values) < 40:
         return None
 
-    fast_values = []
-    slow_values = []
+    macd_values = []
 
-    for i in range(25, len(values) + 1):
+    for i in range(26, len(values) + 1):
         segment = values[:i]
 
         fast = ema(segment, 12)
         slow = ema(segment, 26)
 
         if fast is not None and slow is not None:
-            fast_values.append(fast - slow)
+            macd_values.append(fast - slow)
 
-    if len(fast_values) < 9:
+    if len(macd_values) < 9:
         return None
 
-    signal = ema(fast_values, 9)
+    signal = ema(macd_values, 9)
 
     if signal is None:
         return None
 
-    return fast_values[-1] - signal
+    return macd_values[-1] - signal
 
 
 def calculate_bollinger(values, period=20):
@@ -363,11 +417,12 @@ def calculate_bollinger(values, period=20):
 
 
 def calculate_stochastic(candles, period=14):
-    if len(candles) < period + 3:
+    if len(candles) < period + 2:
         return None
 
     k_values = []
 
+    # Calculate the last three %K values.
     for end in range(len(candles) - 3, len(candles)):
         window = candles[end - period + 1:end + 1]
 
@@ -406,12 +461,14 @@ def calculate_adx(candles, period=14):
         down_move = previous["low"] - current["low"]
 
         plus_dm.append(
-            up_move if up_move > down_move and up_move > 0
+            up_move
+            if up_move > down_move and up_move > 0
             else 0
         )
 
         minus_dm.append(
-            down_move if down_move > up_move and down_move > 0
+            down_move
+            if down_move > up_move and down_move > 0
             else 0
         )
 
@@ -461,7 +518,7 @@ def calculate_adx(candles, period=14):
 
 
 # =========================================================
-# STRICT M1 CONFIRMATION
+# STRICT M1 SIGNAL VALIDATION
 # =========================================================
 
 def evaluate_m1(candles):
@@ -479,7 +536,7 @@ def evaluate_m1(candles):
     stochastic = calculate_stochastic(candles, 14)
     adx = calculate_adx(candles, 14)
 
-    if any(x is None for x in (
+    if any(value is None for value in (
         ema9, ema21, rsi, macd,
         bands, stochastic, adx
     )):
@@ -500,15 +557,14 @@ def evaluate_m1(candles):
     body = abs(close_price - open_price)
     body_ratio = body / candle_range
 
-    middle, upper, lower = bands
-    stoch_k, stoch_d = stochastic
-
-    # A candle with a very small body is not a strong confirmation.
+    # Reject weak / indecision candles.
     if body_ratio < 0.35:
         return None
 
-    # ---------------- CALL ----------------
+    middle, upper, lower = bands
+    stoch_k, stoch_d = stochastic
 
+    # Every condition must be true: 7/7.
     call_checks = [
         ema9 > ema21 and close_price > ema9,
         macd > 0,
@@ -518,8 +574,6 @@ def evaluate_m1(candles):
         adx >= MIN_ADX,
         close_price > open_price
     ]
-
-    # ---------------- PUT -----------------
 
     put_checks = [
         ema9 < ema21 and close_price < ema9,
@@ -534,7 +588,7 @@ def evaluate_m1(candles):
     call_score = sum(call_checks)
     put_score = sum(put_checks)
 
-    if call_score == MIN_SCORE:
+    if call_score >= MIN_SCORE:
         return {
             "direction": "CALL",
             "score": call_score,
@@ -543,7 +597,7 @@ def evaluate_m1(candles):
             "price": close_price
         }
 
-    if put_score == MIN_SCORE:
+    if put_score >= MIN_SCORE:
         return {
             "direction": "PUT",
             "score": put_score,
@@ -579,16 +633,19 @@ def send_telegram(message):
     result = response.json()
 
     if not result.get("ok"):
-        raise RuntimeError("Telegram did not confirm message delivery")
+        raise RuntimeError(
+            "Telegram did not confirm message delivery."
+        )
 
 
 def send_signal(symbol, payout, signal, entry_time):
     direction = signal["direction"]
 
-    if direction == "CALL":
-        heading = "🟢 CALL"
-    else:
-        heading = "🔴 PUT"
+    heading = (
+        "🟢 CALL"
+        if direction == "CALL"
+        else "🔴 PUT"
+    )
 
     message = (
         f"🤖 {VERSION}\n\n"
@@ -602,7 +659,7 @@ def send_signal(symbol, payout, signal, entry_time):
         f"⌛ EXPIRATION: 60 SECONDS\n"
         f"📩 SIGNAL TIME: {local_time()}\n"
         f"🎯 ENTRY TIME: {local_time(entry_time)}\n\n"
-        f"⚠️ Signal only — manual entry."
+        f"⚠️ MANUAL ENTRY ONLY"
     )
 
     send_telegram(message)
@@ -634,13 +691,13 @@ def process_tick(tick, histories, payouts, current_bars):
     )
 
     if timestamp is None:
-        timestamp = time.time()
+        return False
 
+    # Stream tick timestamps are used as Unix time.
     bucket = int(timestamp // TIMEFRAME) * TIMEFRAME
 
     current = current_bars.get(symbol)
 
-    # First tick for this pair
     if current is None:
         current_bars[symbol] = {
             "time": bucket,
@@ -651,23 +708,23 @@ def process_tick(tick, histories, payouts, current_bars):
         }
         return False
 
-    # Same M1 candle
+    # Update current M1 candle.
     if bucket == current["time"]:
         current["high"] = max(current["high"], price)
         current["low"] = min(current["low"], price)
         current["close"] = price
         return False
 
-    # Ignore old or out-of-order ticks
+    # Ignore out-of-order ticks.
     if bucket < current["time"]:
         return False
 
-    # Previous M1 candle has now closed.
+    # Previous M1 candle is closed.
     closed_candle = current.copy()
 
     histories[symbol].append(closed_candle)
 
-    # Start the new M1 candle
+    # Start the next candle.
     current_bars[symbol] = {
         "time": bucket,
         "open": price,
@@ -677,7 +734,7 @@ def process_tick(tick, histories, payouts, current_bars):
     }
 
     logging.info(
-        "%s M1 candle closed. Checking confirmation...",
+        "%s: M1 candle closed. Checking 7/7 confirmation.",
         symbol
     )
 
@@ -685,17 +742,20 @@ def process_tick(tick, histories, payouts, current_bars):
 
     if signal is None:
         logging.info(
-            "%s: No complete M1 confirmation.",
+            "%s: Confirmation below 7/7. No signal.",
             symbol
         )
         return False
 
-    payout = payouts[symbol]
+    payout = payouts.get(symbol, 0)
 
     if payout < MIN_PAYOUT:
+        logging.info(
+            "%s: Payout no longer meets minimum.",
+            symbol
+        )
         return False
 
-    # The first tick of the new candle is the entry reference.
     send_signal(
         symbol,
         payout,
@@ -707,8 +767,6 @@ def process_tick(tick, histories, payouts, current_bars):
 
 
 def run_live_stream(markets):
-    symbols = [item["symbol"] for item in markets]
-
     payouts = {
         item["symbol"]: item["payout"]
         for item in markets
@@ -716,7 +774,10 @@ def run_live_stream(markets):
 
     histories = {}
 
-    for symbol in symbols:
+    # Load historical M1 candles once per symbol.
+    for item in markets:
+        symbol = item["symbol"]
+
         try:
             candles = get_closed_candles(symbol)
 
@@ -734,21 +795,21 @@ def run_live_stream(markets):
             )
 
             logging.info(
-                "%s: Loaded %s closed M1 candles.",
+                "%s: Ready with %s closed M1 candles.",
                 symbol,
                 len(candles)
             )
 
         except Exception as error:
-            logging.error(
-                "%s: Candle loading failed: %s",
+            logging.exception(
+                "%s: Candle history error: %s",
                 symbol,
                 error
             )
 
     if not histories:
         logging.error(
-            "No pair has enough verified M1 candle history."
+            "No pair has enough usable M1 candle history."
         )
         return
 
@@ -766,19 +827,22 @@ def run_live_stream(markets):
     deadline = time.time() + MAX_WAIT_SECONDS
 
     logging.info(
-        "Starting M1 stream for: %s",
+        "Starting one live stream for: %s",
         active_symbols
     )
 
     while time.time() < deadline:
-        remaining = max(1, int(deadline - time.time()))
+        remaining = max(
+            1,
+            int(deadline - time.time())
+        )
 
         try:
             with session.get(
                 stream_url,
                 params=params,
                 stream=True,
-                timeout=(10, remaining + 10)
+                timeout=(15, remaining + 10)
             ) as response:
 
                 response.raise_for_status()
@@ -810,7 +874,24 @@ def run_live_stream(markets):
                         continue
 
                     if event_name == "connected":
-                        logging.info("OTCharts stream connected.")
+                        logging.info(
+                            "OTCharts stream connected: %s",
+                            data.get("symbols", [])
+                        )
+                        continue
+
+                    if event_name == "dropped":
+                        logging.warning(
+                            "OTCharts dropped symbols: %s",
+                            data
+                        )
+                        continue
+
+                    if event_name == "closed":
+                        logging.warning(
+                            "OTC symbols closed by broker: %s",
+                            data
+                        )
                         continue
 
                     if event_name == "tick":
@@ -858,6 +939,7 @@ def main():
     logging.info("MIN PAYOUT: %.1f%%", MIN_PAYOUT)
     logging.info("STRICT CONFIRMATION: 7/7")
     logging.info("MAX MARKETS: %s", MAX_MARKETS)
+    logging.info("OTC CANDLE CLOCK CORRECTION: -2 HOURS")
     logging.info("=" * 60)
 
     validate_environment()
